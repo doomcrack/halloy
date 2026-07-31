@@ -15,20 +15,6 @@ impl Catalog for Theme {
     }
 }
 
-pub fn typing(theme: &Theme) -> Style {
-    let buffer = theme.styles().buffer;
-
-    Style {
-        background: Some(Background::Color(buffer.background)),
-        border: Border {
-            radius: 4.0.into(),
-            width: 0.0,
-            color: buffer.border,
-        },
-        ..Default::default()
-    }
-}
-
 pub fn buffer(theme: &Theme, selected: bool) -> Style {
     let buffer = theme.styles().buffer;
 
@@ -77,26 +63,18 @@ pub fn buffer_text_input(theme: &Theme) -> Style {
     }
 }
 
-pub fn table(theme: &Theme, idx: usize) -> Style {
+/// The chip a day separator sits on: a pill floating over the thread
+/// rather than a rule cutting it in two (QML `DayChip`).
+pub fn day_chip(theme: &Theme) -> Style {
     let general = theme.styles().general;
-    let buffer = theme.styles().buffer;
-
-    let background = if !idx.is_multiple_of(2) {
-        general.background
-    } else {
-        buffer.background
-    };
 
     Style {
-        background: Some(Background::Color(background)),
-        text_color: Some(theme.styles().text.primary.color),
-        ..Default::default()
-    }
-}
-
-pub fn none(_theme: &Theme) -> Style {
-    Style {
-        background: None,
+        background: Some(Background::Color(general.background)),
+        border: Border {
+            radius: 10.0.into(),
+            width: 1.0,
+            color: theme.styles().buffer.date_rule.unwrap_or(general.border),
+        },
         ..Default::default()
     }
 }
@@ -123,21 +101,6 @@ pub fn tooltip(theme: &Theme) -> Style {
         background: Some(Background::Color(general.background)),
         border: Border {
             radius: 4.0.into(),
-            width: 1.0,
-            color: general.border,
-        },
-        ..Default::default()
-    }
-}
-
-pub fn hover_preview_tooltip(theme: &Theme) -> Style {
-    let general = theme.styles().general;
-    let buffer = theme.styles().buffer;
-
-    Style {
-        background: Some(Background::Color(buffer.background)),
-        border: Border {
-            radius: 0.0.into(),
             width: 1.0,
             color: general.border,
         },
@@ -173,7 +136,8 @@ pub fn transparent_overlay(theme: &Theme) -> Style {
     let general = theme.styles().general;
 
     Style {
-        //TODO: Blur background when possible?
+        // TODO(upstream): blur the background once iced can — no backdrop
+        // filter primitive exists today.
         background: Some(Background::Color(Color {
             a: 0.7,
             ..general.background

@@ -1,56 +1,35 @@
-use std::collections::{HashMap, HashSet, VecDeque, hash_map};
+use std::collections::{HashMap, HashSet, VecDeque};
+use std::convert;
 use std::ops::RangeInclusive;
-use std::path::PathBuf;
-use std::sync::Arc;
 use std::time::{Duration, Instant};
-use std::{convert, slice};
 
-use chrono::{DateTime, Utc};
-use data::capabilities::{
-    LabeledResponseContext, MultilineBatchKind, multiline_concat_lines,
-};
-use data::config::buffer::{ScrollPosition, UsernameFormat};
+use data::conversation::{ConvoId, Kind as ConversationKind};
 use data::dashboard::{self, BufferAction};
-use data::environment::{RELEASE_WEBSITE, WIKI_WEBSITE};
-use data::history::ReadMarker;
-use data::history::filter::Filter;
-use data::history::manager::EchoEvent;
-use data::history::reroute::RerouteRules;
-use data::isupport::{self, ChatHistorySubcommand, MessageReference};
-use data::message::{self, Broadcast};
-use data::rate_limit::TokenPriority;
-use data::target::{self, Target};
-use data::user::Nick;
-use data::{
-    Config, Image, Notification, Server, User, Version, cache, client, command,
-    config, environment, file_transfer, history, preview, reaction, redaction,
-    server, server_icon, stream,
-};
+use data::environment::RELEASE_WEBSITE;
+use data::input::RawInput;
+use data::{Config, Version, config, environment, history, stream};
 use iced::widget::pane_grid::{self, PaneGrid};
-use iced::widget::{Space, center, column, container, row, stack, text};
+use iced::widget::{Space, column, container, row, stack};
 use iced::{Length, Size, Task, Vector, clipboard, padding};
-use irc::proto;
 
 use self::command_bar::CommandBar;
-use self::modal::{reaction as reaction_modal, redaction as redaction_modal};
 use self::pane::Pane;
 use self::sidebar::Sidebar;
 use self::theme_editor::ThemeEditor;
 use crate::buffer::{self, Buffer};
-use crate::notification::{self, Notifications, toast};
+use crate::notification::{self, toast};
 use crate::widget::{
     Column, Element, Row, anchored_overlay, context_menu, selectable_text,
     shortcut,
 };
 use crate::window::Window;
-use crate::{
-    Theme, event, filehost, open_url, platform_specific, theme, window,
-};
+use crate::{Theme, event, open_url, platform_specific, theme, window};
 
-mod command_bar;
-pub mod modal;
+pub mod account_card;
+pub mod command_bar;
 pub mod pane;
 pub mod sidebar;
+pub mod status_bar;
 mod theme_editor;
 
 const FOCUS_HISTORY_LEN: usize = 8;
@@ -65,15 +44,15 @@ pub struct Dashboard {
     last_changed: Option<Instant>,
     command_bar: Option<CommandBar>,
     command_bar_window: Option<window::Id>,
-    file_transfers: file_transfer::Manager,
     theme_editor: Option<ThemeEditor>,
-    previews: preview::Collection,
-    previews_cache: Arc<cache::FileCache>,
-    server_icons: server_icon::Manager,
-    typing_animation: Option<buffer::typing::Animation>,
-    http_client: Option<Arc<reqwest::Client>>,
     buffer_settings: dashboard::BufferSettings,
-    pub filehost: filehost::Manager,
+    status_bar: status_bar::StatusBar,
+    /// Whether the first-add explainer has been dismissed with
+    /// don't-show-again (persisted with the dashboard).
+    member_add_explained: bool,
+    /// Conversations whose member list has been requested this snapshot
+    /// generation — dedupes the once-per-open fallback fetch.
+    requested_member_loads: HashSet<ConvoId>,
 }
 
 #[derive(Debug)]
@@ -81,31 +60,22 @@ pub enum Message {
     Pane(window::Id, pane::Message),
     Sidebar(sidebar::Message),
     SelectedText(Vec<(RangeInclusive<f32>, String)>, clipboard::ClipboardKind),
-    History(history::manager::Message),
     DashboardSaved(Result<(), data::dashboard::Error>),
+    Exited(Result<(), data::dashboard::Error>),
     Task(command_bar::Message),
     Shortcut(shortcut::Command),
-    FileTransfer(file_transfer::task::Update),
-    SendFileSelected(Server, User, Option<PathBuf>),
     CloseContextMenu(window::Id, bool),
     ThemeEditor(theme_editor::Message),
     ConfigReloaded(Result<Config, config::Error>),
     ConfigEditorReloaded(Result<Config, config::Error>),
-    Client(client::Message),
-    ServerIcon(server_icon::Message),
-    LoadPreview((url::Url, Result<data::Preview, data::preview::LoadError>)),
     NewWindow(window::Id, Pane),
-    Filehost(filehost::Message),
-    ProceedWithFilehostUpload,
-    CancelFilehostUpload,
+    StatusBar(status_bar::Message),
 }
 
 #[derive(Debug)]
 pub enum Event {
     ConfigReloaded(Result<Config, config::Error>),
     ReloadThemes,
-    QuitServer(Server, Option<String>),
-    IrcError(anyhow::Error),
     Exit,
     OpenUrl(String, bool),
     OpenAbout {
@@ -113,16 +83,19 @@ pub enum Event {
         commit: String,
         system_information: Option<iced::system::Information>,
     },
-    OpenServer(String),
-    ImagePreview(Image),
     ToggleFullscreen,
-    Remove(Server),
-    PromptBeforeFileUpload {
-        upload_url: String,
-        has_credentials: bool,
-        window: window::Id,
+    OpenNewDm,
+    OpenNewGroup,
+    OpenSetNickname(ConvoId),
+    ConfirmDeleteConversation(ConvoId),
+    /// Open the add-member dialog to collect an address for this group.
+    OpenAddMember(ConvoId),
+    /// An invite with a known address (roster dialog or `/add`); the app
+    /// runs the first-add explainer gate before sending.
+    AddMemberRequested {
+        convo_id: ConvoId,
+        peer_address: String,
     },
-    EchoEvents(Server, Vec<EchoEvent>),
 }
 
 impl Dashboard {
@@ -151,27 +124,17 @@ impl Dashboard {
             last_changed: None,
             command_bar: None,
             command_bar_window: None,
-            file_transfers: file_transfer::Manager::default(),
             theme_editor: None,
-            previews: preview::Collection::default(),
-            previews_cache: Arc::new(preview_cache(&config.preview)),
-            server_icons: server_icon::Manager::default(),
-            typing_animation: None,
-            http_client: http_client_from_config(config).map(Arc::new),
             buffer_settings: dashboard::BufferSettings::default(),
-            filehost: filehost::Manager::new(),
+            status_bar: status_bar::StatusBar::default(),
+            member_add_explained: false,
+            requested_member_loads: HashSet::new(),
         };
 
-        if config.buffer.text_input.persist {
-            dashboard
-                .history
-                .preload_drafts(data::input::load_drafts_sync());
-        }
+        let _ = config;
+        dashboard.track_histories(&mut stream::Map::default());
 
-        let command = dashboard.track(None, config);
-        let sidebar_task = sidebar_task.map(Message::Sidebar);
-
-        (dashboard, Task::batch(vec![command, sidebar_task]))
+        (dashboard, sidebar_task.map(Message::Sidebar))
     }
 
     pub fn restore(
@@ -188,158 +151,16 @@ impl Dashboard {
         let (mut dashboard, task) =
             Dashboard::from_data(dashboard, config, main_window);
 
-        let tasks = Task::batch(vec![task, dashboard.track(None, config)]);
+        dashboard.track_histories(&mut stream::Map::default());
 
-        (dashboard, tasks)
-    }
-
-    pub fn init_filters(
-        &mut self,
-        servers: &server::Map,
-        clients: &client::Map,
-    ) {
-        self.history
-            .set_filters(Filter::list_from_servers(servers, clients));
-    }
-
-    pub fn update_channel_discoveries(
-        &self,
-        clients: &mut client::Map,
-        server: &data::Server,
-    ) {
-        if let Some(pane) = self.panes.iter().find_map(|(_, _, pane)| {
-            if let Some(data::Buffer::Internal(
-                buffer::Internal::ChannelDiscovery(Some(pane_server)),
-            )) = pane.buffer.data()
-                && pane_server == *server
-            {
-                Some(pane)
-            } else {
-                None
-            }
-        }) {
-            Self::send_list_command_if_needed(server, pane, clients);
-        }
-    }
-
-    pub fn update_filters(
-        &mut self,
-        servers: &server::Map,
-        clients: &client::Map,
-        buffer_config: &config::Buffer,
-    ) {
-        self.init_filters(servers, clients);
-
-        self.reprocess_history(clients, buffer_config);
-    }
-
-    pub fn refresh_cache_limits(&mut self, config: &Config) {
-        self.previews_cache = Arc::new(preview_cache(&config.preview));
-    }
-
-    pub fn set_reroute_rules(
-        &mut self,
-        servers: &server::Map,
-        clients: &client::Map,
-    ) {
-        let reroute_rules = self.get_reroute_rules_mut();
-
-        *reroute_rules = RerouteRules::from_server_map(servers, clients);
-    }
-
-    pub fn reload_visible_previews(
-        &mut self,
-        clients: &client::Map,
-        config: &Config,
-    ) -> Task<Message> {
-        Task::batch(
-            self.visible_preview_urls_with_preview_clients(
-                clients,
-                &config.preview,
-            )
-            .into_iter()
-            .map(|(url, client)| {
-                Task::perform(
-                    data::preview::load(
-                        url.clone(),
-                        client.clone(),
-                        config.preview.clone(),
-                        self.previews_cache.clone(),
-                    ),
-                    move |result| Message::LoadPreview((url.clone(), result)),
-                )
-            }),
-        )
-    }
-
-    pub fn reprocess_history(
-        &mut self,
-        clients: &client::Map,
-        buffer_config: &config::Buffer,
-    ) {
-        let open_pane_kinds: HashSet<history::Kind> = self
-            .panes
-            .iter()
-            .filter_map(|(_window_id, _grid_pane, pane)| {
-                if matches!(
-                    pane.buffer,
-                    Buffer::Channel(_)
-                        | Buffer::Server(_)
-                        | Buffer::Query(_)
-                        | Buffer::Highlights(_)
-                        | Buffer::ChannelMonitor(_)
-                ) {
-                    pane.buffer.data().and_then(history::Kind::from_buffer)
-                } else {
-                    None
-                }
-            })
-            .collect();
-
-        open_pane_kinds.into_iter().for_each(|kind| {
-            self.history.process_history(kind, clients, buffer_config);
-        });
-
-        // TODO: Reprocess unloaded history to determine/update metadata?
-        // Re-visit after history storage is transitioned to SQL.
-    }
-
-    pub fn renormalize_history(
-        &mut self,
-        server: &data::Server,
-        clients: &client::Map,
-    ) {
-        let open_pane_kinds: HashSet<history::Kind> = self
-            .panes
-            .iter()
-            .filter_map(|(_window_id, _grid_pane, pane)| {
-                if pane
-                    .buffer
-                    .server()
-                    .is_some_and(|buffer_server| buffer_server == *server)
-                    || matches!(
-                        pane.buffer,
-                        Buffer::Highlights(_) | Buffer::ChannelMonitor(_)
-                    )
-                {
-                    pane.buffer.data().and_then(history::Kind::from_buffer)
-                } else {
-                    None
-                }
-            })
-            .collect();
-
-        open_pane_kinds.into_iter().for_each(|kind| {
-            self.history.renormalize_messages(&kind, clients);
-        });
+        (dashboard, task)
     }
 
     pub fn update(
         &mut self,
         message: Message,
-        clients: &mut client::Map,
-        controllers: &mut stream::Map,
-        servers: &server::Map,
+        session: &data::Session,
+        backend: &mut stream::Map,
         theme: &mut Theme,
         version: &Version,
         config: &Config,
@@ -370,7 +191,6 @@ impl Dashboard {
                     pane::Message::ClosePane => {
                         return (
                             self.close_pane(
-                                clients,
                                 config,
                                 self.focus.window,
                                 self.focus.pane,
@@ -385,10 +205,7 @@ impl Dashboard {
                         if let Some(pane) = self.panes.get_mut(window, id) {
                             let (command, event) = pane.buffer.update(
                                 message,
-                                clients,
                                 &mut self.history,
-                                &self.previews,
-                                &mut self.file_transfers,
                                 config,
                             );
 
@@ -405,12 +222,7 @@ impl Dashboard {
 
                             let (buffer_task, buffer_event) = self
                                 .handle_buffer_event(
-                                    window,
-                                    id,
-                                    event,
-                                    clients,
-                                    controllers,
-                                    config,
+                                    window, id, event, session, backend, config,
                                 );
 
                             return (
@@ -419,21 +231,7 @@ impl Dashboard {
                             );
                         }
                     }
-                    pane::Message::ToggleShowUserList => {
-                        if let Some((_, _, pane)) = self.get_focused_mut() {
-                            if let Some(buffer) = pane.buffer.data() {
-                                let settings = self.buffer_settings.entry(
-                                    &buffer,
-                                    Some(config.buffer.clone().into()),
-                                );
-                                settings.channel.nicklist.toggle_visibility();
-                            }
-
-                            self.last_changed = Some(Instant::now());
-                            return (Task::none(), None);
-                        }
-                    }
-                    pane::Message::ToggleShowTopic => {
+                    pane::Message::ToggleShowMemberList => {
                         if let Some((_, _, pane)) = self.get_focused_mut() {
                             if let Some(buffer) = pane.buffer.data() {
                                 let settings = self.buffer_settings.entry(
@@ -441,8 +239,8 @@ impl Dashboard {
                                     Some(config.buffer.clone().into()),
                                 );
                                 settings
-                                    .channel
-                                    .topic_banner
+                                    .conversation
+                                    .member_list
                                     .toggle_visibility();
                             }
 
@@ -450,12 +248,16 @@ impl Dashboard {
                             return (Task::none(), None);
                         }
                     }
+                    pane::Message::ToggleShowDetails => {
+                        self.toggle_details_on_focused();
+                        return (Task::none(), None);
+                    }
                     pane::Message::MaximizePane => self.maximize_pane(),
                     pane::Message::Popout => {
-                        return (self.popout_pane(clients, config), None);
+                        return (self.popout_pane(config), None);
                     }
                     pane::Message::Merge => {
-                        return (self.merge_pane(clients, config), None);
+                        return (self.merge_pane(config), None);
                     }
                     pane::Message::ScrollToBottom => {
                         let Focus { window, pane } = self.focus;
@@ -488,12 +290,7 @@ impl Dashboard {
                                 .data()
                                 .and_then(history::Kind::from_buffer)
                         {
-                            mark_as_read(
-                                kind,
-                                &mut self.history,
-                                clients,
-                                TokenPriority::User,
-                            );
+                            self.history.mark_as_read(&kind);
                         }
                     }
                     pane::Message::ClearBuffer => {
@@ -503,14 +300,7 @@ impl Dashboard {
                                 .data()
                                 .and_then(history::Kind::from_buffer)
                         {
-                            let task = self
-                                .history
-                                .clear_messages(kind, clients)
-                                .map_or_else(Task::none, |task| {
-                                    Task::perform(task, Message::History)
-                                });
-
-                            return (task, None);
+                            self.history.clear_messages(&kind);
                         }
                     }
                     pane::Message::ContentResized(id, size) => {
@@ -518,122 +308,6 @@ impl Dashboard {
                             state.size = size;
                             state.buffer.update_pane_size(size, config);
                         }
-                    }
-                    pane::Message::Modal(id, message) => {
-                        let (task, buffer_event) = {
-                            let Some(pane) = self.panes.get_mut(window, id)
-                            else {
-                                return (Task::none(), None);
-                            };
-
-                            let Some(event) = pane
-                                .modal
-                                .as_mut()
-                                .and_then(|modal| modal.update(message))
-                            else {
-                                return (Task::none(), None);
-                            };
-
-                            match event {
-                                modal::Event::ToggleReaction {
-                                    msgid,
-                                    text,
-                                    unreact,
-                                } => {
-                                    pane.close_buffer_modal();
-
-                                    let Some(buffer_message) = pane
-                                        .buffer
-                                        .reaction_message(msgid, text, unreact)
-                                    else {
-                                        return (self.refocus_pane(), None);
-                                    };
-
-                                    let (command, event) = pane.buffer.update(
-                                        buffer_message,
-                                        clients,
-                                        &mut self.history,
-                                        &self.previews,
-                                        &mut self.file_transfers,
-                                        config,
-                                    );
-
-                                    let task = self.refocus_pane().chain(
-                                        command.map(move |message| {
-                                            Message::Pane(
-                                                window,
-                                                pane::Message::Buffer(
-                                                    id, message,
-                                                ),
-                                            )
-                                        }),
-                                    );
-
-                                    (task, event)
-                                }
-                                modal::Event::RedactReason {
-                                    msgid,
-                                    reason,
-                                } => {
-                                    pane.close_buffer_modal();
-
-                                    if let Some(buffer) = pane.buffer.upstream()
-                                        && let Some(target) = buffer.target()
-                                    {
-                                        let command = command::Irc::Redact {
-                                            target: target.to_string(),
-                                            msgid: msgid.clone(),
-                                            reason: if reason.is_empty() {
-                                                None
-                                            } else {
-                                                Some(reason.clone())
-                                            },
-                                        };
-
-                                        let input: data::Input =
-                                            data::Input::from_command(
-                                                buffer.clone(),
-                                                command,
-                                            );
-
-                                        if let Some(encoded) = input.encoded() {
-                                            clients.send(
-                                                &input.buffer,
-                                                encoded,
-                                                TokenPriority::User,
-                                            );
-                                        }
-                                    }
-
-                                    (self.refocus_pane(), None)
-                                }
-                            }
-                        };
-
-                        let Some(event) = buffer_event else {
-                            return (task, None);
-                        };
-
-                        let (buffer_task, buffer_event) = self
-                            .handle_buffer_event(
-                                window,
-                                id,
-                                event,
-                                clients,
-                                controllers,
-                                config,
-                            );
-
-                        return (
-                            Task::batch(vec![task, buffer_task]),
-                            buffer_event,
-                        );
-                    }
-                    pane::Message::CloseBufferModal(id) => {
-                        if let Some(state) = self.panes.get_mut(window, id) {
-                            state.close_buffer_modal();
-                        }
-                        return (self.refocus_pane(), None);
                     }
                 }
             }
@@ -645,20 +319,14 @@ impl Dashboard {
                 };
 
                 let (event_task, event) = match event {
-                    sidebar::Event::CloseAllQueries(server, queries) => (
-                        self.leave_all_queries(
-                            clients, config, server, queries,
-                        ),
-                        None,
-                    ),
                     sidebar::Event::QuitApplication => {
-                        (self.exit(clients, config), None)
+                        (self.exit(config), None)
                     }
                     sidebar::Event::New(buffer) => (
                         self.open_buffer(
                             buffer,
                             BufferAction::NewPane,
-                            clients,
+                            backend,
                             config,
                         ),
                         None,
@@ -667,7 +335,7 @@ impl Dashboard {
                         self.open_buffer(
                             buffer,
                             BufferAction::NewWindow,
-                            clients,
+                            backend,
                             config,
                         ),
                         None,
@@ -679,46 +347,20 @@ impl Dashboard {
                         self.open_buffer(
                             buffer,
                             BufferAction::ReplacePane,
-                            clients,
+                            backend,
                             config,
                         ),
                         None,
                     ),
                     sidebar::Event::Close(window, pane) => {
-                        (self.close_pane(clients, config, window, pane), None)
+                        (self.close_pane(config, window, pane), None)
                     }
                     sidebar::Event::Swap(window, pane) => {
                         (self.swap_pane_with_focus(window, pane), None)
                     }
-                    sidebar::Event::Detach(buffer) => {
-                        if let Some(target) = buffer.target() {
-                            let server = buffer.server();
-
-                            (
-                                self.leave_server_target(
-                                    clients,
-                                    config,
-                                    server.clone(),
-                                    target,
-                                    Some("detach".to_string()),
-                                ),
-                                None,
-                            )
-                        } else {
-                            (Task::none(), None)
-                        }
-                    }
-                    sidebar::Event::Leave(buffer) => {
-                        self.leave_buffer(clients, config, buffer)
-                    }
                     sidebar::Event::ToggleCommandBar => (
                         self.toggle_command_bar(
-                            servers,
-                            clients,
-                            &closed_upstream_buffers(self, clients),
-                            version,
-                            config,
-                            theme,
+                            session, version, config, theme,
                         ),
                         None,
                     ),
@@ -733,10 +375,6 @@ impl Dashboard {
                         self.toggle_theme_editor(theme, main_window, config),
                         None,
                     ),
-                    sidebar::Event::OpenDocumentation => {
-                        let _ = open_url::open(WIKI_WEBSITE);
-                        (Task::none(), None)
-                    }
                     sidebar::Event::OpenAbout {
                         version,
                         commit,
@@ -749,40 +387,26 @@ impl Dashboard {
                             system_information,
                         }),
                     ),
-                    sidebar::Event::MarkServerAsRead(server) => {
-                        mark_server_as_read(server, &mut self.history, clients);
-
-                        (Task::none(), None)
-                    }
                     sidebar::Event::MarkAsRead(buffer) => {
                         if let Some(kind) = history::Kind::from_buffer(buffer) {
-                            mark_as_read(
-                                kind,
-                                &mut self.history,
-                                clients,
-                                TokenPriority::User,
-                            );
+                            self.history.mark_as_read(&kind);
                         }
 
                         (Task::none(), None)
                     }
-                    sidebar::Event::Connect(server) => {
-                        connect_server(server, controllers, servers);
-
-                        (Task::none(), None)
+                    sidebar::Event::OpenNewDm => {
+                        (Task::none(), Some(Event::OpenNewDm))
                     }
-                    sidebar::Event::DisableAutoconnect(server) => {
-                        controllers.disable_autoconnect(&server);
-
-                        (Task::none(), None)
+                    sidebar::Event::OpenNewGroup => {
+                        (Task::none(), Some(Event::OpenNewGroup))
                     }
-                    sidebar::Event::Remove(server) => {
-                        (Task::none(), Some(Event::Remove(server)))
+                    sidebar::Event::OpenSetNickname(convo_id) => {
+                        (Task::none(), Some(Event::OpenSetNickname(convo_id)))
                     }
-                    sidebar::Event::ShowMutedBuffers(show_muted_buffers) => {
-                        self.buffer_settings.show_muted = show_muted_buffers;
-                        (Task::none(), None)
-                    }
+                    sidebar::Event::ConfirmDeleteConversation(convo_id) => (
+                        Task::none(),
+                        Some(Event::ConfirmDeleteConversation(convo_id)),
+                    ),
                 };
 
                 let window = main_window.id;
@@ -844,130 +468,18 @@ impl Dashboard {
                     );
                 }
             }
-            Message::History(message) => {
-                if let Some(event) =
-                    self.history.update(message, clients, &config.buffer)
-                {
-                    match event {
-                        history::manager::Event::Loaded(kind) => {
-                            let buffer = kind.clone().into();
-
-                            if let Some((window, pane, state)) =
-                                self.panes.get_mut_by_buffer(&buffer)
-                            {
-                                if let Some(draft_reply) =
-                                    state.buffer.get_draft_reply()
-                                    && let Some(reply_preview) =
-                                        self.history.generate_reply_preview(
-                                            kind.clone(),
-                                            &draft_reply.id,
-                                            &draft_reply.server_time,
-                                        )
-                                {
-                                    state
-                                        .buffer
-                                        .set_reply_preview(reply_preview);
-                                }
-
-                                if state.buffer.has_pending_scroll_to() {
-                                    return (
-                                        state
-                                            .buffer
-                                            .prepare_for_pending_scroll_to(
-                                                &self.history,
-                                                config,
-                                            )
-                                            .map(move |message| {
-                                                Message::Pane(
-                                                    window,
-                                                    pane::Message::Buffer(
-                                                        pane, message,
-                                                    ),
-                                                )
-                                            }),
-                                        None,
-                                    );
-                                } else {
-                                    let task = if matches!(
-                                        kind,
-                                        history::Kind::ChannelMonitor
-                                    ) {
-                                        state.buffer.scroll_to_end(config)
-                                    } else {
-                                        match config
-                                            .buffer
-                                            .scroll_position_on_open
-                                        {
-                                            ScrollPosition::OldestUnread => {
-                                                state.buffer.scroll_to_backlog(
-                                                    &self.history,
-                                                    config,
-                                                )
-                                            }
-                                            ScrollPosition::Newest => {
-                                                Task::none()
-                                            }
-                                        }
-                                    };
-
-                                    return (
-                                        task.map(move |message| {
-                                            Message::Pane(
-                                                window,
-                                                pane::Message::Buffer(
-                                                    pane, message,
-                                                ),
-                                            )
-                                        }),
-                                        None,
-                                    );
-                                }
-                            }
-                        }
-                        history::manager::Event::Exited => {
-                            return (Task::none(), Some(Event::Exit));
-                        }
-                        history::manager::Event::SentMessageUpdated(
-                            kind,
-                            read_marker,
-                        ) => {
-                            if config.buffer.mark_as_read.on_message_sent
-                                && let (Some(server), Some(target)) =
-                                    (kind.server(), kind.target())
-                            {
-                                clients.send_markread(
-                                    server,
-                                    target,
-                                    read_marker,
-                                    TokenPriority::High,
-                                );
-                            }
-                        }
-                        history::manager::Event::ResendMessage(
-                            kind,
-                            message,
-                        ) => {
-                            return (
-                                self.resend_message(
-                                    clients, kind, message, config,
-                                ),
-                                None,
-                            );
-                        }
-                        history::manager::Event::EchoEvents(server, events) => {
-                            return (
-                                Task::none(),
-                                Some(Event::EchoEvents(server, events)),
-                            );
-                        }
-                    }
-                }
-            }
             Message::DashboardSaved(Ok(())) => {
                 log::debug!("dashboard saved");
             }
             Message::DashboardSaved(Err(error)) => {
                 log::warn!("error saving dashboard: {error}");
+            }
+            Message::Exited(result) => {
+                if let Err(error) = result {
+                    log::warn!("error saving dashboard on exit: {error}");
+                }
+
+                return (Task::none(), Some(Event::Exit));
             }
             Message::Task(message) => {
                 let Some(command_bar) = &mut self.command_bar else {
@@ -984,9 +496,7 @@ impl Dashboard {
                     Some(command_bar::Event::Command(command)) => {
                         let (command, event) = self.handle_command_bar_command(
                             command,
-                            clients,
-                            controllers,
-                            servers,
+                            backend,
                             theme,
                             config,
                             main_window,
@@ -996,12 +506,7 @@ impl Dashboard {
                             Task::batch(vec![
                                 command,
                                 self.toggle_command_bar(
-                                    servers,
-                                    clients,
-                                    &closed_upstream_buffers(self, clients),
-                                    version,
-                                    config,
-                                    theme,
+                                    session, version, config, theme,
                                 ),
                             ]),
                             event,
@@ -1010,12 +515,7 @@ impl Dashboard {
                     Some(command_bar::Event::Unfocused) => {
                         return (
                             self.toggle_command_bar(
-                                servers,
-                                clients,
-                                &closed_upstream_buffers(self, clients),
-                                version,
-                                config,
-                                theme,
+                                session, version, config, theme,
                             ),
                             None,
                         );
@@ -1067,10 +567,7 @@ impl Dashboard {
                     }
                     CloseBuffer => {
                         let Focus { window, pane } = self.focus;
-                        return (
-                            self.close_pane(clients, config, window, pane),
-                            None,
-                        );
+                        return (self.close_pane(config, window, pane), None);
                     }
                     MaximizeBuffer => {
                         let Focus { window, pane } = self.focus;
@@ -1083,15 +580,7 @@ impl Dashboard {
                         self.panes.main.restore();
                     }
                     CycleNextBuffer => {
-                        let cycle_buffers = self.side_menu.visible_buffers(
-                            servers,
-                            clients,
-                            &self.history,
-                            &self.panes,
-                            config,
-                            self.buffer_settings.show_muted,
-                            config.actions.sidebar.cycle.include_collapsed(),
-                        );
+                        let cycle_buffers = self.cycle_buffers(session, config);
 
                         let open_buffers = open_buffers(self);
 
@@ -1106,7 +595,7 @@ impl Dashboard {
                                 self.open_buffer(
                                     buffer,
                                     BufferAction::ReplacePane,
-                                    clients,
+                                    backend,
                                     config,
                                 ),
                                 None,
@@ -1114,15 +603,7 @@ impl Dashboard {
                         }
                     }
                     CyclePreviousBuffer => {
-                        let cycle_buffers = self.side_menu.visible_buffers(
-                            servers,
-                            clients,
-                            &self.history,
-                            &self.panes,
-                            config,
-                            self.buffer_settings.show_muted,
-                            config.actions.sidebar.cycle.include_collapsed(),
-                        );
+                        let cycle_buffers = self.cycle_buffers(session, config);
 
                         let open_buffers = open_buffers(self);
 
@@ -1137,36 +618,14 @@ impl Dashboard {
                                 self.open_buffer(
                                     buffer,
                                     BufferAction::ReplacePane,
-                                    clients,
+                                    backend,
                                     config,
                                 ),
                                 None,
                             );
                         }
                     }
-                    LeaveBuffer => {
-                        if let Some((_, _, state)) = self.get_focused_mut()
-                            && let Some(buffer) =
-                                state.buffer.upstream().cloned()
-                        {
-                            return self.leave_buffer(clients, config, buffer);
-                        }
-                    }
-                    ToggleNicklist => {
-                        if let Some((_, _, pane)) = self.get_focused_mut() {
-                            if let Some(buffer) = pane.buffer.data() {
-                                let settings = self.buffer_settings.entry(
-                                    &buffer,
-                                    Some(config.buffer.clone().into()),
-                                );
-                                settings.channel.nicklist.toggle_visibility();
-                            }
-
-                            self.last_changed = Some(Instant::now());
-                            return (Task::none(), None);
-                        }
-                    }
-                    ToggleTopic => {
+                    ToggleMemberList => {
                         if let Some((_, _, pane)) = self.get_focused_mut() {
                             if let Some(buffer) = pane.buffer.data() {
                                 let settings = self.buffer_settings.entry(
@@ -1174,8 +633,8 @@ impl Dashboard {
                                     Some(config.buffer.clone().into()),
                                 );
                                 settings
-                                    .channel
-                                    .topic_banner
+                                    .conversation
+                                    .member_list
                                     .toggle_visibility();
                             }
 
@@ -1183,18 +642,16 @@ impl Dashboard {
                             return (Task::none(), None);
                         }
                     }
+                    ToggleDetails => {
+                        self.toggle_details_on_focused();
+                    }
                     ToggleSidebar => {
                         self.toggle_sidebar();
                     }
                     CommandBar => {
                         return (
                             self.toggle_command_bar(
-                                servers,
-                                clients,
-                                &closed_upstream_buffers(self, clients),
-                                version,
-                                config,
-                                theme,
+                                session, version, config, theme,
                             ),
                             None,
                         );
@@ -1208,24 +665,11 @@ impl Dashboard {
                             None,
                         );
                     }
-                    FileTransfers => {
-                        if config.file_transfer.enabled {
-                            return (
-                                self.toggle_internal_buffer(
-                                    clients,
-                                    config,
-                                    buffer::Internal::FileTransfers,
-                                ),
-                                None,
-                            );
-                        }
-                    }
                     Logs => {
                         return (
                             self.toggle_internal_buffer(
-                                clients,
                                 config,
-                                buffer::Internal::Logs,
+                                data::buffer::Internal::Logs,
                             ),
                             None,
                         );
@@ -1240,16 +684,6 @@ impl Dashboard {
                             None,
                         );
                     }
-                    Highlights => {
-                        return (
-                            self.toggle_internal_buffer(
-                                clients,
-                                config,
-                                buffer::Internal::Highlights,
-                            ),
-                            None,
-                        );
-                    }
                     ToggleFullscreen => {
                         return (
                             window::toggle_fullscreen(),
@@ -1257,7 +691,7 @@ impl Dashboard {
                         );
                     }
                     QuitApplication => {
-                        return (self.exit(clients, config), None);
+                        return (self.exit(config), None);
                     }
                     ScrollUpPage => {
                         return (
@@ -1300,13 +734,6 @@ impl Dashboard {
                         );
                     }
                     ScrollToTop => {
-                        if config.buffer.chathistory.infinite_scroll
-                            && let Some((_, _, state)) = self.get_focused()
-                            && let Some(buffer) = state.buffer.data()
-                        {
-                            self.request_older_chathistory(clients, &buffer);
-                        }
-
                         return (
                             self.get_focused_mut().map_or_else(
                                 Task::none,
@@ -1362,19 +789,7 @@ impl Dashboard {
                     }
                     CycleNextUnreadBuffer => {
                         let cycle_buffers =
-                            self.side_menu.visible_buffers_with_has_unread(
-                                servers,
-                                clients,
-                                &self.history,
-                                &self.panes,
-                                config,
-                                self.buffer_settings.show_muted,
-                                config
-                                    .actions
-                                    .sidebar
-                                    .cycle
-                                    .include_collapsed(),
-                            );
+                            self.cycle_buffers_with_has_unread(session, config);
 
                         let open_buffers = open_buffers(self);
 
@@ -1389,7 +804,7 @@ impl Dashboard {
                                 self.open_buffer(
                                     buffer.clone(),
                                     BufferAction::ReplacePane,
-                                    clients,
+                                    backend,
                                     config,
                                 ),
                                 None,
@@ -1398,19 +813,7 @@ impl Dashboard {
                     }
                     CyclePreviousUnreadBuffer => {
                         let cycle_buffers =
-                            self.side_menu.visible_buffers_with_has_unread(
-                                servers,
-                                clients,
-                                &self.history,
-                                &self.panes,
-                                config,
-                                self.buffer_settings.show_muted,
-                                config
-                                    .actions
-                                    .sidebar
-                                    .cycle
-                                    .include_collapsed(),
-                            );
+                            self.cycle_buffers_with_has_unread(session, config);
 
                         let open_buffers = open_buffers(self);
 
@@ -1425,7 +828,7 @@ impl Dashboard {
                                 self.open_buffer(
                                     buffer.clone(),
                                     BufferAction::ReplacePane,
-                                    clients,
+                                    backend,
                                     config,
                                 ),
                                 None,
@@ -1439,12 +842,7 @@ impl Dashboard {
                                 .data()
                                 .and_then(history::Kind::from_buffer)
                         {
-                            mark_as_read(
-                                kind,
-                                &mut self.history,
-                                clients,
-                                TokenPriority::User,
-                            );
+                            self.history.mark_as_read(&kind);
                         }
                     }
                     ConfigEditorSave => {
@@ -1474,9 +872,8 @@ impl Dashboard {
                     OpenConfigEditor => {
                         return (
                             self.toggle_internal_buffer(
-                                clients,
                                 config,
-                                buffer::Internal::ConfigEditor,
+                                data::buffer::Internal::ConfigEditor,
                             ),
                             None,
                         );
@@ -1484,62 +881,16 @@ impl Dashboard {
                     OpenConfigFile => {
                         let _ = open_url::open(Config::path());
                     }
-                    ShowMutedBuffers => {
-                        self.buffer_settings.show_muted = true;
-                    }
-                    HideMutedBuffers => {
-                        self.buffer_settings.show_muted = false;
-                    }
-                }
-            }
-            Message::FileTransfer(update) => {
-                self.file_transfers.update(update, config);
-            }
-            Message::SendFileSelected(server, to, path) => {
-                if let Some(server_handle) = clients.get_server_handle(&server)
-                {
-                    let query = target::Query::from(&to);
-
-                    if let Some(path) = path
-                        && let Some(event) = self.file_transfers.send(
-                            file_transfer::SendRequest {
-                                to,
-                                path,
-                                server: server.clone(),
-                                server_handle: server_handle.clone(),
-                            },
-                            config,
-                        )
-                    {
-                        return (
-                            self.handle_file_transfer_event(
-                                &server,
-                                &query,
-                                event,
-                                clients
-                                    .get_server_casemapping_or_default(&server),
-                                config,
-                            ),
-                            None,
-                        );
-                    }
+                    // Sidebar-only toggles; nothing to do from a pane.
+                    ShowMutedBuffers | HideMutedBuffers => {}
                 }
             }
             Message::CloseContextMenu(window, any_closed) => {
                 if !any_closed {
-                    if let Some((_, _, state, history)) =
-                        self.get_focused_with_history_mut()
+                    if let Some((_, _, state)) = self.get_focused_mut()
+                        && state.buffer.close_picker()
                     {
-                        if state.buffer.close_picker() {
-                            return (Task::none(), None);
-                        // We only want to call clear_draft_reply if
-                        // close_picker does not return true.
-                        } else if state
-                            .buffer
-                            .clear_draft_reply(history, config)
-                        {
-                            return (Task::none(), None);
-                        }
+                        return (Task::none(), None);
                     }
 
                     if self.is_pane_maximized() && window == self.main_window()
@@ -1600,108 +951,14 @@ impl Dashboard {
 
                 return (Task::none(), event);
             }
-            Message::Client(message) => match message {
-                client::Message::ChatHistoryRequest(server, subcommand) => {
-                    clients.send_chathistory_request(
-                        &server,
-                        subcommand,
-                        TokenPriority::High,
-                    );
-                }
-                client::Message::ChatHistoryTargetsTimestampUpdated(
-                    server,
-                    timestamp,
-                    Ok(()),
-                ) => {
-                    log::debug!(
-                        "updated targets timestamp for {server} to {timestamp}"
-                    );
-                }
-                client::Message::ChatHistoryTargetsTimestampUpdated(
-                    server,
-                    timestamp,
-                    Err(error),
-                ) => {
-                    log::warn!(
-                        "failed to update targets timestamp for {server} to {timestamp}: {error}"
-                    );
-                }
-                client::Message::RequestNewerChatHistory(
-                    server,
-                    target,
-                    server_time,
-                    allow_at,
-                ) => {
-                    let message_reference_types = clients
-                        .get_server_chathistory_message_reference_types(
-                            &server,
-                        );
-
-                    let message_reference =
-                        self.history.last_can_reference_before_or_at(
-                            server.clone(),
-                            target.clone(),
-                            server_time,
-                            allow_at,
-                            &message_reference_types,
-                        );
-
-                    let limit = clients.get_server_chathistory_limit(&server);
-
-                    clients.send_chathistory_request(
-                        &server,
-                        ChatHistorySubcommand::Latest(
-                            target,
-                            message_reference,
-                            limit,
-                        ),
-                        TokenPriority::High,
-                    );
-                }
-            },
-            Message::LoadPreview((url, Ok(preview))) => {
-                log::trace!("Preview loaded for {url}");
-                if let hash_map::Entry::Occupied(mut entry) =
-                    self.previews.entry(url)
-                {
-                    *entry.get_mut() = preview::State::Loaded(preview);
-                }
-            }
-            Message::ServerIcon(message) => {
-                self.server_icons.update(message);
-            }
-            Message::LoadPreview((url, Err(error))) => {
-                if matches!(error, preview::LoadError::Disabled) {
-                    log::trace!("Failed to load preview for {url}: {error}");
-                } else {
-                    log::debug!("Failed to load preview for {url}: {error}");
-                }
-                if self.previews.contains_key(&url) {
-                    self.previews.insert(url, preview::State::Error(error));
-                }
-            }
             Message::NewWindow(window, pane) => {
                 let (state, pane) = pane_grid::State::new(pane);
                 self.panes.popout.insert(window, state);
 
                 return (self.focus_pane(window, pane), None);
             }
-            Message::Filehost(msg) => {
-                return (
-                    self.handle_filehost_message(msg, clients, config),
-                    None,
-                );
-            }
-            Message::ProceedWithFilehostUpload => {
-                let task = self
-                    .filehost
-                    .proceed(clients, self.http_client.clone(), &config.proxy)
-                    .map(Message::Filehost);
-                return (task, None);
-            }
-            Message::CancelFilehostUpload => {
-                let task = self.filehost.cancel().map(Message::Filehost);
-                return (task, None);
+            Message::StatusBar(message) => {
+                self.status_bar.update(message);
             }
         }
 
@@ -1711,8 +968,7 @@ impl Dashboard {
     pub fn view_window<'a>(
         &'a self,
         window: window::Id,
-        servers: &'a server::Map,
-        clients: &'a client::Map,
+        session: &'a data::Session,
         version: &'a Version,
         config: &'a Config,
         theme: &'a Theme,
@@ -1736,22 +992,13 @@ impl Dashboard {
                         1,
                         is_focused,
                         false,
-                        self.typing_animation.as_ref(),
-                        clients,
-                        &self.file_transfers,
+                        session,
                         &self.history,
-                        &self.previews,
                         &self.side_menu,
                         config,
                         theme,
                         settings,
                         window != self.main_window(),
-                        |server: &Server, channel: &target::Channel| -> bool {
-                            self.has_focused_pane_channel(server, channel)
-                        },
-                        |server: &Server, channel: &target::Channel| -> bool {
-                            self.has_open_pane_channel(server, channel)
-                        },
                     )
                 })
                 .spacing(config.pane.gap.inner)
@@ -1764,7 +1011,7 @@ impl Dashboard {
             let base = Element::new(content)
                 .map(move |message| Message::Pane(window, message));
             let base = self.with_command_bar_overlay(
-                base, window, servers, clients, version, config,
+                base, window, session, version, config,
             );
 
             return self.with_keyboard_shortcuts(base, config);
@@ -1779,8 +1026,7 @@ impl Dashboard {
 
     pub fn view<'a>(
         &'a self,
-        servers: &'a server::Map,
-        clients: &'a client::Map,
+        session: &'a data::Session,
         version: &'a Version,
         config: &'a Config,
         theme: &'a Theme,
@@ -1802,22 +1048,13 @@ impl Dashboard {
                     panes,
                     is_focused,
                     maximized,
-                    self.typing_animation.as_ref(),
-                    clients,
-                    &self.file_transfers,
+                    session,
                     &self.history,
-                    &self.previews,
                     &self.side_menu,
                     config,
                     theme,
                     settings,
                     false,
-                    |server: &Server, channel: &target::Channel| -> bool {
-                        self.has_focused_pane_channel(server, channel)
-                    },
-                    |server: &Server, channel: &target::Channel| -> bool {
-                        self.has_open_pane_channel(server, channel)
-                    },
                 )
             })
             .on_click(pane::Message::PaneClicked)
@@ -1853,17 +1090,13 @@ impl Dashboard {
         let side_menu = self
             .side_menu
             .view(
-                servers,
-                clients,
+                session,
                 &self.history,
                 &self.panes,
                 self.focus,
-                &self.server_icons,
                 config,
-                &self.file_transfers,
                 version,
                 theme,
-                self.buffer_settings.show_muted,
             )
             .map(|e| e.map(Message::Sidebar));
 
@@ -1897,11 +1130,22 @@ impl Dashboard {
                 .into()
         };
 
+        // The status strip claims height only while it has something to
+        // say (backend errors, delivery not online).
+        let base: Element<Message> =
+            match status_bar::view(&self.status_bar, session, theme) {
+                Some(strip) => column![
+                    container(base).width(Length::Fill).height(Length::Fill),
+                    strip.map(Message::StatusBar),
+                ]
+                .into(),
+                None => base,
+            };
+
         let base = self.with_command_bar_overlay(
             base,
             self.main_window(),
-            servers,
-            clients,
+            session,
             version,
             config,
         );
@@ -1913,8 +1157,7 @@ impl Dashboard {
         &'a self,
         base: Element<'a, Message>,
         window: window::Id,
-        servers: &'a server::Map,
-        clients: &'a client::Map,
+        session: &'a data::Session,
         version: &'a Version,
         config: &'a Config,
     ) -> Element<'a, Message> {
@@ -1937,15 +1180,12 @@ impl Dashboard {
                 background,
                 command_bar
                     .view(
-                        servers,
-                        clients,
-                        &all_upstream_buffers(clients, &self.history),
+                        session,
                         self.focus,
                         self.buffer_resize_action(),
                         version,
                         config,
                         self.main_window(),
-                        self.buffer_settings.show_muted,
                     )
                     .map(Message::Task),
                 anchored_overlay::Anchor::BelowTopCentered,
@@ -1958,51 +1198,8 @@ impl Dashboard {
             column![column![base]].into()
         };
 
-        let focused_target_info = self
-            .panes
-            .get(self.focus.window, self.focus.pane)
-            .and_then(|pane| {
-                let target = pane.buffer.target()?;
-                let server = pane.buffer.server()?;
-                Some((target, server))
-            });
-
-        if self.filehost.file_being_hovered {
-            let (overlay_text, is_error) = if !config.filehost.file_drop() {
-                (String::from("File drop is disabled here"), true)
-            } else if let Some((target, server)) = focused_target_info {
-                (format!("Drop to upload file to {target} @ {server}"), false)
-            } else {
-                (String::from("Upload is not valid here"), true)
-            };
-
-            let text_style: fn(&Theme) -> iced::widget::text::Style =
-                if is_error {
-                    theme::text::error
-                } else {
-                    theme::text::primary
-                };
-
-            stack![
-                base,
-                container(
-                    center(
-                        container(text(overlay_text).style(text_style))
-                            .style(theme::container::tooltip)
-                            .padding(8),
-                    )
-                    .width(Length::Fill)
-                    .height(Length::Fill),
-                )
-                .width(Length::Fill)
-                .height(Length::Fill)
-                .style(theme::container::transparent_overlay),
-            ]
-            .into()
-        } else {
-            // Wrap in stack so iced can track base properly
-            stack![base].into()
-        }
+        // Wrap in stack so iced can track base properly
+        stack![base].into()
     }
 
     fn with_keyboard_shortcuts<'a>(
@@ -2018,566 +1215,51 @@ impl Dashboard {
         window: window::Id,
         id: pane_grid::Pane,
         event: buffer::Event,
-        clients: &mut data::client::Map,
-        controllers: &mut stream::Map,
+        session: &data::Session,
+        backend: &mut stream::Map,
         config: &Config,
     ) -> (Task<Message>, Option<Event>) {
-        let Some(pane) = self.panes.get_mut(window, id) else {
-            return (Task::none(), None);
+        let close_context_menu = move || {
+            context_menu::close(convert::identity).map(move |any_closed| {
+                Message::CloseContextMenu(window, any_closed)
+            })
         };
 
         match event {
-            buffer::Event::OpenInternalBuffer(buffer) => {
-                // If opening channel discovery with a server, send LIST command if needed
-                if let buffer::Internal::ChannelDiscovery(Some(server)) =
-                    &buffer
-                {
-                    Self::send_list_command_if_needed(server, pane, clients);
-                }
-
-                return (
-                    self.open_buffer(
-                        data::Buffer::Internal(buffer),
-                        config.actions.buffer.open_internal,
-                        clients,
-                        config,
-                    ),
-                    None,
-                );
-            }
             buffer::Event::ContextMenu(event) => {
-                let mut tasks = if matches!(
-                    event,
-                    buffer::context_menu::Event::LoadUserAvatar(..)
-                ) {
-                    vec![]
-                } else {
-                    vec![context_menu::close(convert::identity).map(
-                        move |any_closed| {
-                            Message::CloseContextMenu(window, any_closed)
-                        },
-                    )]
-                };
-
-                let event = match event {
-                    buffer::context_menu::Event::LoadUserAvatar(
-                        server,
-                        url,
-                    ) => {
-                        let client = if clients
-                            .get_server_proxy_config(&server)
-                            .is_some()
-                        {
-                            clients.get_server_http_client(&server)
-                        } else {
-                            self.http_client.clone()
-                        };
-
-                        if let Some(client) = client
-                            && !self.previews.contains_key(&url)
-                        {
-                            self.previews
-                                .insert(url.clone(), preview::State::Loading);
-                            tasks.push(Task::perform(
-                                data::preview::load_avatar(
-                                    url.clone(),
-                                    client,
-                                    config.metadata.avatar.clone(),
-                                    config.preview.clone(),
-                                    self.previews_cache.clone(),
-                                ),
-                                move |result| {
-                                    Message::LoadPreview((url.clone(), result))
-                                },
-                            ));
-                        }
-
-                        None
-                    }
+                let action = match event {
                     buffer::context_menu::Event::CopyText(text) => {
-                        tasks.push(clipboard::write(text).discard());
-                        None
+                        clipboard::write(text).discard()
                     }
-                    buffer::context_menu::Event::OpenUrl(url) => {
-                        Some(Event::OpenUrl(
-                            url,
-                            config.buffer.url.prompt_before_open,
-                        ))
-                    }
-                    buffer::context_menu::Event::HidePreview(hash, url) => {
-                        let kind = pane
-                            .buffer
-                            .data()
-                            .and_then(history::Kind::from_buffer);
-                        let parsed = url::Url::parse(&url).ok();
-
-                        if let (Some(kind), Some(url)) = (kind, parsed) {
-                            self.history.hide_preview(kind, hash, url);
-                        }
-
-                        None
-                    }
-                    buffer::context_menu::Event::ShowPreview(hash, url) => {
-                        let kind = pane
-                            .buffer
-                            .data()
-                            .and_then(history::Kind::from_buffer);
-                        let parsed = url::Url::parse(&url).ok();
-
-                        if let (Some(kind), Some(url)) = (kind, parsed) {
-                            self.history.show_preview(kind, hash, &url);
-                            tasks.push(
-                                self.reload_visible_previews(clients, config),
-                            );
-                        }
-
-                        None
-                    }
-                    buffer::context_menu::Event::ToggleAccessLevel(
-                        server,
-                        channel,
-                        nick,
-                        mode,
-                    ) => {
-                        let buffer = buffer::Upstream::Channel(
-                            server.clone(),
-                            channel.clone(),
-                        );
-
-                        let command = command::Irc::Mode(
-                            channel.to_string(),
-                            Some(mode),
-                            Some(vec![nick.to_string()]),
-                        );
-                        let input = data::Input::from_command(buffer, command);
-
-                        if let Some(encoded) = input.encoded() {
-                            clients.send(
-                                &input.buffer,
-                                encoded,
-                                TokenPriority::User,
-                            );
-                        }
-
-                        None
-                    }
-                    buffer::context_menu::Event::SendWhois(server, nick) => {
-                        let buffer =
-                            pane.buffer.upstream().cloned().unwrap_or_else(
-                                || buffer::Upstream::Server(server.clone()),
-                            );
-
-                        let command =
-                            command::Irc::Whois(None, nick.to_string());
-
-                        let input =
-                            data::Input::from_command(buffer.clone(), command);
-
-                        if let Some(encoded) = input.encoded() {
-                            clients.send(
-                                &input.buffer,
-                                encoded,
-                                TokenPriority::User,
-                            );
-                        }
-
-                        None
-                    }
-                    buffer::context_menu::Event::SendWhowas(server, nick) => {
-                        let buffer =
-                            pane.buffer.upstream().cloned().unwrap_or_else(
-                                || buffer::Upstream::Server(server.clone()),
-                            );
-
-                        let command =
-                            command::Irc::Whowas(nick.to_string(), None);
-
-                        let input =
-                            data::Input::from_command(buffer.clone(), command);
-
-                        if let Some(encoded) = input.encoded() {
-                            clients.send(
-                                &input.buffer,
-                                encoded,
-                                TokenPriority::User,
-                            );
-                        }
-
-                        None
-                    }
-                    buffer::context_menu::Event::OpenTarget(
-                        server,
-                        target,
-                        buffer_action,
-                    ) => {
-                        let buffer = match target {
-                            Target::Channel(channel) => {
-                                buffer::Upstream::Channel(server, channel)
-                            }
-                            Target::Query(query) => {
-                                buffer::Upstream::Query(server, query)
-                            }
-                        };
-
-                        tasks.push(self.open_buffer(
-                            data::Buffer::Upstream(buffer),
-                            buffer_action,
-                            clients,
-                            config,
-                        ));
-
-                        None
-                    }
-                    buffer::context_menu::Event::InsertNickname(nick) => {
-                        if let Some((_, _, pane, history)) =
-                            self.get_focused_with_history_mut()
-                        {
-                            pane.buffer.insert_user_to_input(
-                                nick,
-                                history,
-                                &config.buffer.text_input.autocomplete,
-                            );
-                        }
-
-                        None
-                    }
-                    buffer::context_menu::Event::SendFile(server, nick) => {
-                        tasks.push(Task::perform(
-                            async move {
-                                rfd::AsyncFileDialog::new()
-                                    .pick_file()
-                                    .await
-                                    .map(|handle| handle.path().to_path_buf())
-                            },
-                            move |file| {
-                                Message::SendFileSelected(
-                                    server.clone(),
-                                    nick.clone(),
-                                    file,
-                                )
-                            },
-                        ));
-
-                        None
-                    }
-                    buffer::context_menu::Event::CtcpRequest(
-                        command,
-                        server,
-                        nick,
-                        params,
-                    ) => {
-                        let buffer =
-                            pane.buffer.upstream().cloned().unwrap_or_else(
-                                || buffer::Upstream::Server(server.clone()),
-                            );
-
-                        let command = command::Irc::Ctcp(
-                            command,
-                            nick.to_string(),
-                            params,
-                        );
-
-                        let input =
-                            data::Input::from_command(buffer.clone(), command);
-
-                        if let Some(encoded) = input.encoded() {
-                            clients.send(
-                                &input.buffer,
-                                encoded,
-                                TokenPriority::High,
-                            );
-                        }
-
-                        None
-                    }
-                    buffer::context_menu::Event::CopyTimestamp(date_time) => {
-                        let date_time =
-                            config.buffer.format_copy_timestamp(&date_time);
-
-                        tasks.push(clipboard::write(date_time).discard());
-
-                        None
-                    }
-                    buffer::context_menu::Event::DeleteMessage(
-                        server_time,
-                        hash,
-                    ) => {
-                        if let Some(kind) =
-                            pane.buffer.upstream().map(|buffer| {
-                                history::Kind::from_input_buffer(buffer.clone())
-                            })
-                            && let Some(future) = self.history.remove_message(
-                                kind,
-                                server_time,
-                                hash,
-                                false,
-                            )
-                        {
-                            tasks.push(
-                                Task::future(future).map(Message::History),
-                            );
-                        }
-
-                        None
-                    }
-                    buffer::context_menu::Event::ResendMessage(
-                        server_time,
-                        hash,
-                    ) => {
-                        if let Some(kind) =
-                            pane.buffer.upstream().map(|buffer| {
-                                history::Kind::from_input_buffer(buffer.clone())
-                            })
-                            && let Some(future) = self.history.remove_message(
-                                kind,
-                                server_time,
-                                hash,
-                                true,
-                            )
-                        {
-                            tasks.push(
-                                Task::future(future).map(Message::History),
-                            );
-                        }
-
-                        None
-                    }
-                    buffer::context_menu::Event::OpenReactionModal(
-                        msgid,
-                        selected_reactions,
-                    ) => {
-                        tasks.push(
-                            pane.open_modal(
-                                id,
-                                modal::Modal::AddReaction(
-                                    reaction_modal::State::new(
-                                        msgid,
-                                        selected_reactions,
-                                    ),
-                                ),
-                            )
-                            .map(move |message| Message::Pane(window, message)),
-                        );
-                        None
-                    }
-                    buffer::context_menu::Event::RedactMessage(msgid) => {
-                        tasks.push(
-                            pane.open_modal(
-                                id,
-                                modal::Modal::RedactReason(
-                                    redaction_modal::State::new(msgid),
-                                ),
-                            )
-                            .map(move |message| Message::Pane(window, message)),
-                        );
-
-                        None
-                    }
-                    buffer::context_menu::Event::Reply {
-                        msgid,
-                        server_time,
-                        ..
-                    } => {
-                        if let Some(kind) =
-                            pane.buffer.upstream().map(|buffer| {
-                                history::Kind::from_input_buffer(buffer.clone())
-                            })
-                            && let Some(reply_preview) =
-                                self.history.generate_reply_preview(
-                                    kind,
-                                    &msgid,
-                                    &server_time,
-                                )
-                        {
-                            pane.buffer.set_reply_preview(reply_preview);
-                        }
-
-                        tasks.push(self.focus_pane(window, id));
-
-                        None
-                    }
-                    buffer::context_menu::Event::ExpandMessage(
-                        server_time,
-                        hash,
-                    ) => {
-                        if let Some(kind) =
-                            pane.buffer.upstream().map(|buffer| {
-                                history::Kind::from_input_buffer(buffer.clone())
-                            })
-                        {
-                            self.history.expand_message(
-                                kind,
-                                server_time,
-                                hash,
-                                &config.buffer.server_messages.condense,
-                            );
-                        }
-
-                        None
-                    }
-                    buffer::context_menu::Event::ContractMessage(
-                        server_time,
-                        hash,
-                    ) => {
-                        if let Some(kind) =
-                            pane.buffer.upstream().map(|buffer| {
-                                history::Kind::from_input_buffer(buffer.clone())
-                            })
-                        {
-                            self.history.contract_message(
-                                kind,
-                                server_time,
-                                hash,
-                                &config.buffer.server_messages.condense,
-                            );
-                        }
-
-                        None
+                    buffer::context_menu::Event::DmWith(address) => {
+                        self.open_dm(&address, session, backend, config)
                     }
                 };
 
-                return (Task::batch(tasks), event);
+                return (Task::batch(vec![close_context_menu(), action]), None);
             }
-            buffer::Event::OpenBuffers(server, targets) => {
-                let mut tasks = vec![];
-
-                for (target, buffer_action) in targets {
-                    tasks.push(self.open_target(
-                        server.clone(),
-                        target,
-                        clients,
-                        buffer_action,
-                        config,
-                        true,
-                    ));
-                }
-
-                return (Task::batch(tasks), None);
-            }
-            buffer::Event::LeaveBuffers(targets, reason) => {
-                if let Some(server) = pane
-                    .buffer
-                    .upstream()
-                    .map(buffer::Upstream::server)
-                    .cloned()
-                {
-                    let mut tasks = vec![];
-
-                    for target in targets {
-                        tasks.push(self.leave_server_target(
-                            clients,
-                            config,
-                            server.clone(),
-                            target,
-                            reason.clone(),
-                        ));
-                    }
-
-                    return (Task::batch(tasks), None);
-                }
-            }
-            buffer::Event::History(history_task) => {
-                return (history_task.map(Message::History), None);
-            }
-            buffer::Event::GoToMessage(
-                server,
-                channel,
-                message,
-                buffer_action,
-            ) => {
-                let buffer = data::Buffer::Upstream(buffer::Upstream::Channel(
-                    server, channel,
-                ));
-
-                let mut tasks = vec![];
-
-                if self.panes.get_mut_by_buffer(&buffer).is_none() {
-                    tasks.push(self.open_buffer(
-                        buffer.clone(),
-                        buffer_action,
-                        clients,
-                        config,
-                    ));
-                }
-
-                if let Some((window, pane, state)) =
-                    self.panes.get_mut_by_buffer(&buffer)
-                {
-                    tasks.push(
-                        state
-                            .buffer
-                            .scroll_to_message(message, &self.history, config)
-                            .map(move |message| {
-                                Message::Pane(
-                                    window,
-                                    pane::Message::Buffer(pane, message),
-                                )
-                            }),
-                    );
-                }
-
-                return (Task::batch(tasks), None);
-            }
-            buffer::Event::RequestOlderChatHistory => {
-                if let Some(buffer) = pane.buffer.data() {
-                    self.request_older_chathistory(clients, &buffer);
-                }
-            }
-            buffer::Event::PreviewChanged => {
-                let visible = self.visible_preview_urls_with_preview_clients(
-                    clients,
-                    &config.preview,
-                );
-                let tracking =
-                    self.previews.keys().cloned().collect::<HashSet<_>>();
-                let missing = visible
-                    .iter()
-                    .filter_map(|(url, preview_client)| {
-                        (!tracking.contains(url))
-                            .then_some((url.clone(), preview_client.clone()))
-                    })
-                    .collect::<Vec<_>>();
-                let removed = tracking
-                    .into_iter()
-                    .filter(|url| !visible.contains_key(url))
-                    .collect::<HashSet<_>>();
-
-                for (url, _) in &missing {
-                    self.previews.insert(url.clone(), preview::State::Loading);
-                }
-
-                for url in removed {
-                    self.previews.remove(&url);
-                }
-
+            buffer::Event::CopyText(text) => {
                 return (
-                    Task::batch(missing.into_iter().map(
-                        |(url, preview_client)| {
-                            Task::perform(
-                                data::preview::load(
-                                    url.clone(),
-                                    preview_client.clone(),
-                                    config.preview.clone(),
-                                    self.previews_cache.clone(),
-                                ),
-                                move |result| {
-                                    Message::LoadPreview((url.clone(), result))
-                                },
-                            )
-                        },
-                    )),
+                    Task::batch(vec![
+                        close_context_menu(),
+                        clipboard::write(text).discard(),
+                    ]),
                     None,
                 );
             }
-            buffer::Event::HidePreview(kind, hash, url) => {
-                self.history.hide_preview(kind, hash, url);
+            buffer::Event::OpenDm(address) => {
+                return (
+                    Task::batch(vec![
+                        close_context_menu(),
+                        self.open_dm(&address, session, backend, config),
+                    ]),
+                    None,
+                );
             }
-            buffer::Event::MarkAsRead(kind) => {
-                mark_as_read(
-                    kind,
-                    &mut self.history,
-                    clients,
-                    TokenPriority::User,
+            buffer::Event::OpenAddMember(convo_id) => {
+                return (
+                    close_context_menu(),
+                    Some(Event::OpenAddMember(convo_id)),
                 );
             }
             buffer::Event::OpenUrl(url) => {
@@ -2589,76 +1271,18 @@ impl Dashboard {
                     )),
                 );
             }
-            buffer::Event::ImagePreview(image) => {
-                return (Task::none(), Some(Event::ImagePreview(image)));
+            buffer::Event::MarkAsRead(kind) => {
+                self.history.mark_as_read(&kind);
             }
-            buffer::Event::ExpandMessage(server_time, hash) => {
-                if let Some(kind) =
-                    pane.buffer.data().and_then(history::Kind::from_buffer)
-                {
-                    self.history.expand_message(
-                        kind,
-                        server_time,
-                        hash,
-                        &config.buffer.server_messages.condense,
-                    );
-                }
+            buffer::Event::SendMessage { convo_id, content } => {
+                backend.send(stream::Control::SendMessage {
+                    convo_id: wire_id(&convo_id),
+                    content,
+                });
             }
-            buffer::Event::ContractMessage(server_time, hash) => {
-                if let Some(kind) =
-                    pane.buffer.data().and_then(history::Kind::from_buffer)
-                {
-                    self.history.contract_message(
-                        kind,
-                        server_time,
-                        hash,
-                        &config.buffer.server_messages.condense,
-                    );
-                }
-            }
-            buffer::Event::InputSent {
-                history_task,
-                open_buffers,
-                was_join_command,
-            } => {
-                let mut tasks = vec![];
-
-                if let Some(server) = pane
-                    .buffer
-                    .upstream()
-                    .map(buffer::Upstream::server)
-                    .cloned()
-                {
-                    for (target, buffer_action) in open_buffers {
-                        tasks.push(self.open_target(
-                            server.clone(),
-                            target,
-                            clients,
-                            buffer_action,
-                            config,
-                            !was_join_command,
-                        ));
-                    }
-                }
-
-                return (
-                    history_task
-                        .map(Message::History)
-                        .chain(Task::batch(tasks)),
-                    None,
-                );
-            }
-            buffer::Event::SelectedServer(server) => {
-                Self::send_list_command_if_needed(&server, pane, clients);
-
-                self.last_changed = Some(Instant::now());
-
-                return (Task::none(), None);
-            }
-            buffer::Event::SendUnsafeList(server) => {
-                Self::send_list_command(&server, pane, clients);
-
-                return (Task::none(), None);
+            buffer::Event::Command(command) => {
+                return self
+                    .handle_command(command, window, id, session, backend);
             }
             buffer::Event::ConfigSaved => {
                 return (
@@ -2669,181 +1293,111 @@ impl Dashboard {
                     None,
                 );
             }
-            buffer::Event::OpenServer(server) => {
-                return (Task::none(), Some(Event::OpenServer(server)));
+        }
+
+        (Task::none(), None)
+    }
+
+    /// Composer slash commands. dm/group/add/nick map onto backend
+    /// controls; the results come back as push events (e.g.
+    /// `conversation_created`). Missing arguments open the matching
+    /// dialog instead of erroring.
+    fn handle_command(
+        &mut self,
+        command: data::Command,
+        window: window::Id,
+        id: pane_grid::Pane,
+        session: &data::Session,
+        backend: &mut stream::Map,
+    ) -> (Task<Message>, Option<Event>) {
+        let convo_id = self
+            .panes
+            .get(window, id)
+            .and_then(|pane| pane.buffer.convo_id().cloned());
+
+        match command {
+            data::Command::Dm(Some(peer_address)) => {
+                backend
+                    .send(stream::Control::CreateConversation { peer_address });
             }
-            buffer::Event::Reconnect(server) => {
-                controllers.connect(&server);
+            data::Command::Dm(None) => {
+                return (Task::none(), Some(Event::OpenNewDm));
             }
-            buffer::Event::FilehostUpload {
-                server,
-                target,
-                file_paths,
-                upload_ids,
-                abort_registrations,
-            } => {
-                let Some(upload_url) =
-                    clients.get_filehost(&server).map(String::from)
-                else {
-                    let casemapping =
-                        clients.get_server_casemapping_or_default(&server);
-                    let task = self.broadcast(
-                        &server,
-                        casemapping,
-                        config,
-                        Utc::now(),
-                        false,
-                        Broadcast::FilehostUploadFailed {
-                            error: format!(
-                                "no filehost configured for server {server}"
-                            ),
-                            target,
+            data::Command::Group(Some(name), description) => {
+                backend.send(stream::Control::CreateGroup {
+                    name,
+                    description: description.unwrap_or_default(),
+                });
+            }
+            data::Command::Group(None, _) => {
+                return (Task::none(), Some(Event::OpenNewGroup));
+            }
+            data::Command::Add(peer_address) => {
+                // Membership is a group concept; QML only reaches add-member
+                // from the group roster pane.
+                let group_id = convo_id.filter(|convo_id| {
+                    session.conversations.get(convo_id).is_some_and(
+                        |conversation| {
+                            conversation.kind == ConversationKind::Group
                         },
-                    );
-                    return (task, None);
-                };
+                    )
+                });
 
-                let pending = filehost::PendingUpload {
-                    window,
-                    pane_id: id,
-                    is_override_url: clients.get_filehost_is_override(&server),
-                    has_credentials: clients
-                        .get_filehost_auth(&server)
-                        .is_some(),
-                    server,
-                    target,
-                    upload_url,
-                    file_paths,
-                    upload_ids,
-                    abort_registrations,
-                };
-
-                let (task, event) = self.filehost.upload(
-                    pending,
-                    clients,
-                    self.http_client.clone(),
-                    &config.proxy,
-                );
-
-                let task = task.map(Message::Filehost);
-
-                if let Some(filehost::Event::PromptBeforeUpload {
-                    upload_url,
-                    has_credentials,
-                    window,
-                }) = event
-                {
+                match group_id {
+                    Some(convo_id) => {
+                        return (
+                            Task::none(),
+                            Some(Event::AddMemberRequested {
+                                convo_id,
+                                peer_address,
+                            }),
+                        );
+                    }
+                    None => self.report_error(
+                        "/add only works in group conversations".to_string(),
+                    ),
+                }
+            }
+            data::Command::Nick(Some(nickname)) => {
+                if let Some(convo_id) = convo_id {
+                    backend.send(stream::Control::SetNickname {
+                        convo_id: wire_id(&convo_id),
+                        nickname,
+                    });
+                }
+            }
+            data::Command::Nick(None) => {
+                if let Some(convo_id) = convo_id {
                     return (
-                        task,
-                        Some(Event::PromptBeforeFileUpload {
-                            upload_url,
-                            has_credentials,
-                            window,
-                        }),
+                        Task::none(),
+                        Some(Event::OpenSetNickname(convo_id)),
                     );
                 }
-
-                return (task, None);
+            }
+            data::Command::Details => {
+                if let Some(state) = self.panes.get_mut(window, id)
+                    && let Buffer::Conversation(conversation) =
+                        &mut state.buffer
+                {
+                    conversation.toggle_details();
+                }
+            }
+            data::Command::Clear => {
+                if let Some(convo_id) = convo_id {
+                    self.history
+                        .clear_messages(&history::Kind::Conversation(convo_id));
+                }
             }
         }
 
         (Task::none(), None)
     }
 
-    fn handle_filehost_message(
-        &mut self,
-        msg: filehost::Message,
-        clients: &client::Map,
-        config: &Config,
-    ) -> Task<Message> {
-        match msg {
-            filehost::Message::UploadDone {
-                window,
-                pane_id,
-                target,
-                id,
-                url,
-            } => {
-                let buf_msg = match &target {
-                    Some(Target::Channel(_)) => buffer::Message::Channel(
-                        buffer::channel::Message::FilehostUploadDone {
-                            id,
-                            url,
-                        },
-                    ),
-                    Some(Target::Query(_)) => buffer::Message::Query(
-                        buffer::query::Message::FilehostUploadDone { id, url },
-                    ),
-                    None => buffer::Message::Server(
-                        buffer::server::Message::FilehostUploadDone { id, url },
-                    ),
-                };
-                Task::done(Message::Pane(
-                    window,
-                    pane::Message::Buffer(pane_id, buf_msg),
-                ))
-            }
-            filehost::Message::UploadFailed {
-                window,
-                pane_id,
-                server,
-                target,
-                id,
-                error,
-            } => {
-                let casemapping =
-                    clients.get_server_casemapping_or_default(&server);
-                let history_task = self.broadcast(
-                    &server,
-                    casemapping,
-                    config,
-                    Utc::now(),
-                    false,
-                    Broadcast::FilehostUploadFailed {
-                        error,
-                        target: target.clone(),
-                    },
-                );
-                let decrement_msg = match &target {
-                    Some(Target::Channel(_)) => buffer::Message::Channel(
-                        buffer::channel::Message::FilehostUploadDone {
-                            id,
-                            url: None,
-                        },
-                    ),
-                    Some(Target::Query(_)) => buffer::Message::Query(
-                        buffer::query::Message::FilehostUploadDone {
-                            id,
-                            url: None,
-                        },
-                    ),
-                    None => buffer::Message::Server(
-                        buffer::server::Message::FilehostUploadDone {
-                            id,
-                            url: None,
-                        },
-                    ),
-                };
-                let decrement_task = Task::done(Message::Pane(
-                    window,
-                    pane::Message::Buffer(pane_id, decrement_msg),
-                ));
-                Task::batch(vec![history_task, decrement_task])
-            }
-            filehost::Message::KnownSaved(Err(e)) => {
-                log::error!("failed to save known filehost URLs: {e}");
-                Task::none()
-            }
-            filehost::Message::KnownSaved(Ok(())) => Task::none(),
-        }
-    }
-
     pub fn handle_event(
         &mut self,
         window: window::Id,
         event: event::Event,
-        servers: &server::Map,
-        clients: &mut data::client::Map,
+        session: &data::Session,
         version: &Version,
         config: &Config,
         theme: &mut Theme,
@@ -2857,17 +1411,9 @@ impl Dashboard {
                 // - Close command bar (if this window owns it)
                 // - Close theme editor (if this window owns it)
                 // - Close context menu
-                // - Close command/emoji picker
                 // - Restore maximized pane (if main window)
                 if self.command_bar_window == Some(window) {
-                    self.toggle_command_bar(
-                        servers,
-                        clients,
-                        &closed_upstream_buffers(self, clients),
-                        version,
-                        config,
-                        theme,
-                    )
+                    self.toggle_command_bar(session, version, config, theme)
                 } else if self.theme_editor.as_ref().map(|e| e.window)
                     == Some(window)
                 {
@@ -2901,9 +1447,7 @@ impl Dashboard {
     fn handle_command_bar_command(
         &mut self,
         command: command_bar::Command,
-        clients: &mut client::Map,
-        controllers: &mut stream::Map,
-        servers: &server::Map,
+        backend: &mut stream::Map,
         theme: &mut Theme,
         config: &Config,
         main_window: &Window,
@@ -2928,27 +1472,19 @@ impl Dashboard {
                 }
                 command_bar::Buffer::Close => {
                     let Focus { window, pane } = self.focus;
-                    (self.close_pane(clients, config, window, pane), None)
+                    (self.close_pane(config, window, pane), None)
                 }
-                command_bar::Buffer::Replace(buffer) => (
+                command_bar::Buffer::Replace(buffer, _) => (
                     self.open_buffer(
                         buffer,
                         BufferAction::ReplacePane,
-                        clients,
+                        backend,
                         config,
                     ),
                     None,
                 ),
-                command_bar::Buffer::Popout => {
-                    (self.popout_pane(clients, config), None)
-                }
-                command_bar::Buffer::Merge => {
-                    (self.merge_pane(clients, config), None)
-                }
-                command_bar::Buffer::ShowMutedBuffers(show_muted_buffers) => {
-                    self.buffer_settings.show_muted = show_muted_buffers;
-                    (Task::none(), None)
-                }
+                command_bar::Buffer::Popout => (self.popout_pane(config), None),
+                command_bar::Buffer::Merge => (self.merge_pane(config), None),
             },
             command_bar::Command::Configuration(command) => match command {
                 command_bar::Configuration::OpenConfigDirectory => {
@@ -3000,9 +1536,7 @@ impl Dashboard {
             },
             command_bar::Command::Application(application) => match application
             {
-                command_bar::Application::Quit => {
-                    (self.exit(clients, config), None)
-                }
+                command_bar::Application::Quit => (self.exit(config), None),
                 command_bar::Application::ToggleFullscreen => {
                     (window::toggle_fullscreen(), Some(Event::ToggleFullscreen))
                 }
@@ -3010,24 +1544,6 @@ impl Dashboard {
                     self.toggle_sidebar();
                     (Task::none(), None)
                 }
-            },
-            command_bar::Command::Server(server) => match server {
-                command_bar::Server::Connect(server) => {
-                    connect_server(server, controllers, servers);
-                    (Task::none(), None)
-                }
-                command_bar::Server::Disconnect(server) => (
-                    Task::none(),
-                    Some(Event::QuitServer(
-                        server,
-                        config.buffer.commands.quit.default_reason.clone(),
-                    )),
-                ),
-                command_bar::Server::ReloadIcon(server) => (
-                    self.remove_server_icon(clients, &server)
-                        .chain(self.request_server_icon(clients, &server)),
-                    None,
-                ),
             },
         }
     }
@@ -3060,9 +1576,8 @@ impl Dashboard {
 
     fn toggle_internal_buffer(
         &mut self,
-        clients: &mut data::client::Map,
         config: &Config,
-        buffer: buffer::Internal,
+        buffer: data::buffer::Internal,
     ) -> Task<Message> {
         let open = self.panes.iter().find_map(|(window_id, pane, state)| {
             (state.buffer.internal().as_ref() == Some(&buffer))
@@ -3070,81 +1585,48 @@ impl Dashboard {
         });
 
         if let Some((window, pane)) = open {
-            self.close_pane(clients, config, window, pane)
+            self.close_pane(config, window, pane)
         } else {
             self.open_buffer(
                 buffer.into(),
                 config.actions.buffer.open_internal,
-                clients,
+                &mut stream::Map::default(),
                 config,
             )
         }
     }
 
-    fn send_list_command_if_needed(
-        server: &data::Server,
-        pane: &Pane,
-        clients: &mut data::client::Map,
-    ) {
-        let is_needed = if clients.get_server_supports_list(server) {
-            clients.get_channel_discovery_manager(server).is_none_or(
-                data::channel_discovery::Manager::needs_fetch_or_refetch,
-            )
-        } else {
-            clients
-                .get_channel_discovery_manager(server)
-                .is_some_and(data::channel_discovery::Manager::needs_refetch)
-        };
-
-        if is_needed {
-            Self::send_list_command(server, pane, clients);
-        }
-    }
-
-    fn send_list_command(
-        server: &data::Server,
-        pane: &Pane,
-        clients: &mut data::client::Map,
-    ) {
-        let buffer = pane
-            .buffer
-            .upstream()
-            .cloned()
-            .unwrap_or_else(|| buffer::Upstream::Server(server.clone()));
-
-        let command = command::Irc::List(None, None);
-        let input = data::Input::from_command(buffer, command);
-
-        if let Some(encoded) = input.encoded() {
-            clients.send(&input.buffer, encoded, TokenPriority::User);
-        }
+    /// Opens a conversation buffer; the standard entry point for sidebar
+    /// clicks, notifications, and backend-created conversations.
+    pub fn open_conversation(
+        &mut self,
+        convo_id: ConvoId,
+        buffer_action: BufferAction,
+        backend: &mut stream::Map,
+        config: &Config,
+    ) -> Task<Message> {
+        self.open_buffer(
+            data::Buffer::Conversation(convo_id),
+            buffer_action,
+            backend,
+            config,
+        )
     }
 
     fn open_buffer(
         &mut self,
         buffer: data::Buffer,
         buffer_action: BufferAction,
-        clients: &mut data::client::Map,
+        backend: &mut stream::Map,
         config: &Config,
     ) -> Task<Message> {
-        // TODO(pounce) reduce clones
+        // TODO(post-v1): reduce clones — the pane grid is cloned per open to
+        // keep the borrow checker happy while `self` is mutated below.
         let panes = self.panes.clone();
 
         self.last_changed = Some(Instant::now());
 
-        match buffer.upstream() {
-            Some(buffer::Upstream::Channel(server, channel)) => {
-                clients.prioritize_who_poll(server, channel);
-            }
-            Some(buffer::Upstream::Query(server, query)) => {
-                let user = User::from(Nick::from(query));
-
-                clients.add_monitored_user_automated(server, &user);
-            }
-            Some(buffer::Upstream::Server(..)) | None => (),
-        }
-
-        match buffer_action {
+        let task = match buffer_action {
             BufferAction::ReplacePane => {
                 // If buffer already is open, we swap it with focused pane.
                 for (window, id, pane) in panes.iter() {
@@ -3164,19 +1646,11 @@ impl Dashboard {
                     mark_as_read_on_buffer_close(
                         &state.buffer,
                         &mut self.history,
-                        clients,
                         config,
                     );
 
-                    if let Some(buffer::Upstream::Channel(server, channel)) =
-                        state.buffer.upstream()
-                    {
-                        clients.deprioritize_who_poll(server, channel);
-                    }
-
                     state.buffer = Buffer::from_data(
                         buffer,
-                        clients,
                         &self.history,
                         state.size,
                         config,
@@ -3194,112 +1668,26 @@ impl Dashboard {
             }
             BufferAction::NewPane => {
                 // If buffer already is open, we focus it.
+                let mut existing = None;
                 for (window, id, pane) in panes.iter() {
                     if pane.buffer.data().as_ref() == Some(&buffer) {
-                        self.focus = Focus { window, pane: id };
-
-                        return self.focus_pane(window, id);
+                        existing = Some((window, id));
+                        break;
                     }
                 }
 
-                // If we only have one pane, and its empty, we replace it.
-                if self.panes.len() == 1 {
-                    for (id, pane) in panes.main.iter() {
-                        if matches!(pane.buffer, Buffer::Empty) {
-                            self.panes.main.panes.entry(*id).and_modify(|p| {
-                                p.buffer = Buffer::from_data(
-                                    buffer.clone(),
-                                    clients,
-                                    &self.history,
-                                    p.size,
-                                    config,
-                                );
-                            });
-                            self.last_changed = Some(Instant::now());
+                if let Some((window, id)) = existing {
+                    self.focus = Focus { window, pane: id };
 
-                            return self.focus_pane(self.main_window(), *id);
-                        }
-                    }
+                    self.focus_pane(window, id)
+                } else {
+                    self.new_pane_with_buffer(buffer, config)
                 }
-
-                let (pane_to_split, pane_to_split_state) = {
-                    if matches!(
-                        config.pane.split_axis,
-                        config::pane::SplitAxis::LargestShorter
-                    ) && let Some((pane, pane_state)) =
-                        self.panes.main.panes.iter().reduce(
-                            |(acc_pane, acc_pane_state), (pane, pane_state)| {
-                                let pane_area = pane_state.size.width
-                                    * pane_state.size.height;
-                                let acc_pane_area = acc_pane_state.size.width
-                                    * acc_pane_state.size.height;
-
-                                if pane_area > acc_pane_area {
-                                    (pane, pane_state)
-                                } else {
-                                    (acc_pane, acc_pane_state)
-                                }
-                            },
-                        )
-                    {
-                        (*pane, pane_state)
-                    } else if self.focus.window == self.main_window()
-                        && let Some(pane_state) =
-                            self.panes.main.panes.get(&self.focus.pane)
-                    {
-                        (self.focus.pane, pane_state)
-                    } else if let Some((pane, pane_state)) =
-                        self.panes.main.panes.iter().last()
-                    {
-                        (*pane, pane_state)
-                    } else {
-                        log::error!("Didn't find any panes to split");
-                        return Task::none();
-                    }
-                };
-
-                let split_axis = match config.pane.split_axis {
-                    config::pane::SplitAxis::Horizontal => {
-                        pane_grid::Axis::Horizontal
-                    }
-                    config::pane::SplitAxis::Vertical => {
-                        pane_grid::Axis::Vertical
-                    }
-                    config::pane::SplitAxis::Shorter
-                    | config::pane::SplitAxis::LargestShorter => {
-                        if pane_to_split_state.size.height
-                            < pane_to_split_state.size.width
-                        {
-                            pane_grid::Axis::Vertical
-                        } else {
-                            pane_grid::Axis::Horizontal
-                        }
-                    }
-                };
-
-                let result = self.panes.main.split(
-                    split_axis,
-                    pane_to_split,
-                    Pane::new(Buffer::from_data(
-                        buffer,
-                        clients,
-                        &self.history,
-                        pane_to_split_state.size,
-                        config,
-                    )),
-                );
-
-                if let Some((pane, _)) = result {
-                    return self.focus_pane(self.main_window(), pane);
-                }
-
-                Task::none()
             }
             BufferAction::NewWindow => {
                 iced::window::position(self.main_window()).then({
                     let pane = Pane::new(Buffer::from_data(
                         buffer.clone(),
-                        clients,
                         &self.history,
                         Size::default(),
                         config,
@@ -3327,716 +1715,231 @@ impl Dashboard {
                     }
                 })
             }
-        }
+        };
+
+        self.track_histories(backend);
+
+        task
     }
 
-    pub fn leave_all_queries(
+    fn new_pane_with_buffer(
         &mut self,
-        clients: &mut data::client::Map,
+        buffer: data::Buffer,
         config: &Config,
-        server: Server,
-        queries: Vec<target::Query>,
     ) -> Task<Message> {
-        let tasks: Vec<Task<Message>> = queries
-            .into_iter()
-            .map(|query| {
-                let buffer =
-                    buffer::Upstream::Query(server.clone(), query.clone());
+        // If we only have one pane, and its empty, we replace it.
+        if self.panes.len() == 1 {
+            let empty = self.panes.main.iter().find_map(|(id, pane)| {
+                matches!(pane.buffer, Buffer::Empty).then_some(*id)
+            });
 
-                self.leave_buffer(clients, config, buffer).0
-            })
-            .collect();
+            if let Some(id) = empty {
+                let size = self
+                    .panes
+                    .main
+                    .get(id)
+                    .map(|pane| pane.size)
+                    .unwrap_or_default();
 
-        Task::batch(tasks)
-    }
+                if let Some(pane) = self.panes.main.get_mut(id) {
+                    pane.buffer =
+                        Buffer::from_data(buffer, &self.history, size, config);
+                }
+                self.last_changed = Some(Instant::now());
 
-    pub fn leave_buffer(
-        &mut self,
-        clients: &mut data::client::Map,
-        config: &Config,
-        buffer: buffer::Upstream,
-    ) -> (Task<Message>, Option<Event>) {
-        let open = self.panes.iter().find_map(|(window, pane, state)| {
-            (state.buffer.upstream() == Some(&buffer)).then_some((window, pane))
-        });
-
-        let mut tasks = vec![];
-
-        // Close pane
-        if let Some((window, pane)) = open {
-            tasks.push(self.close_pane(clients, config, window, pane));
+                return self.focus_pane(self.main_window(), id);
+            }
         }
 
-        match buffer.clone() {
-            buffer::Upstream::Server(server) => (
-                Task::batch(tasks),
-                Some(Event::QuitServer(
-                    server,
-                    config.buffer.commands.quit.default_reason.clone(),
-                )),
-            ),
-            buffer::Upstream::Channel(server, channel) => {
-                // Send part & close history file
-                let command = command::Irc::Part(
-                    channel.to_string(),
-                    config.buffer.commands.part.default_reason.clone(),
-                );
-                let input = data::Input::from_command(buffer.clone(), command);
+        let (pane_to_split, pane_to_split_state) = {
+            if matches!(
+                config.pane.split_axis,
+                config::pane::SplitAxis::LargestShorter
+            ) && let Some((pane, pane_state)) =
+                self.panes.main.panes.iter().reduce(
+                    |(acc_pane, acc_pane_state), (pane, pane_state)| {
+                        let pane_area =
+                            pane_state.size.width * pane_state.size.height;
+                        let acc_pane_area = acc_pane_state.size.width
+                            * acc_pane_state.size.height;
 
-                if let Some(encoded) = input.encoded() {
-                    clients.send(&buffer, encoded, TokenPriority::High);
-                }
-
-                tasks.push(
-                    self.history
-                        .close(history::Kind::Channel(server, channel), clients)
-                        .map_or_else(Task::none, |task| {
-                            Task::perform(task, Message::History)
-                        }),
-                );
-
-                (Task::batch(tasks), None)
+                        if pane_area > acc_pane_area {
+                            (pane, pane_state)
+                        } else {
+                            (acc_pane, acc_pane_state)
+                        }
+                    },
+                )
+            {
+                (*pane, pane_state)
+            } else if self.focus.window == self.main_window()
+                && let Some(pane_state) =
+                    self.panes.main.panes.get(&self.focus.pane)
+            {
+                (self.focus.pane, pane_state)
+            } else if let Some((pane, pane_state)) =
+                self.panes.main.panes.iter().last()
+            {
+                (*pane, pane_state)
+            } else {
+                log::error!("Didn't find any panes to split");
+                return Task::none();
             }
-            buffer::Upstream::Query(server, nick) => {
-                if let Some(client) = clients.client_mut(&server)
-                    && let user = User::from(Nick::from(&nick))
-                    && client.is_monitored_user_automated(&user)
+        };
+
+        let split_axis = match config.pane.split_axis {
+            config::pane::SplitAxis::Horizontal => pane_grid::Axis::Horizontal,
+            config::pane::SplitAxis::Vertical => pane_grid::Axis::Vertical,
+            config::pane::SplitAxis::Shorter
+            | config::pane::SplitAxis::LargestShorter => {
+                if pane_to_split_state.size.height
+                    < pane_to_split_state.size.width
                 {
-                    client.remove_monitored_user(&user);
+                    pane_grid::Axis::Vertical
+                } else {
+                    pane_grid::Axis::Horizontal
                 }
-
-                tasks.push(
-                    self.history
-                        .close(history::Kind::Query(server, nick), clients)
-                        .map_or_else(Task::none, |task| {
-                            Task::perform(task, Message::History)
-                        }),
-                );
-
-                // No PART to send, just close history
-                (Task::batch(tasks), None)
             }
-        }
-    }
+        };
 
-    pub fn leave_server_target(
-        &mut self,
-        clients: &mut data::client::Map,
-        config: &Config,
-        server: Server,
-        target: Target,
-        reason: Option<String>,
-    ) -> Task<Message> {
-        let open = self.panes.iter().find_map(|(window, pane, state)| {
-            (state.buffer.server() == Some(server.clone())
-                && state.buffer.target() == Some(target.clone()))
-            .then_some((window, pane))
-        });
-
-        let mut tasks = vec![];
-
-        // Close pane
-        if let Some((window, pane)) = open {
-            tasks.push(self.close_pane(clients, config, window, pane));
-        }
-
-        match target {
-            Target::Channel(channel) => {
-                let buffer = data::buffer::Upstream::Channel(
-                    server.clone(),
-                    channel.clone(),
-                );
-
-                // Send part & close history file
-                let command = command::Irc::Part(channel.to_string(), reason);
-                let input = data::Input::from_command(buffer.clone(), command);
-
-                if let Some(encoded) = input.encoded() {
-                    clients.send(&buffer, encoded, TokenPriority::User);
-                }
-
-                tasks.push(
-                    self.history
-                        .close(history::Kind::Channel(server, channel), clients)
-                        .map_or_else(Task::none, |task| {
-                            Task::perform(task, Message::History)
-                        }),
-                );
-
-                Task::batch(tasks)
-            }
-            Target::Query(nick) => {
-                tasks.push(
-                    self.history
-                        .close(history::Kind::Query(server, nick), clients)
-                        .map_or_else(Task::none, |task| {
-                            Task::perform(task, Message::History)
-                        }),
-                );
-
-                // No PART to send, just close history
-                Task::batch(tasks)
-            }
-        }
-    }
-
-    pub fn record_message(
-        &mut self,
-        server: &Server,
-        casemapping: isupport::CaseMap,
-        message: data::Message,
-        labeled_response_context: Option<LabeledResponseContext>,
-        config: &Config,
-    ) -> Task<Message> {
-        let tasks = self.history.record_message(
-            server,
-            casemapping,
-            message,
-            labeled_response_context,
-            config,
+        let result = self.panes.main.split(
+            split_axis,
+            pane_to_split,
+            Pane::new(Buffer::from_data(
+                buffer,
+                &self.history,
+                pane_to_split_state.size,
+                config,
+            )),
         );
 
-        Task::batch(
-            tasks
-                .into_iter()
-                .map(|task| Task::perform(task, Message::History)),
-        )
-    }
-
-    pub fn resend_message(
-        &mut self,
-        clients: &mut client::Map,
-        kind: history::Kind,
-        message: data::Message,
-        config: &Config,
-    ) -> Task<Message> {
-        if let Some(buffer) = data::Buffer::from(kind).upstream()
-            && let Some(user) = clients
-                .nickname(buffer.server())
-                .map(|nick| User::from(nick.to_owned()))
-            && let Some(command) = message.command
-        {
-            let multiline = if let Some((target, text, batch_kind)) =
-                match &command {
-                    data::command::Irc::Msg(target, text) => {
-                        Some((target, text, MultilineBatchKind::PRIVMSG))
-                    }
-                    data::command::Irc::Notice(target, text) => {
-                        Some((target, text, MultilineBatchKind::NOTICE))
-                    }
-                    _ => None,
-                } {
-                if text.lines().count() > 1 {
-                    true
-                } else if let Some(multiline_limits) =
-                    clients.get_multiline_limits(buffer.server())
-                {
-                    let multiline_concat_bytes = multiline_limits.concat_bytes(
-                        clients.get_relay_bytes(buffer.server()),
-                        batch_kind,
-                        target,
-                    );
-
-                    multiline_concat_lines(multiline_concat_bytes, text).len()
-                        > 1
-                } else {
-                    false
-                }
-            } else {
-                false
-            };
-            let reply_id = message.reply_to.as_ref();
-
-            let (user, channel_users) =
-                if let buffer::Upstream::Channel(server, channel) = &buffer {
-                    (
-                        clients
-                            .resolve_user_attributes(server, channel, &user)
-                            .cloned()
-                            .unwrap_or(user),
-                        clients.get_channel_users(server, channel),
-                    )
-                } else {
-                    (user, None)
-                };
-            let chantypes =
-                clients.get_server_chantypes_or_default(buffer.server());
-            let statusmsg =
-                clients.get_server_statusmsg_or_default(buffer.server());
-            let casemapping =
-                clients.get_server_casemapping_or_default(buffer.server());
-            let supports_echoes =
-                clients.get_server_supports_echoes(buffer.server());
-
-            // The command stored with each sent message is expected to
-            // correspond to a single message (i.e. it is not a multi-target
-            // command; if the original command was multi-target, then it was
-            // split into single-target commands).
-            if let Some(message) = command
-                .messages(
-                    user,
-                    channel_users,
-                    buffer.server(),
-                    chantypes,
-                    statusmsg,
-                    casemapping,
-                    supports_echoes,
-                    self.history.get_reroute_rules(),
-                    Some(buffer),
-                )
-                .and_then(|messages| messages.into_iter().next())
-                && let Some(mut encoded) = proto::Command::try_from(command)
-                    .ok()
-                    .map(proto::Message::from)
-                    .map(message::Encoded::from)
-            {
-                let labeled_response_context = if multiline {
-                    clients.send_multiline_batch(
-                        buffer,
-                        vec![encoded],
-                        TokenPriority::User,
-                        reply_id,
-                    )
-                } else {
-                    encoded.set_reply_to(reply_id);
-
-                    clients.send(buffer, encoded, TokenPriority::User)
-                };
-
-                return Task::batch(
-                    self.history
-                        .record_input_message(
-                            message,
-                            labeled_response_context.clone(),
-                            buffer.server(),
-                            casemapping,
-                            config,
-                        )
-                        .into_iter()
-                        .map(Task::future),
-                )
-                .map(Message::History);
-            }
+        if let Some((pane, _)) = result {
+            return self.focus_pane(self.main_window(), pane);
         }
 
         Task::none()
     }
 
-    pub fn track_channel_monitor_channel(
-        &mut self,
-        server: &Server,
-        channel: &target::Channel,
-        clients: &client::Map,
-        config: &config::ChannelMonitor,
-    ) -> Task<Message> {
+    /// A conversation vanished (deleted locally or remotely): panes showing
+    /// it become Empty and its history is dropped.
+    pub fn conversation_deleted(&mut self, convo_id: &ConvoId) {
         self.history
-            .track_channel_monitor_channel(server, channel, clients, config)
-            .map_or_else(Task::none, |task| {
-                Task::perform(task, Message::History)
-            })
+            .close(&history::Kind::Conversation(convo_id.clone()));
+
+        for (_, _, pane) in self.panes.iter_mut() {
+            if pane.buffer.convo_id() == Some(convo_id) {
+                pane.buffer = Buffer::Empty;
+            }
+        }
+
+        self.last_changed = Some(Instant::now());
     }
 
-    pub fn reload_channel_monitor(
-        &mut self,
-        clients: &client::Map,
-        config: &config::ChannelMonitor,
-    ) -> Task<Message> {
-        self.history
-            .reload_channel_monitor(clients, config)
-            .map_or_else(Task::none, |task| {
-                Task::perform(task, Message::History)
-            })
-    }
+    /// Restores a failed send's text into the conversation's composer.
+    /// The stored draft is written too (it was cleared at send time), so
+    /// the text survives a pane switch — and lands at all when no pane
+    /// currently shows the conversation.
+    pub fn restore_draft(&mut self, convo_id: &ConvoId, content: &str) {
+        if self.history.input(convo_id).draft_message.trim().is_empty() {
+            self.history.record_draft(RawInput {
+                convo_id: convo_id.clone(),
+                text: content.to_string(),
+            });
+        }
 
-    pub fn record_reaction(
-        &mut self,
-        server: &Server,
-        reaction: reaction::Context,
-        notification_enabled: bool,
-        labeled_response_context: Option<LabeledResponseContext>,
-    ) -> Task<Message> {
-        let future = self.history.record_reaction(
-            server,
-            reaction,
-            notification_enabled,
-            labeled_response_context,
-        );
-        if let Some(f) = future {
-            Task::perform(f, Message::History)
-        } else {
-            Task::none()
+        for (_, _, pane) in self.panes.iter_mut() {
+            pane.buffer.restore_draft(convo_id, content);
         }
     }
 
-    pub fn redact_message(
-        &mut self,
-        server: &Server,
-        redaction: redaction::Context,
-        display_redacted: bool,
-    ) {
-        self.history
-            .redact_message(server, redaction, display_redacted);
+    /// Queues a user-visible error onto the status bar.
+    pub fn report_error(&mut self, error: String) {
+        self.status_bar.push_error(error);
     }
 
-    pub fn is_focused_and_at_bottom(&self, kind: &history::Kind) -> bool {
-        let Some((kind_window, kind_pane)) =
-            self.panes.iter().find_map(|(window, _, state)| {
-                state
-                    .buffer
-                    .data()
-                    .and_then(history::Kind::from_buffer)
-                    .is_some_and(|pane_kind| pane_kind == *kind)
-                    .then_some((window, state))
-            })
-        else {
-            return false;
-        };
+    pub fn member_add_explained(&self) -> bool {
+        self.member_add_explained
+    }
 
-        if kind_pane
-            .buffer
-            .is_scrolled_to_bottom()
-            .is_none_or(|is_scrolled_to_bottom| !is_scrolled_to_bottom)
+    /// Persists the first-add explainer acknowledgement (saved with the
+    /// dashboard).
+    pub fn set_member_add_explained(&mut self) {
+        self.member_add_explained = true;
+        self.last_changed = Some(Instant::now());
+    }
+
+    /// Toggles the focused conversation pane's details panel.
+    fn toggle_details_on_focused(&mut self) {
+        if let Some((_, _, pane)) = self.get_focused_mut()
+            && let Buffer::Conversation(conversation) = &mut pane.buffer
         {
-            return false;
+            conversation.toggle_details();
         }
-
-        self.get_focused()
-            .is_some_and(|(focused_window, _, focused_pane)| {
-                let is_focused_window = kind_window == focused_window;
-
-                let focused_kind = focused_pane
-                    .buffer
-                    .data()
-                    .and_then(history::Kind::from_buffer);
-                let is_focused_pane = focused_kind.as_ref() == Some(kind);
-
-                is_focused_window && is_focused_pane
-            })
     }
 
-    pub fn is_open_and_at_bottom(&self, kind: &history::Kind) -> bool {
-        let Some((kind_window, kind_pane)) =
-            self.panes.iter_visible().find_map(|(window, _, state)| {
-                state
-                    .buffer
-                    .data()
-                    .and_then(history::Kind::from_buffer)
-                    .is_some_and(|pane_kind| pane_kind == *kind)
-                    .then_some((window, state))
-            })
-        else {
-            return false;
-        };
-
-        if kind_pane
-            .buffer
-            .is_scrolled_to_bottom()
-            .is_none_or(|is_scrolled_to_bottom| !is_scrolled_to_bottom)
-        {
-            return false;
-        }
-
-        self.get_focused()
-            .is_some_and(|(focused_window, _, _)| kind_window == focused_window)
-    }
-
-    pub fn block_and_record_message(
+    /// Opens the direct conversation with `address` when one exists;
+    /// otherwise asks the backend to create it (the `conversation_created`
+    /// push event then focuses the new pane).
+    fn open_dm(
         &mut self,
-        server: &Server,
-        casemapping: isupport::CaseMap,
-        message: data::Message,
-        labeled_response_context: Option<LabeledResponseContext>,
+        address: &str,
+        session: &data::Session,
+        backend: &mut stream::Map,
         config: &Config,
     ) -> Task<Message> {
-        let tasks = self.history.block_and_record_message(
-            server,
-            casemapping,
-            message,
-            labeled_response_context,
-            config,
-        );
+        let existing = session.conversations.iter().find(|conversation| {
+            conversation.kind == ConversationKind::Direct
+                && conversation
+                    .peer_address()
+                    .is_some_and(|peer| peer.as_str() == address)
+        });
 
-        Task::batch(
-            tasks
-                .into_iter()
-                .map(|task| Task::perform(task, Message::History)),
-        )
-    }
-
-    pub fn record_log(&mut self, record: data::log::Record) -> Task<Message> {
-        if let Some(task) = self.history.record_log(record) {
-            Task::perform(task, Message::History)
+        if let Some(conversation) = existing {
+            self.open_conversation(
+                conversation.id.clone(),
+                BufferAction::ReplacePane,
+                backend,
+                config,
+            )
         } else {
+            backend.send(stream::Control::CreateConversation {
+                peer_address: address.to_string(),
+            });
+
             Task::none()
         }
     }
 
-    pub fn record_highlight(
+    pub fn record_message(
         &mut self,
+        kind: history::Kind,
         message: data::Message,
+    ) {
+        self.history.record_message(kind, message);
+    }
+
+    pub fn load_messages(
+        &mut self,
+        kind: history::Kind,
+        messages: Vec<data::Message>,
     ) -> Task<Message> {
-        self.history
-            .record_highlight(message)
-            .map_or_else(Task::none, |task| {
-                Task::perform(task, Message::History)
+        self.history.load_full(kind.clone(), messages);
+
+        // A thread's settle window runs from the moment its rows land, so
+        // the panes showing it have to hear about it.
+        Task::batch(self.panes.iter_mut().map(|(window, pane, state)| {
+            state.buffer.messages_loaded(&kind).map(move |message| {
+                Message::Pane(window, pane::Message::Buffer(pane, message))
             })
-    }
-
-    pub fn get_oldest_message_reference(
-        &self,
-        server: &Server,
-        target: Target,
-        message_reference_types: &[isupport::MessageReferenceType],
-    ) -> Option<MessageReference> {
-        if let Some(first_can_reference) = self
-            .history
-            .first_can_reference(server.clone(), target.clone())
-        {
-            for message_reference_type in message_reference_types {
-                match message_reference_type {
-                    isupport::MessageReferenceType::MessageId => {
-                        if let Some(id) = &first_can_reference.id {
-                            return Some(MessageReference::MessageId(
-                                id.clone(),
-                            ));
-                        }
-                    }
-                    isupport::MessageReferenceType::Timestamp => {
-                        return Some(MessageReference::Timestamp(
-                            first_can_reference.server_time,
-                        ));
-                    }
-                }
-            }
-        }
-
-        None
-    }
-
-    pub fn request_older_chathistory(
-        &self,
-        clients: &mut data::client::Map,
-        buffer: &data::Buffer,
-    ) {
-        let Some(upstream) = buffer.upstream() else {
-            return;
-        };
-
-        let server = upstream.server();
-
-        if clients.get_server_supports_chathistory(server)
-            && let Some(target) = upstream.target()
-        {
-            if clients.get_chathistory_exhausted(server, &target) {
-                return;
-            }
-
-            let message_reference_types =
-                clients.get_server_chathistory_message_reference_types(server);
-
-            let first_can_reference = self.get_oldest_message_reference(
-                server,
-                target.clone(),
-                &message_reference_types,
-            );
-
-            let subcommand =
-                if let Some(first_can_reference) = first_can_reference {
-                    ChatHistorySubcommand::Before(
-                        target,
-                        first_can_reference,
-                        clients.get_server_chathistory_limit(server),
-                    )
-                } else {
-                    ChatHistorySubcommand::Latest(
-                        target,
-                        first_can_reference,
-                        clients.get_server_chathistory_limit(server),
-                    )
-                };
-
-            clients.send_chathistory_request(
-                server,
-                subcommand,
-                TokenPriority::User,
-            );
-        }
-    }
-
-    pub fn broadcast(
-        &mut self,
-        server: &Server,
-        casemapping: isupport::CaseMap,
-        config: &Config,
-        server_time: DateTime<Utc>,
-        received_with_server_time: bool,
-        broadcast: Broadcast,
-    ) -> Task<Message> {
-        Task::batch(
-            self.history
-                .broadcast(
-                    server,
-                    casemapping,
-                    broadcast,
-                    config,
-                    server_time,
-                    received_with_server_time,
-                )
-                .into_iter()
-                .map(|task| Task::perform(task, Message::History)),
-        )
-    }
-
-    pub fn block_message(
-        &self,
-        message: &mut data::Message,
-        kind: &history::Kind,
-        server: &Server,
-        casemapping: isupport::CaseMap,
-        buffer_config: &config::Buffer,
-    ) {
-        self.history.block_message(
-            message,
-            kind,
-            server,
-            casemapping,
-            buffer_config,
-        );
-    }
-
-    pub fn update_read_marker(
-        &mut self,
-        kind: impl Into<history::Kind> + 'static,
-        read_marker: ReadMarker,
-    ) -> Task<Message> {
-        if let Some(task) = self.history.update_read_marker(kind, read_marker) {
-            Task::perform(task, Message::History)
-        } else {
-            Task::none()
-        }
-    }
-
-    pub fn update_display_read_marker(
-        &mut self,
-        kind: impl Into<history::Kind> + 'static,
-        read_marker: ReadMarker,
-    ) {
-        self.history.update_display_read_marker(kind, read_marker);
-    }
-
-    pub fn remove_server_icon(
-        &mut self,
-        clients: &mut client::Map,
-        server: &Server,
-    ) -> Task<Message> {
-        let icon_url = clients.get_icon_url(server);
-
-        self.server_icons
-            .remove(server, icon_url)
-            .map(Message::ServerIcon)
-    }
-
-    pub fn request_server_icon(
-        &mut self,
-        clients: &mut client::Map,
-        server: &Server,
-    ) -> Task<Message> {
-        let icon_url = clients.get_icon_url(server);
-
-        let http_client = if clients.get_server_proxy_config(server).is_some() {
-            clients.get_server_http_client(server)
-        } else {
-            self.http_client.clone()
-        };
-
-        self.server_icons
-            .request(server, icon_url, http_client)
-            .map(Message::ServerIcon)
-    }
-
-    pub fn request_override_server_icons(
-        &mut self,
-        servers: &server::Map,
-    ) -> Task<Message> {
-        Task::batch(servers.entries().filter_map(|entry| {
-            if entry.config.icon.enabled
-                && let Some(override_url) = &entry.config.icon.override_url
-            {
-                let http_client =
-                    if let Some(proxy_config) = &entry.config.proxy {
-                        config::proxy::build_client(Some(proxy_config), None)
-                            .ok()
-                            .map(Arc::from)
-                    } else {
-                        self.http_client.clone()
-                    };
-
-                Some(
-                    self.server_icons
-                        .request(&entry.server, Some(override_url), http_client)
-                        .map(Message::ServerIcon),
-                )
-            } else {
-                None
-            }
         }))
     }
 
-    pub fn mark_as_read(
-        &mut self,
-        kind: history::Kind,
-        clients: &mut client::Map,
-    ) {
-        mark_as_read(kind, &mut self.history, clients, TokenPriority::High);
+    pub fn mark_unread(&mut self, kind: &history::Kind) {
+        self.history.mark_unread(kind);
     }
 
-    pub fn load_metadata_and_request_newer_chathistory(
-        &mut self,
-        clients: &data::client::Map,
-        server: Server,
-        target: Target,
-        server_time: DateTime<Utc>,
-        allow_at: bool,
-    ) -> Task<Message> {
-        let command = self
-            .history
-            .load_metadata(server.clone(), target.clone())
-            .map_or(Task::none(), |task| Task::perform(task, Message::History));
-
-        if clients.get_server_supports_chathistory(&server) {
-            command.chain(Task::done(Message::Client(
-                data::client::Message::RequestNewerChatHistory(
-                    server,
-                    target,
-                    server_time,
-                    allow_at,
-                ),
-            )))
-        } else {
-            command
-        }
-    }
-
-    pub fn load_chathistory_targets_timestamp(
-        &self,
-        clients: &data::client::Map,
-        server: &Server,
-        server_time: DateTime<Utc>,
-    ) -> Option<Task<Message>> {
-        clients
-            .load_chathistory_targets_timestamp(server, server_time)
-            .map(|task| Task::perform(task, Message::Client))
-    }
-
-    pub fn overwrite_chathistory_targets_timestamp(
-        &self,
-        clients: &data::client::Map,
-        server: &Server,
-        timestamp: DateTime<Utc>,
-    ) -> Option<Task<Message>> {
-        clients
-            .overwrite_chathistory_targets_timestamp(server, timestamp)
-            .map(|task| Task::perform(task, Message::Client))
+    pub fn record_log(&mut self, record: data::log::Record) {
+        self.history.record_log(record);
     }
 
     pub fn get_focused(&self) -> Option<(window::Id, pane_grid::Pane, &Pane)> {
@@ -4046,11 +1949,6 @@ impl Dashboard {
             .map(|state| (window, pane, state))
     }
 
-    pub fn focused_upstream_buffer(&self) -> Option<&data::buffer::Upstream> {
-        self.get_focused()
-            .and_then(|(_, _, pane)| pane.buffer.upstream())
-    }
-
     fn get_focused_mut(
         &mut self,
     ) -> Option<(window::Id, pane_grid::Pane, &mut Pane)> {
@@ -4058,30 +1956,6 @@ impl Dashboard {
         self.panes
             .get_mut(window, pane)
             .map(|state| (window, pane, state))
-    }
-
-    fn get_focused_with_history_mut(
-        &mut self,
-    ) -> Option<(
-        window::Id,
-        pane_grid::Pane,
-        &mut Pane,
-        &mut history::Manager,
-    )> {
-        let Focus { window, pane } = self.focus;
-        self.panes
-            .get_mut(window, pane)
-            .map(|state| (window, pane, state, &mut self.history))
-    }
-
-    pub fn get_unique_queries(&self, server: &Server) -> Vec<&target::Query> {
-        self.history.get_unique_queries(server)
-    }
-
-    pub fn add_to_sidebar(&mut self, server: Server, query: target::Query) {
-        let kind = history::Kind::Query(server, query);
-
-        self.history.open(kind);
     }
 
     pub fn refocus_pane(&mut self) -> Task<Message> {
@@ -4228,7 +2102,6 @@ impl Dashboard {
 
     fn close_pane(
         &mut self,
-        clients: &mut data::client::Map,
         config: &Config,
         window: window::Id,
         pane: pane_grid::Pane,
@@ -4239,27 +2112,14 @@ impl Dashboard {
             mark_as_read_on_buffer_close(
                 &state.buffer,
                 &mut self.history,
-                clients,
                 config,
             );
 
-            if let Some(buffer::Upstream::Channel(server, channel)) =
-                state.buffer.upstream()
-            {
-                clients.deprioritize_who_poll(server, channel);
-            }
-
-            if config.buffer.close.query.close()
-                && let Some(history::Kind::Query(server, nick)) =
+            if config.buffer.close.direct.close()
+                && let Some(history::Kind::Conversation(convo_id)) =
                     state.buffer.data().and_then(history::Kind::from_buffer)
             {
-                tasks.push(
-                    self.history
-                        .close(history::Kind::Query(server, nick), clients)
-                        .map_or_else(Task::none, |task| {
-                            Task::perform(task, Message::History)
-                        }),
-                );
+                self.history.close(&history::Kind::Conversation(convo_id));
             }
         }
 
@@ -4291,11 +2151,7 @@ impl Dashboard {
         Task::batch(tasks)
     }
 
-    fn popout_pane(
-        &mut self,
-        clients: &mut data::client::Map,
-        config: &Config,
-    ) -> Task<Message> {
+    fn popout_pane(&mut self, config: &Config) -> Task<Message> {
         let Focus { pane, .. } = self.focus;
 
         self.focus_history.retain(|p| *p != pane);
@@ -4306,7 +2162,7 @@ impl Dashboard {
             return self.open_buffer(
                 buffer,
                 BufferAction::NewWindow,
-                clients,
+                &mut stream::Map::default(),
                 config,
             );
         }
@@ -4314,11 +2170,7 @@ impl Dashboard {
         Task::none()
     }
 
-    fn merge_pane(
-        &mut self,
-        clients: &mut data::client::Map,
-        config: &Config,
-    ) -> Task<Message> {
+    fn merge_pane(&mut self, config: &Config) -> Task<Message> {
         let Focus { window, pane } = self.focus;
 
         if let Some(pane) = self
@@ -4331,7 +2183,7 @@ impl Dashboard {
                 Some(buffer) => self.open_buffer(
                     buffer,
                     BufferAction::NewPane,
-                    clients,
+                    &mut stream::Map::default(),
                     config,
                 ),
                 None => self.new_pane(pane_grid::Axis::Horizontal),
@@ -4383,51 +2235,62 @@ impl Dashboard {
         }
     }
 
-    pub fn track(
-        &mut self,
-        clients: Option<&data::client::Map>,
-        config: &Config,
-    ) -> Task<Message> {
-        let resources = self.panes.resources().collect();
+    /// Syncs tracked histories with the open panes and requests message
+    /// loads for conversation panes whose history is not `Full` yet (the
+    /// module is the message store; `MessagesLoaded` folds the reply in).
+    pub fn track_histories(&mut self, backend: &mut stream::Map) {
+        let resources: HashSet<history::Resource> =
+            self.panes.resources().collect();
 
-        Task::batch(
-            self.history
-                .track(resources, clients, &config.channel_monitor)
-                .into_iter()
-                .map(|fut| Task::perform(fut, Message::History))
-                .collect::<Vec<_>>(),
-        )
-    }
-
-    pub fn tick(
-        &mut self,
-        now: Instant,
-        clients: &data::client::Map,
-        config: &Config,
-    ) -> Task<Message> {
-        if !self.has_typing_activity(clients) {
-            self.typing_animation = None;
+        for resource in &resources {
+            if let history::Kind::Conversation(convo_id) = &resource.kind
+                && self.history.get_messages(&resource.kind, None).is_none()
+            {
+                backend.send(stream::Control::LoadMessages {
+                    convo_id: wire_id(convo_id),
+                });
+            }
         }
 
-        let history_ticks = Task::batch(
-            self.history
-                .tick(now.into(), clients)
-                .into_iter()
-                .map(|task| Task::perform(task, Message::History))
-                .collect::<Vec<_>>(),
-        );
+        self.history.track(resources);
+    }
 
-        let draft_save = config
-            .buffer
-            .text_input
-            .persist
-            .then(|| {
-                self.history
-                    .maybe_save_drafts(now.into())
-                    .map(|fut| Task::perform(fut, Message::History))
-            })
-            .flatten();
+    /// Once-per-open fallback fetch: the snapshot-time member loads are
+    /// best-effort (a full control queue drops them), so conversation
+    /// panes re-request their roster while it is still unknown. Deduped
+    /// per snapshot generation via [`Self::reset_member_requests`].
+    pub fn track_member_loads(
+        &mut self,
+        session: &data::Session,
+        backend: &mut stream::Map,
+    ) {
+        let convo_ids: Vec<ConvoId> = self
+            .panes
+            .iter()
+            .filter_map(|(_, _, pane)| pane.buffer.convo_id().cloned())
+            .collect();
 
+        for convo_id in convo_ids {
+            if session
+                .conversations
+                .get(&convo_id)
+                .is_some_and(|conversation| conversation.members.is_empty())
+                && self.requested_member_loads.insert(convo_id.clone())
+            {
+                backend.send(stream::Control::LoadMembers {
+                    convo_id: wire_id(&convo_id),
+                });
+            }
+        }
+    }
+
+    /// Starts a fresh member-request generation; each snapshot replaces
+    /// the conversation set, so earlier dedupe entries are stale.
+    pub fn reset_member_requests(&mut self) {
+        self.requested_member_loads.clear();
+    }
+
+    pub fn tick(&mut self, now: Instant) -> Task<Message> {
         if let Some(last_changed) = self.last_changed
             && now.duration_since(last_changed) >= SAVE_AFTER
         {
@@ -4435,34 +2298,7 @@ impl Dashboard {
 
             self.last_changed = None;
 
-            return Task::batch(
-                [
-                    Task::perform(dashboard.save(), Message::DashboardSaved),
-                    history_ticks,
-                ]
-                .into_iter()
-                .chain(draft_save)
-                .collect::<Vec<_>>(),
-            );
-        }
-
-        Task::batch(
-            [history_ticks]
-                .into_iter()
-                .chain(draft_save)
-                .collect::<Vec<_>>(),
-        )
-    }
-
-    pub fn animation_tick(
-        &mut self,
-        now: Instant,
-        clients: &data::client::Map,
-    ) -> Task<Message> {
-        if self.has_typing_activity(clients) {
-            buffer::typing::advance(&mut self.typing_animation, now);
-        } else {
-            self.typing_animation = None;
+            return Task::perform(dashboard.save(), Message::DashboardSaved);
         }
 
         Task::none()
@@ -4470,9 +2306,7 @@ impl Dashboard {
 
     pub fn toggle_command_bar(
         &mut self,
-        servers: &server::Map,
-        clients: &client::Map,
-        buffers: &[buffer::Upstream],
+        session: &data::Session,
         version: &Version,
         config: &Config,
         theme: &mut Theme,
@@ -4491,16 +2325,12 @@ impl Dashboard {
                 *theme = theme.selected();
 
                 self.close_command_bar();
-                self.open_command_bar(
-                    servers, clients, buffers, version, config,
-                );
+                self.open_command_bar(session, version, config);
 
                 Task::none()
             }
             None => {
-                self.open_command_bar(
-                    servers, clients, buffers, version, config,
-                );
+                self.open_command_bar(session, version, config);
                 Task::none()
             }
         }
@@ -4513,23 +2343,18 @@ impl Dashboard {
 
     fn open_command_bar(
         &mut self,
-        servers: &server::Map,
-        clients: &client::Map,
-        buffers: &[buffer::Upstream],
+        session: &data::Session,
         version: &Version,
         config: &Config,
     ) {
         self.command_bar_window = Some(self.focus.window);
         self.command_bar = Some(CommandBar::new(
-            servers,
-            clients,
-            buffers,
+            session,
             version,
             config,
             self.focus,
             self.buffer_resize_action(),
             self.main_window(),
-            self.buffer_settings.show_muted,
         ));
     }
 
@@ -4547,99 +2372,44 @@ impl Dashboard {
         )
     }
 
-    pub fn receive_file_transfer(
-        &mut self,
-        server: &Server,
-        casemapping: isupport::CaseMap,
-        request: file_transfer::ReceiveRequest,
+    fn cycle_buffers(
+        &self,
+        session: &data::Session,
         config: &Config,
-        notifications: &mut Notifications,
-    ) -> Option<Task<Message>> {
-        if !config.file_transfer.enabled {
-            log::info!(
-                "file transfer request from {} ignored",
-                request.from.formatted(UsernameFormat::Full)
-            );
-
-            return None;
-        }
-
-        let event = self.file_transfers.receive(request.clone(), config)?;
-
-        notifications.notify(
-            config,
-            &Notification::FileTransferRequest {
-                nick: request.from.nickname().to_owned(),
-                casemapping,
-                filename: match event {
-                    file_transfer::manager::Event::NewTransfer(
-                        ref transfer,
-                        _,
-                    ) => transfer.filename.clone(),
-                },
-            },
-            server,
-        );
-
-        let query = target::Query::from(request.from);
-
-        let task = self.handle_file_transfer_event(
-            server,
-            &query,
-            event,
-            casemapping,
-            config,
-        );
-
-        Some(task)
+    ) -> Vec<data::Buffer> {
+        // Recency order matches the sidebar; internal buffers trail.
+        session
+            .conversations
+            .sorted()
+            .into_iter()
+            .map(|conversation| {
+                data::Buffer::Conversation(conversation.id.clone())
+            })
+            .chain(
+                config
+                    .sidebar
+                    .internal_buffers
+                    .buffers
+                    .iter()
+                    .map(|internal| data::Buffer::Internal(internal.into())),
+            )
+            .collect()
     }
 
-    pub fn handle_file_transfer_event(
-        &mut self,
-        server: &Server,
-        query: &target::Query,
-        event: file_transfer::manager::Event,
-        casemapping: isupport::CaseMap,
+    fn cycle_buffers_with_has_unread(
+        &self,
+        session: &data::Session,
         config: &Config,
-    ) -> Task<Message> {
-        let mut tasks = vec![];
+    ) -> Vec<(data::Buffer, bool)> {
+        self.cycle_buffers(session, config)
+            .into_iter()
+            .map(|buffer| {
+                let has_unread = history::Kind::from_buffer(buffer.clone())
+                    .is_some_and(|kind| self.history.has_unread(&kind));
 
-        match event {
-            file_transfer::manager::Event::NewTransfer(transfer, task) => {
-                match transfer.direction {
-                    file_transfer::Direction::Received => {
-                        tasks.push(self.record_message(
-                            server,
-                            casemapping,
-                            data::Message::file_transfer_request_received(
-                                &transfer.remote_user,
-                                query,
-                                &transfer.filename,
-                            ),
-                            None,
-                            config,
-                        ));
-                    }
-                    file_transfer::Direction::Sent => {
-                        tasks.push(self.record_message(
-                            server,
-                            casemapping,
-                            data::Message::file_transfer_request_sent(
-                                &transfer.remote_user,
-                                query,
-                                &transfer.filename,
-                            ),
-                            None,
-                            config,
-                        ));
-                    }
-                }
-
-                tasks.push(Task::run(task, Message::FileTransfer));
-            }
-        }
-
-        Task::batch(tasks)
+                (buffer, has_unread)
+            })
+            .collect()
     }
 
     fn from_data(
@@ -4651,7 +2421,6 @@ impl Dashboard {
 
         fn configuration(
             pane: data::Pane,
-            clients: &data::client::Map,
             history: &history::Manager,
             config: &Config,
         ) -> Configuration<Pane> {
@@ -4667,18 +2436,13 @@ impl Dashboard {
                             }
                         },
                         ratio,
-                        a: Box::new(configuration(
-                            *a, clients, history, config,
-                        )),
-                        b: Box::new(configuration(
-                            *b, clients, history, config,
-                        )),
+                        a: Box::new(configuration(*a, history, config)),
+                        b: Box::new(configuration(*b, history, config)),
                     }
                 }
                 data::Pane::Buffer { buffer } => {
                     Configuration::Pane(Pane::new(Buffer::from_data(
                         buffer,
-                        clients,
                         history,
                         Size::default(),
                         config,
@@ -4690,18 +2454,12 @@ impl Dashboard {
             }
         }
 
-        let mut history = history::Manager::default();
-        if config.buffer.text_input.persist {
-            history.preload_drafts(data::input::load_drafts_sync());
-        }
+        let history = history::Manager::default();
 
         let panes = Panes {
             main_window: main_window.id,
             main: pane_grid::State::with_configuration(configuration(
-                data.pane,
-                &data::client::Map::default(),
-                &history,
-                config,
+                data.pane, &history, config,
             )),
             popout: HashMap::new(),
         };
@@ -4734,27 +2492,20 @@ impl Dashboard {
             last_changed: None,
             command_bar: None,
             command_bar_window: None,
-            file_transfers: file_transfer::Manager::default(),
             theme_editor: None,
-            previews: preview::Collection::default(),
-            previews_cache: Arc::new(preview_cache(&config.preview)),
-            server_icons: server_icon::Manager::default(),
-            typing_animation: None,
-            http_client: http_client_from_config(config).map(Arc::new),
             buffer_settings: data.buffer_settings.clone(),
-            filehost: filehost::Manager::new(),
+            status_bar: status_bar::StatusBar::default(),
+            member_add_explained: data.member_add_explained,
+            requested_member_loads: HashSet::new(),
         };
 
         let mut tasks = vec![sidebar_task.map(Message::Sidebar)];
 
         for pane in data.popout_panes {
             // Popouts are only a single pane
-            let Configuration::Pane(pane) = configuration(
-                pane,
-                &data::client::Map::default(),
-                &dashboard.history,
-                config,
-            ) else {
+            let Configuration::Pane(pane) =
+                configuration(pane, &dashboard.history, config)
+            else {
                 continue;
             };
 
@@ -4762,7 +2513,7 @@ impl Dashboard {
                 tasks.push(dashboard.open_buffer(
                     buffer,
                     BufferAction::NewWindow,
-                    &mut data::client::Map::default(),
+                    &mut stream::Map::default(),
                     config,
                 ));
             }
@@ -4778,49 +2529,30 @@ impl Dashboard {
         &self.history
     }
 
-    pub fn get_filters(&mut self) -> &mut Vec<Filter> {
-        self.history.get_filters()
+    /// Ensures a (possibly partial) history entry exists so unread state
+    /// accrues for conversations without an open pane.
+    pub fn open_history(&mut self, kind: history::Kind) {
+        self.history.open(kind);
     }
 
-    pub fn handle_file_drop(&mut self, path: PathBuf) -> Task<Message> {
-        let Focus { window, pane } = self.focus;
-
-        let Some(pane_state) = self.panes.get(window, pane) else {
-            return Task::none();
-        };
-
-        let msg = match &pane_state.buffer {
-            Buffer::Channel(_) => Some(buffer::Message::Channel(
-                buffer::channel::Message::FilesDropped(vec![path]),
-            )),
-            Buffer::Query(_) => Some(buffer::Message::Query(
-                buffer::query::Message::FilesDropped(vec![path]),
-            )),
-            Buffer::Server(_) => Some(buffer::Message::Server(
-                buffer::server::Message::FilesDropped(vec![path]),
-            )),
-            _ => None,
-        };
-
-        if let Some(msg) = msg {
-            Task::done(Message::Pane(window, pane::Message::Buffer(pane, msg)))
-        } else {
-            Task::none()
-        }
-    }
-
-    pub fn get_reroute_rules(&self) -> &RerouteRules {
-        self.history.get_reroute_rules()
-    }
-
-    pub fn get_reroute_rules_mut(&mut self) -> &mut RerouteRules {
-        self.history.get_reroute_rules_mut()
+    pub fn find_window_with_history(
+        &self,
+        kind: &history::Kind,
+    ) -> Option<window::Id> {
+        self.panes.iter().find_map(|(window_id, _, state)| {
+            state
+                .buffer
+                .data()
+                .and_then(history::Kind::from_buffer)
+                .is_some_and(|pane_kind| pane_kind == *kind)
+                .then_some(window_id)
+        })
     }
 
     pub fn handle_notification_event(
         &mut self,
         event: notification::Event,
-        clients: &mut data::client::Map,
+        backend: &mut stream::Map,
         config: &Config,
     ) -> Task<Message> {
         match event {
@@ -4854,7 +2586,7 @@ impl Dashboard {
                             activate_application.chain(self.open_buffer(
                                 buffer,
                                 config.actions.notification.open_buffer,
-                                clients,
+                                backend,
                                 config,
                             ))
                         } else {
@@ -4886,7 +2618,6 @@ impl Dashboard {
         id: window::Id,
         event: window::Event,
         theme: &mut Theme,
-        config: &Config,
     ) -> Task<Message> {
         if self.panes.popout.contains_key(&id) {
             match event {
@@ -4906,18 +2637,9 @@ impl Dashboard {
                 | window::Event::Resized(_)
                 | window::Event::Unfocused
                 | window::Event::Opened { .. } => {}
-                window::Event::FileHovered => {
-                    self.filehost.file_being_hovered = true;
-                }
-                window::Event::FilesHoveredLeft => {
-                    self.filehost.file_being_hovered = false;
-                }
-                window::Event::FileDropped(path) => {
-                    self.filehost.file_being_hovered = false;
-                    if config.filehost.file_drop() {
-                        return self.handle_file_drop(path);
-                    }
-                }
+                window::Event::FileHovered
+                | window::Event::FilesHoveredLeft
+                | window::Event::FileDropped(_) => {}
             }
         } else if self.theme_editor.as_ref().is_some_and(|e| e.window == id) {
             match event {
@@ -4958,11 +2680,9 @@ impl Dashboard {
         }
     }
 
-    pub fn exit(
-        &mut self,
-        clients: &mut data::client::Map,
-        config: &Config,
-    ) -> Task<Message> {
+    /// Marks buffers as read per config, saves the dashboard, then asks
+    /// the caller (via `Event::Exit`) to quit the backend and the app.
+    pub fn exit(&mut self, config: &Config) -> Task<Message> {
         if config.buffer.mark_as_read.on_application_exit {
             self.history.kinds()
         } else {
@@ -4984,314 +2704,65 @@ impl Dashboard {
         }
         .into_iter()
         .for_each(|kind| {
-            mark_as_read(kind, &mut self.history, clients, TokenPriority::High);
+            self.history.mark_as_read(&kind);
         });
 
-        let history = self.history.exit(clients);
-        let last_changed = self.last_changed.take();
+        self.last_changed = None;
         let dashboard = data::Dashboard::from(&*self);
 
-        Task::perform(
-            async move {
-                if last_changed.is_some() {
-                    match dashboard.save().await {
-                        Ok(()) => {
-                            log::debug!("dashboard saved");
-                        }
-                        Err(error) => {
-                            log::warn!("error saving dashboard: {error}");
-                        }
-                    }
-                }
-
-                history.await
-            },
-            Message::History,
-        )
-    }
-
-    pub fn open_target(
-        &mut self,
-        server: Server,
-        target: Target,
-        clients: &mut data::client::Map,
-        buffer_action: BufferAction,
-        config: &Config,
-        join_channel_if_not_joined: bool,
-    ) -> Task<Message> {
-        match target {
-            Target::Channel(channel) => {
-                if join_channel_if_not_joined
-                    && !clients.contains_channel(&server, &channel)
-                {
-                    clients.join(&server, slice::from_ref(&channel));
-                }
-
-                let buffer = data::Buffer::Upstream(buffer::Upstream::Channel(
-                    server, channel,
-                ));
-
-                self.open_buffer(buffer, buffer_action, clients, config)
-            }
-            Target::Query(query) => {
-                let buffer = data::Buffer::Upstream(buffer::Upstream::Query(
-                    server, query,
-                ));
-
-                self.open_buffer(buffer, buffer_action, clients, config)
-            }
-        }
-    }
-
-    pub fn find_window_with_file_transfers(&mut self) -> Option<window::Id> {
-        self.panes.iter().find_map(|(window_id, _, state)| {
-            matches!(state.buffer, Buffer::FileTransfers(_))
-                .then_some(window_id)
-        })
-    }
-
-    pub fn has_typing_activity(&self, clients: &client::Map) -> bool {
-        self.panes
-            .iter()
-            .any(|(_, _, pane)| pane.buffer.has_typing_activity(clients))
-    }
-
-    pub fn has_typing_activity_in_focused_window(
-        &self,
-        clients: &client::Map,
-        focused_window: Option<window::Id>,
-    ) -> bool {
-        focused_window.is_some_and(|focused_window| {
-            self.panes.iter().any(|(window, _, pane)| {
-                pane.buffer.has_typing_activity(clients)
-                    && focused_window == window
-            })
-        })
-    }
-
-    pub fn find_window_with_history(
-        &mut self,
-        kind: &history::Kind,
-    ) -> Option<window::Id> {
-        self.panes.iter().find_map(|(window_id, _, state)| {
-            state
-                .buffer
-                .data()
-                .and_then(history::Kind::from_buffer)
-                .is_some_and(|pane_kind| pane_kind == *kind)
-                .then_some(window_id)
-        })
-    }
-
-    pub fn find_window_with_server(
-        &mut self,
-        server: &Server,
-    ) -> Option<window::Id> {
-        self.panes.iter().find_map(|(window_id, _, state)| {
-            state
-                .buffer
-                .server()
-                .is_some_and(|pane_server| pane_server == *server)
-                .then_some(window_id)
-        })
-    }
-
-    pub fn process_server_inputs_completion_and_notice(
-        &mut self,
-        server: &Server,
-        clients: &client::Map,
-        config: &Config,
-    ) {
-        for buffer in self.panes.iter_mut().filter_map(|(_, _, state)| {
-            state
-                .buffer
-                .server()
-                .is_some_and(|pane_server| pane_server == *server)
-                .then_some(&mut state.buffer)
-        }) {
-            buffer.process_input_completion_and_notice(
-                clients,
-                &self.history,
-                config,
-            );
-        }
+        Task::perform(dashboard.save(), Message::Exited)
     }
 
     fn main_window(&self) -> window::Id {
         self.panes.main_window
     }
 
-    // URLs are filtered if there is no available preview client (an error) or
-    // previews are disabled for the buffer (configuration)
-    fn visible_preview_urls_with_preview_clients(
+    pub fn focused_buffer_name(
         &self,
-        clients: &client::Map,
-        config: &config::preview::Preview,
-    ) -> HashMap<url::Url, Arc<reqwest::Client>> {
-        let pane_map = |pane: &Pane| -> Vec<(url::Url, Arc<reqwest::Client>)> {
-            let server = pane.buffer.server();
-
-            let preview_client = if let Some(server) = server.as_ref()
-                && clients.get_server_proxy_config(server).is_some()
-            {
-                clients.get_server_http_client(server)
-            } else {
-                self.http_client.clone()
-            };
-
-            let Some(preview_client) = preview_client else {
-                return vec![];
-            };
-
-            if let Some(server) = server.as_ref()
-                && let Some(target_ref) = pane.buffer.target_ref()
-            {
-                let casemapping =
-                    clients.get_server_casemapping_or_default(server);
-
-                if matches!(
-                    config.card.visible(target_ref, server, casemapping),
-                    config::preview::Visibility::None
-                ) && matches!(
-                    config.image.visible(target_ref, server, casemapping),
-                    config::preview::Visibility::None
-                ) {
-                    return vec![];
-                }
+        w: window::Id,
+        session: &data::Session,
+    ) -> Option<String> {
+        let name = |pane: &Pane| -> Option<String> {
+            match &pane.buffer {
+                Buffer::Empty => None,
+                Buffer::Conversation(state) => Some(
+                    session.conversations.get(&state.convo_id).map_or_else(
+                        || {
+                            format!(
+                                "Conversation {}",
+                                state.convo_id.short_label()
+                            )
+                        },
+                        data::Conversation::display_name,
+                    ),
+                ),
+                Buffer::Logs(_) => Some("Logs".to_string()),
+                Buffer::ConfigEditor(_) => Some("Config Editor".to_string()),
             }
-
-            pane.visible_urls()
-                .into_iter()
-                .map(move |url| (url.clone(), preview_client.clone()))
-                .collect()
         };
 
-        self.panes
-            .main
-            .panes
-            .values()
-            .flat_map(pane_map)
-            .chain(
-                self.panes
-                    .popout
-                    .values()
-                    .flat_map(|state| state.panes.values().flat_map(pane_map)),
-            )
-            .collect()
-    }
-
-    pub fn focused_buffer_name(&self, w: window::Id) -> Option<String> {
         if w == self.main_window() {
             self.focus_history
                 .front()
                 .and_then(|pane| self.panes.get(w, *pane))
-                .filter(|pane| !matches!(pane.buffer, Buffer::Empty))
-                .map(|pane| pane.buffer.to_string())
+                .and_then(name)
         } else {
-            self.panes.iter().find_map(|(win, _, pane)| {
-                (win == w && !matches!(pane.buffer, Buffer::Empty))
-                    .then_some(pane.buffer.to_string())
-            })
+            self.panes
+                .iter()
+                .find_map(|(win, _, pane)| (win == w).then(|| name(pane)))
+                .flatten()
         }
     }
-
-    fn has_focused_pane_channel(
-        &self,
-        server: &Server,
-        channel: &target::Channel,
-    ) -> bool {
-        self.panes
-            .iter()
-            .find(|(window, pane, _)| {
-                self.focus
-                    == Focus {
-                        window: *window,
-                        pane: *pane,
-                    }
-            })
-            .and_then(|(_, _, pane)| match pane.buffer.upstream() {
-                Some(buffer::Upstream::Channel(
-                    focused_server,
-                    focused_channel,
-                )) => Some((focused_server, focused_channel)),
-                _ => None,
-            })
-            .is_some_and(|(focused_server, focused_channel)| {
-                focused_server == server && focused_channel == channel
-            })
-    }
-
-    pub fn open_pane_channels(&self) -> Vec<(&Server, &target::Channel)> {
-        self.panes
-            .iter()
-            .filter_map(|(_, _, pane)| match pane.buffer.upstream() {
-                Some(buffer::Upstream::Channel(server, channel)) => {
-                    Some((server, channel))
-                }
-                _ => None,
-            })
-            .collect()
-    }
-
-    pub fn has_open_pane_channel(
-        &self,
-        server: &Server,
-        channel: &target::Channel,
-    ) -> bool {
-        self.open_pane_channels()
-            .iter()
-            .any(|(open_server, open_channel)| {
-                *open_server == server && *open_channel == channel
-            })
-    }
-
-    pub fn open_pane_server_queries(
-        &self,
-        server: &Server,
-    ) -> Vec<&target::Query> {
-        self.panes
-            .iter()
-            .filter_map(|(_, _, pane)| match pane.buffer.upstream() {
-                Some(buffer::Upstream::Query(buffer_server, query))
-                    if buffer_server == server =>
-                {
-                    Some(query)
-                }
-                _ => None,
-            })
-            .collect()
-    }
 }
 
-fn mark_server_as_read(
-    server: Server,
-    history: &mut history::Manager,
-    clients: &mut data::client::Map,
-) {
-    for kind in history.server_kinds(server) {
-        mark_as_read(kind, history, clients, TokenPriority::User);
-    }
-}
-
-fn mark_as_read(
-    kind: history::Kind,
-    history: &mut history::Manager,
-    clients: &mut data::client::Map,
-    priority: TokenPriority,
-) {
-    let read_marker = history.mark_as_read(&kind);
-
-    if let (Some(server), Some(target), Some(read_marker)) =
-        (kind.server(), kind.target(), read_marker)
-    {
-        clients.send_markread(server, target, read_marker, priority);
-    }
+/// The wire-side conversation id for backend controls.
+pub fn wire_id(convo_id: &ConvoId) -> stream::ConvoId {
+    stream::ConvoId(convo_id.as_str().to_owned())
 }
 
 fn mark_as_read_on_buffer_close(
     buffer: &Buffer,
     history: &mut history::Manager,
-    clients: &mut data::client::Map,
     config: &Config,
 ) {
     if config
@@ -5301,7 +2772,7 @@ fn mark_as_read_on_buffer_close(
         .mark_as_read(buffer.is_scrolled_to_bottom())
         && let Some(kind) = buffer.data().and_then(history::Kind::from_buffer)
     {
-        mark_as_read(kind, history, clients, TokenPriority::High);
+        history.mark_as_read(&kind);
     }
 }
 
@@ -5362,6 +2833,7 @@ impl<'a> From<&'a Dashboard> for data::Dashboard {
             } else {
                 data::dashboard::Sidebar::Visible
             },
+            member_add_explained: dashboard.member_add_explained,
         }
     }
 }
@@ -5401,7 +2873,7 @@ impl Panes {
     }
 
     fn get_by_buffer(
-        &mut self,
+        &self,
         buffer: &data::Buffer,
     ) -> Option<(window::Id, pane_grid::Pane, &Pane)> {
         self.iter().find(|(_, _, state)| {
@@ -5409,38 +2881,12 @@ impl Panes {
         })
     }
 
-    fn get_mut_by_buffer(
-        &mut self,
-        buffer: &data::Buffer,
-    ) -> Option<(window::Id, pane_grid::Pane, &mut Pane)> {
-        self.iter_mut().find(|(_, _, state)| {
-            state.buffer.data().is_some_and(|b| b == *buffer)
-        })
-    }
-
-    fn iter(
+    pub fn iter(
         &self,
     ) -> impl Iterator<Item = (window::Id, pane_grid::Pane, &Pane)> {
         self.main
             .iter()
             .map(move |(pane, state)| (self.main_window, *pane, state))
-            .chain(self.popout.iter().flat_map(|(window_id, panes)| {
-                panes.iter().map(|(pane, state)| (*window_id, *pane, state))
-            }))
-    }
-
-    fn iter_visible(
-        &self,
-    ) -> impl Iterator<Item = (window::Id, pane_grid::Pane, &Pane)> {
-        let maximized = self.main.maximized();
-
-        self.main
-            .iter()
-            .filter_map(move |(pane, state)| {
-                maximized
-                    .is_none_or(|maximized| *pane == maximized)
-                    .then_some((self.main_window, *pane, state))
-            })
             .chain(self.popout.iter().flat_map(|(window_id, panes)| {
                 panes.iter().map(|(pane, state)| (*window_id, *pane, state))
             }))
@@ -5470,52 +2916,13 @@ impl Panes {
     }
 }
 
-fn all_upstream_buffers(
-    clients: &client::Map,
-    history: &history::Manager,
-) -> Vec<buffer::Upstream> {
-    clients
-        .connected_servers()
-        .flat_map(|server| {
-            std::iter::once(buffer::Upstream::Server(server.clone()))
-                .chain(clients.get_channels(server).map(|channel| {
-                    buffer::Upstream::Channel(server.clone(), channel.clone())
-                }))
-                .chain(history.get_unique_queries(server).into_iter().map(
-                    |nick| {
-                        buffer::Upstream::Query(server.clone(), nick.clone())
-                    },
-                ))
-        })
-        .collect()
-}
-
+/// Every buffer the command bar / cycling can target: all conversations in
+/// recency order plus the internal buffers.
 fn open_buffers(dashboard: &Dashboard) -> Vec<data::Buffer> {
     dashboard
         .panes
         .iter()
         .filter_map(|(_, _, pane)| pane.buffer.data())
-        .collect()
-}
-
-fn open_upstream_buffers(dashboard: &Dashboard) -> Vec<buffer::Upstream> {
-    dashboard
-        .panes
-        .iter()
-        .filter_map(|(_, _, pane)| pane.buffer.upstream())
-        .cloned()
-        .collect()
-}
-
-fn closed_upstream_buffers(
-    dashboard: &Dashboard,
-    clients: &client::Map,
-) -> Vec<buffer::Upstream> {
-    let open_buffers = open_upstream_buffers(dashboard);
-
-    all_upstream_buffers(clients, &dashboard.history)
-        .into_iter()
-        .filter(|buffer| !open_buffers.contains(buffer))
         .collect()
 }
 
@@ -5610,45 +3017,4 @@ fn cycle_previous_unread_buffer(
     previous_before()
         .or_else(|| previous_after().or(None))
         .cloned()
-}
-
-fn connect_server(
-    server: Server,
-    controllers: &mut stream::Map,
-    servers: &server::Map,
-) {
-    if let Some(parent) = server.parent() {
-        controllers.connect(&parent);
-    }
-
-    controllers.connect(&server);
-
-    for bouncer_network in servers.get_bouncer_networks(&server) {
-        controllers.connect(bouncer_network);
-    }
-}
-
-fn http_client_from_config(config: &Config) -> Option<reqwest::Client> {
-    let http_client = config::proxy::build_client(config.proxy.as_ref(), None);
-
-    match http_client {
-        Ok(http_client) => Some(http_client),
-        Err(error) => {
-            log::warn!(
-                "Unable to build HTTP client, preview fetching and file upload disabled by default: {error}"
-            );
-
-            None
-        }
-    }
-}
-
-fn preview_cache(config: &config::Preview) -> cache::FileCache {
-    let root = environment::cache_dir().join("previews");
-
-    cache::FileCache::new(
-        root,
-        config.request.image_cache.max_size_bytes(),
-        config.request.image_cache.trim_interval,
-    )
 }

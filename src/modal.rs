@@ -1,91 +1,114 @@
-use std::path::PathBuf;
-use std::time::Instant;
-
-use data::{Image, Server, config};
-use iced::Task;
+use data::config;
+use data::conversation::ConvoId;
+use iced::widget::{button, container, text};
+use iced::{Length, Task, alignment};
 
 use crate::widget::Element;
-use crate::{Theme, open_url, window};
+use crate::{Theme, open_url, theme, window};
 
 pub mod about;
-pub mod confirm_file_upload;
-pub mod connect_to_server;
-pub mod image_preview;
-pub mod keyring_password;
+pub mod add_member;
+pub mod confirm_delete;
+pub mod member_add_info;
+pub mod new_dm;
+pub mod new_group;
 pub mod prompt_before_open_url;
 pub mod reload_configuration_error;
+pub mod set_nickname;
 
 #[derive(Debug)]
 pub enum Modal {
     ReloadConfigurationError(config::Error),
-    ServerConnect {
-        url: String,
-        server: Server,
-        config: config::Server,
-    },
     About(about::About),
-    PromptBeforeOpenUrl {
-        url: String,
-        window: window::Id,
-    },
-    ImagePreview {
-        image: Image,
-        timer: Option<Instant>,
-        window: window::Id,
-    },
-    ConfirmFileUpload {
-        url: String,
-        has_credentials: bool,
-        window: window::Id,
-    },
-    KeyringPassword(keyring_password::KeyringPassword),
+    PromptBeforeOpenUrl { url: String, window: window::Id },
+    NewDm(new_dm::NewDm),
+    NewGroup(new_group::NewGroup),
+    SetNickname(set_nickname::SetNickname),
+    ConfirmDeleteConversation(confirm_delete::ConfirmDelete),
+    AddMember(add_member::AddMember),
+    MemberAddInfo(member_add_info::MemberAddInfo),
 }
 
 #[derive(Debug, Clone)]
 pub enum Message {
     Cancel,
     OpenURL(String),
-    ConfirmFileUpload,
     // Modal specific messages
-    ServerConnect(ServerConnect),
     About(about::Action),
-    ImagePreview(ImagePreview),
-    KeyringPassword(keyring_password::Action),
-}
-
-#[derive(Debug, Clone)]
-pub enum ImagePreview {
-    SaveImage(PathBuf),
-    SavedImage(Option<PathBuf>),
-}
-
-#[derive(Debug, Clone)]
-pub enum ServerConnect {
-    AcceptNewServer,
-    DangerouslyAcceptInvalidCerts(bool),
+    NewDm(new_dm::Message),
+    NewGroup(new_group::Message),
+    SetNickname(set_nickname::Message),
+    ConfirmDelete(confirm_delete::Message),
+    AddMember(add_member::Message),
+    MemberAddInfo(member_add_info::Message),
 }
 
 pub enum Event {
     CloseModal,
-    AcceptNewServer,
-    ConfirmFileUpload,
-    KeyringPasswordStored,
+    CreateDirectMessage {
+        peer_address: String,
+    },
+    CreateGroup {
+        name: String,
+        description: String,
+    },
+    SetNickname {
+        convo_id: ConvoId,
+        nickname: String,
+    },
+    DeleteConversation(ConvoId),
+    /// An address was entered in the add-member dialog; the caller runs
+    /// the first-add explainer gate before sending.
+    AddGroupMember {
+        convo_id: ConvoId,
+        peer_address: String,
+    },
+    /// The explainer was confirmed; send the invite (and persist the
+    /// don't-show-again preference when asked).
+    ConfirmAddGroupMember {
+        convo_id: ConvoId,
+        peer_address: String,
+        dont_show_again: bool,
+    },
+}
+
+/// Dialog drafts that outlive a dismissed modal (QML parity: a dismissed
+/// dialog reopens with the same draft; it clears on a successful create).
+#[derive(Debug, Clone, Default)]
+pub struct Drafts {
+    pub dm: String,
+    pub group_name: String,
+    pub group_description: String,
+    pub member: String,
 }
 
 impl Modal {
     pub fn window_id(&self) -> Option<window::Id> {
         match self {
-            Modal::ReloadConfigurationError(..) => None,
-            Modal::ServerConnect { .. } => None,
-            Modal::About(..) => None,
+            Modal::ReloadConfigurationError(..)
+            | Modal::About(..)
+            | Modal::NewDm(..)
+            | Modal::NewGroup(..)
+            | Modal::SetNickname(..)
+            | Modal::ConfirmDeleteConversation(..)
+            | Modal::AddMember(..)
+            | Modal::MemberAddInfo(..) => None,
             Modal::PromptBeforeOpenUrl { url: _, window } => Some(*window),
-            Modal::ImagePreview {
-                image: _,
-                timer: _,
-                window,
-            } => Some(*window),
-            Modal::ConfirmFileUpload { window, .. } => Some(*window),
-            Modal::KeyringPassword(_) => None,
+        }
+    }
+
+    /// Focuses the modal's primary input, if it has one.
+    pub fn focus(&self) -> Task<Message> {
+        match self {
+            Modal::NewDm(modal) => modal.focus(),
+            Modal::NewGroup(modal) => modal.focus(),
+            Modal::SetNickname(modal) => modal.focus(),
+            Modal::AddMember(modal) => modal.focus(),
+            Modal::ReloadConfigurationError(..)
+            | Modal::About(..)
+            | Modal::PromptBeforeOpenUrl { .. }
+            | Modal::ConfirmDeleteConversation(..)
+            | Modal::MemberAddInfo(..) => Task::none(),
         }
     }
 
@@ -95,9 +118,6 @@ impl Modal {
     ) -> (Task<Message>, Option<Event>) {
         match message {
             Message::Cancel => (Task::none(), Some(Event::CloseModal)),
-            Message::ConfirmFileUpload => {
-                (Task::none(), Some(Event::ConfirmFileUpload))
-            }
             Message::About(action) => {
                 if let Modal::About(about) = self {
                     (about.update(action), None)
@@ -105,72 +125,53 @@ impl Modal {
                     (Task::none(), None)
                 }
             }
-            Message::ServerConnect(server_connect) => match server_connect {
-                ServerConnect::AcceptNewServer => {
-                    (Task::none(), Some(Event::AcceptNewServer))
-                }
-                ServerConnect::DangerouslyAcceptInvalidCerts(toggle) => {
-                    if let Modal::ServerConnect { config, .. } = self {
-                        config.dangerously_accept_invalid_certs = toggle;
-                    }
-
+            Message::NewDm(message) => {
+                if let Modal::NewDm(modal) = self {
+                    modal.update(message)
+                } else {
                     (Task::none(), None)
                 }
-            },
+            }
+            Message::NewGroup(message) => {
+                if let Modal::NewGroup(modal) = self {
+                    modal.update(message)
+                } else {
+                    (Task::none(), None)
+                }
+            }
+            Message::SetNickname(message) => {
+                if let Modal::SetNickname(modal) = self {
+                    modal.update(message)
+                } else {
+                    (Task::none(), None)
+                }
+            }
+            Message::ConfirmDelete(message) => {
+                if let Modal::ConfirmDeleteConversation(modal) = self {
+                    modal.update(message)
+                } else {
+                    (Task::none(), None)
+                }
+            }
+            Message::AddMember(message) => {
+                if let Modal::AddMember(modal) = self {
+                    modal.update(message)
+                } else {
+                    (Task::none(), None)
+                }
+            }
+            Message::MemberAddInfo(message) => {
+                if let Modal::MemberAddInfo(modal) = self {
+                    modal.update(message)
+                } else {
+                    (Task::none(), None)
+                }
+            }
             Message::OpenURL(raw_url) => {
                 let canonical = url::Url::parse(&raw_url)
                     .map_or(raw_url, |u| u.to_string());
                 let _ = open_url::open(canonical);
-                let close = !matches!(self, Modal::ConfirmFileUpload { .. });
-                (Task::none(), close.then_some(Event::CloseModal))
-            }
-            Message::ImagePreview(image_preview) => match image_preview {
-                ImagePreview::SaveImage(source) => (
-                    Task::perform(
-                        async move {
-                            if let Some(handle) = rfd::AsyncFileDialog::new()
-                                .set_file_name(
-                                    source
-                                        .file_name()
-                                        .and_then(|n| n.to_str())
-                                        .unwrap_or_default(),
-                                )
-                                .save_file()
-                                .await
-                            {
-                                let destination = handle.path();
-                                tokio::fs::copy(&source, destination)
-                                    .await
-                                    .ok()
-                                    .map(|_| destination.to_path_buf())
-                            } else {
-                                None
-                            }
-                        },
-                        move |path| {
-                            Message::ImagePreview(ImagePreview::SavedImage(
-                                path,
-                            ))
-                        },
-                    ),
-                    None,
-                ),
-                ImagePreview::SavedImage(path) => {
-                    if path.is_some()
-                        && let Modal::ImagePreview { timer, .. } = self
-                    {
-                        *timer = Some(Instant::now());
-                    }
-
-                    (Task::none(), None)
-                }
-            },
-            Message::KeyringPassword(action) => {
-                if let Modal::KeyringPassword(keyring_password) = self {
-                    keyring_password.update(action)
-                } else {
-                    (Task::none(), None)
-                }
+                (Task::none(), Some(Event::CloseModal))
             }
         }
     }
@@ -180,26 +181,33 @@ impl Modal {
             Modal::ReloadConfigurationError(error) => {
                 reload_configuration_error::view(error, theme)
             }
-            Modal::ServerConnect {
-                url: raw, config, ..
-            } => connect_to_server::view(raw, config, theme),
             Modal::About(about) => about.view(theme),
             Modal::PromptBeforeOpenUrl { url, window: _ } => {
                 prompt_before_open_url::view(url, theme)
             }
-            Modal::ConfirmFileUpload {
-                url,
-                has_credentials,
-                window: _,
-            } => confirm_file_upload::view(url, *has_credentials, theme),
-            Modal::ImagePreview {
-                image,
-                timer,
-                window: _,
-            } => image_preview::view(image, timer, theme),
-            Modal::KeyringPassword(keyring_password) => {
-                keyring_password.view(theme)
-            }
+            Modal::NewDm(modal) => modal.view(theme),
+            Modal::NewGroup(modal) => modal.view(theme),
+            Modal::SetNickname(modal) => modal.view(theme),
+            Modal::ConfirmDeleteConversation(modal) => modal.view(theme),
+            Modal::AddMember(modal) => modal.view(theme),
+            Modal::MemberAddInfo(modal) => modal.view(theme),
         }
     }
+}
+
+/// A dialog's footer button; `None` renders it disabled.
+fn action_button(
+    label: &str,
+    on_press: Option<Message>,
+) -> Element<'_, Message> {
+    button(
+        container(text(label))
+            .align_x(alignment::Horizontal::Center)
+            .width(Length::Fill),
+    )
+    .padding(5)
+    .width(Length::Fixed(96.0))
+    .style(|theme, status| theme::button::secondary(theme, status, false))
+    .on_press_maybe(on_press)
+    .into()
 }

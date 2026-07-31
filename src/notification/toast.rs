@@ -44,7 +44,7 @@ impl Toast {
             } else {
                 notification.summary(title);
             }
-            notification.appname("Halloy");
+            notification.appname("Frigicom");
             notification.icon(data::environment::APPLICATION_ID);
         }
         #[cfg(target_os = "linux")]
@@ -77,7 +77,7 @@ impl Toast {
 
         match notification_action {
             NotificationAction::ActivateApplication => {
-                notification.action("default", "Open Halloy");
+                notification.action("default", "Open Frigicom");
                 if has_buffer_context {
                     notification.action("open_buffer", "Open Buffer");
                 }

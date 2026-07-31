@@ -446,6 +446,7 @@ fn components() -> impl Iterator<Item = Component> {
                 .map(Component::Buttons),
         )
         .chain(Formatting::iter().map(Component::Formatting))
+        .chain(Avatars::iter().map(Component::Avatars))
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, strum::Display)]
@@ -460,6 +461,8 @@ pub enum Component {
     Buttons(Buttons),
     #[strum(to_string = "formatting-{0}")]
     Formatting(Formatting),
+    #[strum(to_string = "avatar-{0}")]
+    Avatars(Avatars),
 }
 
 impl Component {
@@ -470,6 +473,7 @@ impl Component {
             Component::Buffer(buffer) => buffer.color(styles),
             Component::Buttons(buttons) => buttons.color(styles),
             Component::Formatting(formatting) => formatting.color(styles),
+            Component::Avatars(avatars) => Some(avatars.color(styles)),
         }
     }
 
@@ -480,6 +484,7 @@ impl Component {
             Component::Buffer(buffer) => buffer.font_style(styles),
             Component::Buttons(_) => None,
             Component::Formatting(_) => None,
+            Component::Avatars(_) => None,
         }
     }
 
@@ -507,7 +512,80 @@ impl Component {
             Component::Formatting(formatting) => {
                 formatting.update(&mut styles.formatting, color);
             }
+            Component::Avatars(avatars) => {
+                avatars.update(&mut styles.avatars, color);
+            }
         }
+    }
+}
+
+#[derive(
+    Debug, Clone, Copy, PartialEq, Eq, strum::Display, strum::EnumIter,
+)]
+#[strum(serialize_all = "kebab-case")]
+pub enum Avatars {
+    Ramp1Start,
+    Ramp1End,
+    Ramp2Start,
+    Ramp2End,
+    Ramp3Start,
+    Ramp3End,
+    Ramp4Start,
+    Ramp4End,
+    Ramp5Start,
+    Ramp5End,
+    SelfStart,
+    SelfEnd,
+    Ink,
+}
+
+impl Avatars {
+    /// The resolved color, so the picker previews the palette-derived
+    /// default when no override is set.
+    fn color(self, styles: &Styles) -> Color {
+        use data::appearance::theme::{
+            avatar_ink, avatar_ramp_colors, avatar_self_colors,
+        };
+
+        match self {
+            Avatars::Ramp1Start => avatar_ramp_colors(styles, 0).0,
+            Avatars::Ramp1End => avatar_ramp_colors(styles, 0).1,
+            Avatars::Ramp2Start => avatar_ramp_colors(styles, 1).0,
+            Avatars::Ramp2End => avatar_ramp_colors(styles, 1).1,
+            Avatars::Ramp3Start => avatar_ramp_colors(styles, 2).0,
+            Avatars::Ramp3End => avatar_ramp_colors(styles, 2).1,
+            Avatars::Ramp4Start => avatar_ramp_colors(styles, 3).0,
+            Avatars::Ramp4End => avatar_ramp_colors(styles, 3).1,
+            Avatars::Ramp5Start => avatar_ramp_colors(styles, 4).0,
+            Avatars::Ramp5End => avatar_ramp_colors(styles, 4).1,
+            Avatars::SelfStart => avatar_self_colors(styles).0,
+            Avatars::SelfEnd => avatar_self_colors(styles).1,
+            Avatars::Ink => avatar_ink(styles),
+        }
+    }
+
+    fn update(
+        self,
+        styles: &mut data::appearance::theme::Avatars,
+        color: Option<Color>,
+    ) {
+        let slot = match self {
+            Avatars::Ramp1Start => &mut styles.ramp1.start,
+            Avatars::Ramp1End => &mut styles.ramp1.end,
+            Avatars::Ramp2Start => &mut styles.ramp2.start,
+            Avatars::Ramp2End => &mut styles.ramp2.end,
+            Avatars::Ramp3Start => &mut styles.ramp3.start,
+            Avatars::Ramp3End => &mut styles.ramp3.end,
+            Avatars::Ramp4Start => &mut styles.ramp4.start,
+            Avatars::Ramp4End => &mut styles.ramp4.end,
+            Avatars::Ramp5Start => &mut styles.ramp5.start,
+            Avatars::Ramp5End => &mut styles.ramp5.end,
+            Avatars::SelfStart => &mut styles.self_ramp.start,
+            Avatars::SelfEnd => &mut styles.self_ramp.end,
+            Avatars::Ink => &mut styles.ink,
+        };
+
+        *slot = color;
     }
 }
 

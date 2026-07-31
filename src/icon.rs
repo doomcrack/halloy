@@ -1,4 +1,3 @@
-use data::config;
 use iced::widget::text::LineHeight;
 use iced::widget::{svg, text};
 
@@ -12,40 +11,6 @@ pub fn dot<'a>() -> Text<'a> {
 
 pub fn error<'a>() -> Text<'a> {
     to_text('\u{E80D}')
-}
-
-pub fn connected<'a>() -> TextColorSvg<'a, Theme> {
-    text_color_svg(svg::Handle::from_memory(
-        include_bytes!("../assets/fontello/entypo-globe.svg").as_slice(),
-    ))
-}
-
-pub fn connecting<'a>() -> TextColorSvg<'a, Theme> {
-    let fontawesome_plug =
-        include_bytes!("../assets/fontello/fontawesome-plug.svg").to_vec();
-
-    text_color_svg(svg::Handle::from_memory(fontawesome_plug))
-}
-
-// If attempting to connect and not successful
-pub fn disconnected<'a>() -> TextColorSvg<'a, Theme> {
-    text_color_svg(svg::Handle::from_memory(
-        include_bytes!("../assets/fontello/entypo-cancel.svg").as_slice(),
-    ))
-}
-
-// If not attempting to connect
-pub fn not_connected<'a>() -> TextColorSvg<'a, Theme> {
-    let elusive_error_alt =
-        include_bytes!("../assets/fontello/elusive-error-alt.svg").to_vec();
-
-    text_color_svg(svg::Handle::from_memory(elusive_error_alt))
-}
-
-pub fn link<'a>() -> TextColorSvg<'a, Theme> {
-    text_color_svg(svg::Handle::from_memory(
-        include_bytes!("../assets/fontello/entypo-link.svg").as_slice(),
-    ))
 }
 
 pub fn cancel<'a>() -> Text<'a> {
@@ -64,10 +29,6 @@ pub fn people<'a>() -> Text<'a> {
     to_text('\u{E804}')
 }
 
-pub fn topic<'a>() -> Text<'a> {
-    to_text('\u{E803}')
-}
-
 pub fn search<'a>() -> TextColorSvg<'a, Theme> {
     text_color_svg(svg::Handle::from_memory(
         include_bytes!("../assets/fontello/entypo-search.svg").as_slice(),
@@ -76,12 +37,6 @@ pub fn search<'a>() -> TextColorSvg<'a, Theme> {
 
 pub fn checkmark<'a>() -> Text<'a> {
     to_text('\u{E806}')
-}
-
-pub fn file_transfer<'a>() -> TextColorSvg<'a, Theme> {
-    text_color_svg(svg::Handle::from_memory(
-        include_bytes!("../assets/fontello/entypo-download.svg").as_slice(),
-    ))
 }
 
 pub fn refresh<'a>() -> TextColorSvg<'a, Theme> {
@@ -126,24 +81,6 @@ pub fn menu<'a>() -> TextColorSvg<'a, Theme> {
     ))
 }
 
-pub fn documentation<'a>() -> TextColorSvg<'a, Theme> {
-    text_color_svg(svg::Handle::from_memory(
-        include_bytes!("../assets/fontello/fontawesome-book.svg").as_slice(),
-    ))
-}
-
-pub fn highlights<'a>() -> TextColorSvg<'a, Theme> {
-    text_color_svg(svg::Handle::from_memory(
-        include_bytes!("../assets/fontello/entypo-bell.svg").as_slice(),
-    ))
-}
-
-pub fn channel_monitor<'a>() -> TextColorSvg<'a, Theme> {
-    text_color_svg(svg::Handle::from_memory(
-        include_bytes!("../assets/fontello/fontawesome-desktop.svg").as_slice(),
-    ))
-}
-
 pub fn scroll_to_bottom<'a>() -> Text<'a> {
     to_text('\u{F103}')
 }
@@ -167,56 +104,9 @@ pub fn open<'a>() -> Text<'a> {
     to_text('\u{F115}')
 }
 
-pub fn star<'a>() -> TextColorSvg<'a, Theme> {
-    text_color_svg(svg::Handle::from_memory(
-        include_bytes!("../assets/fontello/fontawesome-star.svg").as_slice(),
-    ))
-}
-
-pub fn certificate<'a>() -> TextColorSvg<'a, Theme> {
-    text_color_svg(svg::Handle::from_memory(
-        include_bytes!("../assets/fontello/fontawesome-certificate.svg")
-            .as_slice(),
-    ))
-}
-
 pub fn circle<'a>() -> TextColorSvg<'a, Theme> {
     text_color_svg(svg::Handle::from_memory(
         include_bytes!("../assets/fontello/fontawesome-circle.svg").as_slice(),
-    ))
-}
-
-pub fn circle_empty<'a>() -> TextColorSvg<'a, Theme> {
-    text_color_svg(svg::Handle::from_memory(
-        include_bytes!("../assets/fontello/fontawesome-circle-empty.svg")
-            .as_slice(),
-    ))
-}
-
-pub fn dot_circled<'a>() -> TextColorSvg<'a, Theme> {
-    text_color_svg(svg::Handle::from_memory(
-        include_bytes!("../assets/fontello/fontawesome-dot-circled.svg")
-            .as_slice(),
-    ))
-}
-
-pub fn asterisk<'a>() -> TextColorSvg<'a, Theme> {
-    text_color_svg(svg::Handle::from_memory(
-        include_bytes!("../assets/fontello/fontawesome-asterisk.svg")
-            .as_slice(),
-    ))
-}
-
-pub fn speaker<'a>() -> TextColorSvg<'a, Theme> {
-    text_color_svg(svg::Handle::from_memory(
-        include_bytes!("../assets/fontello/entypo-sound.svg").as_slice(),
-    ))
-}
-
-pub fn lightbulb<'a>() -> TextColorSvg<'a, Theme> {
-    text_color_svg(svg::Handle::from_memory(
-        include_bytes!("../assets/fontello/fontawesome-lightbulb.svg")
-            .as_slice(),
     ))
 }
 
@@ -226,39 +116,12 @@ pub fn quit<'a>() -> TextColorSvg<'a, Theme> {
     ))
 }
 
-pub fn channel_discovery<'a>() -> TextColorSvg<'a, Theme> {
-    text_color_svg(svg::Handle::from_memory(
-        include_bytes!("../assets/fontello/fontawesome-users.svg").as_slice(),
-    ))
-}
-
 pub fn plus<'a>() -> Text<'a> {
     to_text('\u{E820}')
 }
 
-pub fn chevron_left<'a>() -> Text<'a> {
-    to_text('\u{003C}')
-}
-
-pub fn chevron_right<'a>() -> Text<'a> {
-    to_text('\u{003E}')
-}
-
-#[allow(dead_code)]
-pub fn chevron_up<'a>() -> Text<'a> {
-    to_text('\u{005E}')
-}
-
 pub fn chevron_down<'a>() -> Text<'a> {
     to_text('\u{0076}')
-}
-
-pub fn lock<'a>() -> Text<'a> {
-    to_text('\u{E821}')
-}
-
-pub fn reply<'a>() -> Text<'a> {
-    to_text('\u{E81B}')
 }
 
 pub fn not_sent<'a>() -> TextColorSvg<'a, Theme> {
@@ -278,24 +141,6 @@ pub fn about<'a>() -> TextColorSvg<'a, Theme> {
     ))
 }
 
-pub fn log_indicator<'a>() -> TextColorSvg<'a, Theme> {
-    text_color_svg(svg::Handle::from_memory(
-        include_bytes!("../assets/fontello/entypo-cancel.svg").as_slice(),
-    ))
-}
-
-pub fn show<'a>() -> TextColorSvg<'a, Theme> {
-    text_color_svg(svg::Handle::from_memory(
-        include_bytes!("../assets/fontello/fontawesome-eye.svg").as_slice(),
-    ))
-}
-
-pub fn hide<'a>() -> TextColorSvg<'a, Theme> {
-    text_color_svg(svg::Handle::from_memory(
-        include_bytes!("../assets/fontello/fontawesome-eye-off.svg").as_slice(),
-    ))
-}
-
 pub fn spinner<'a>(angle: f32) -> TextColorSvg<'a, Theme> {
     text_color_svg(svg::Handle::from_memory(
         include_bytes!("../assets/spinner.svg").as_slice(),
@@ -310,20 +155,4 @@ fn to_text<'a>(unicode: char) -> Text<'a> {
         .line_height(LineHeight::Relative(1.0))
         .size(theme::ICON_SIZE)
         .font(*font::ICON)
-}
-
-pub fn from_icon<'a>(
-    icon: config::sidebar::Icon,
-) -> Option<TextColorSvg<'a, Theme>> {
-    match icon {
-        config::sidebar::Icon::Dot => Some(circle()),
-        config::sidebar::Icon::DotCircled => Some(dot_circled()),
-        config::sidebar::Icon::Certificate => Some(certificate()),
-        config::sidebar::Icon::Asterisk => Some(asterisk()),
-        config::sidebar::Icon::Speaker => Some(speaker()),
-        config::sidebar::Icon::Lightbulb => Some(lightbulb()),
-        config::sidebar::Icon::Star => Some(star()),
-        config::sidebar::Icon::CircleEmpty => Some(circle_empty()),
-        config::sidebar::Icon::None => None,
-    }
 }

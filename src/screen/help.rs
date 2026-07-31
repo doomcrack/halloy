@@ -66,7 +66,7 @@ impl Help {
         .on_press(Message::OpenWikiWebsite);
 
         let refresh_button = button(
-            container(text("Refresh Halloy"))
+            container(text("Refresh Frigicom"))
                 .align_x(alignment::Horizontal::Center)
                 .width(Length::Fill),
         )

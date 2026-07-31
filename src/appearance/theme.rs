@@ -23,11 +23,10 @@ pub mod text;
 pub mod text_editor;
 pub mod text_input;
 
-// TODO: If we use non-standard font sizes, we should consider
-// Config.font.size since it's user configurable
+// TODO(post-v1): derive these from Config.font.size instead of hard-coding
+// them, so non-standard font sizes scale the chrome too.
 pub const TEXT_SIZE: f32 = 13.0;
 pub const ICON_SIZE: f32 = 12.0;
-pub const ICON_SPACE: f32 = 2.0;
 
 #[derive(Debug, Clone)]
 pub enum Theme {

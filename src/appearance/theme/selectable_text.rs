@@ -1,12 +1,11 @@
-use data::appearance::theme::nickname_alpha;
-use data::config::buffer::{self, Dimmed};
-use data::message::source::server::{Kind, StandardReply};
-use data::{Config, User, log, message};
+use data::address::avatar_ramp;
+use data::appearance::theme::{
+    AVATAR_RAMP_COUNT, avatar_ramp_colors, avatar_self_colors, nickname_color,
+};
+use data::{Config, buffer, log, message};
 use iced::Color;
-use iced::theme::Base;
 
 use super::{Theme, text};
-use crate::widget::selectable_rich_text;
 use crate::widget::selectable_text::{Catalog, Style, StyleFn};
 
 impl Catalog for Theme {
@@ -28,43 +27,9 @@ pub fn default(theme: &Theme) -> Style {
     }
 }
 
-pub fn secondary(theme: &Theme) -> Style {
-    Style {
-        color: Some(theme.styles().text.secondary.color),
-        selection_color: theme.styles().buffer.selection,
-    }
-}
-
 pub fn logs(theme: &Theme) -> Style {
     Style {
         color: None,
-        selection_color: theme.styles().buffer.selection,
-    }
-}
-
-pub fn action(theme: &Theme) -> Style {
-    let color: Option<iced::Color> = text::action(theme).color;
-
-    Style {
-        color,
-        selection_color: theme.styles().buffer.selection,
-    }
-}
-
-pub fn tertiary(theme: &Theme) -> Style {
-    let color = text::tertiary(theme).color;
-
-    Style {
-        color,
-        selection_color: theme.styles().buffer.selection,
-    }
-}
-
-pub fn condensed_marker(theme: &Theme) -> Style {
-    let color = text::timestamp(theme).color;
-
-    Style {
-        color,
         selection_color: theme.styles().buffer.selection,
     }
 }
@@ -78,115 +43,46 @@ pub fn timestamp(theme: &Theme) -> Style {
     }
 }
 
-pub fn topic(theme: &Theme) -> Style {
-    let color = text::topic(theme).color;
-
-    Style {
-        color,
-        selection_color: theme.styles().buffer.selection,
-    }
-}
-
-pub fn server(
-    theme: &Theme,
-    server: Option<&message::source::Server>,
-) -> Style {
-    let styles = theme.styles().buffer.server_messages;
-    let color = server
-        .and_then(|server| match server.kind() {
-            Kind::Join => styles.join.color,
-            Kind::Part => styles.part.color,
-            Kind::Quit => styles.quit.color,
-            Kind::JoinTopic => styles.join_topic.color,
-            Kind::RequestTopic => styles.request_topic.color,
-            Kind::ChangeHost => styles.change_host.color,
-            Kind::ChangeMode => styles.change_mode.color,
-            Kind::ChangeNick => styles.change_nick.color,
-            Kind::ChangeTopic => styles.change_topic.color,
-            Kind::MonitoredOnline => styles.monitored_online.color,
-            Kind::MonitoredOffline => styles.monitored_offline.color,
-            Kind::StandardReply(StandardReply::Fail) => styles
-                .standard_reply_fail
-                .color
-                .or(Some(theme.styles().text.error.color)),
-            Kind::StandardReply(StandardReply::Warn) => styles
-                .standard_reply_warn
-                .color
-                .or(theme.styles().text.warning.color)
-                .or(Some(theme.styles().text.error.color)),
-            Kind::StandardReply(StandardReply::Note) => {
-                styles.standard_reply_note.color
-            }
-            Kind::WAllOps => styles.wallops.color,
-            Kind::Kick => styles.kick.color,
-            Kind::Away => styles.away.color,
-            Kind::Invite => styles.invite.color,
-        })
-        .or(Some(styles.default.color));
-
-    Style {
-        color,
-        selection_color: theme.styles().buffer.selection,
-    }
-}
-
-pub fn nickname(
-    theme: &Theme,
-    config: &Config,
-    user: &User,
-    metadata_color: Option<Color>,
-    is_away: bool,
-    is_user_offline: bool,
-) -> Style {
-    let is_away = config
-        .buffer
-        .nickname
-        .away
-        .is_away(is_away || is_user_offline);
-
-    if let Some(metadata_color) = metadata_color {
-        let color = nickname_alpha(
-            metadata_color,
-            is_away,
-            theme.styles().buffer.background,
-        );
-
-        Style {
-            color: Some(color),
-            selection_color: theme.styles().buffer.selection,
+/// Sender label color; `seed` drives the per-sender color when the
+/// configured color mode is `Unique`/`Palette` (pass the short label for
+/// QML avatar-ramp parity). `Unique` — the default — takes the first stop
+/// of the ramp the sender's avatar is drawn in, so a name and a face read
+/// as the same person.
+pub fn sender(theme: &Theme, config: &Config, seed: Option<&str>) -> Style {
+    let color = match (&config.buffer.sender.color, seed) {
+        (buffer::Color::Unique, Some(seed)) => {
+            avatar_ramp_colors(
+                theme.styles(),
+                avatar_ramp(seed, AVATAR_RAMP_COUNT),
+            )
+            .0
         }
-    } else {
-        nickname_style(
-            theme,
-            &config.buffer.nickname.color,
-            user,
-            is_away,
-            config.buffer.nickname.offline.is_offline(is_user_offline),
-        )
-    }
-}
-
-fn nickname_style(
-    theme: &Theme,
-    kind: &data::buffer::Color,
-    user: &User,
-    is_away: Option<buffer::Away>,
-    is_offline: bool,
-) -> Style {
-    let color =
-        text::nickname(theme, kind, Some(user.seed()), is_away, is_offline)
-            .color;
+        (kind, seed) => {
+            nickname_color(theme.styles().buffer.nickname.color, kind, seed)
+        }
+    };
 
     Style {
-        color,
+        color: Some(color),
         selection_color: theme.styles().buffer.selection,
     }
 }
 
-pub fn status(theme: &Theme, status: message::source::Status) -> Style {
+/// This account's own sender label: the brand ramp its own avatar takes,
+/// so your own messages read as yours on every theme (QML `isMe`).
+pub fn own_sender(theme: &Theme) -> Style {
+    Style {
+        color: Some(avatar_self_colors(theme.styles()).0),
+        selection_color: theme.styles().buffer.selection,
+    }
+}
+
+pub fn status(theme: &Theme, status: message::StatusKind) -> Style {
     let color = match status {
-        message::source::Status::Success => text::success(theme).color,
-        message::source::Status::Error => text::error(theme).color,
+        message::StatusKind::SendFailed => text::error(theme).color,
+        message::StatusKind::NewConversation
+        | message::StatusKind::MemberChange
+        | message::StatusKind::Info => text::secondary(theme).color,
     };
 
     Style {
@@ -227,37 +123,6 @@ pub fn log_level(theme: &Theme, log_level: log::Level) -> Style {
     Style {
         color: Some(color),
         selection_color: theme.styles().buffer.selection,
-    }
-}
-
-impl selectable_rich_text::Link for message::Link {
-    fn underline(&self) -> bool {
-        match self {
-            data::message::Link::Url(_) => true,
-            data::message::Link::User(..)
-            | data::message::Link::Channel(..)
-            | data::message::Link::GoToMessage(..)
-            | data::message::Link::ExpandMessage(..)
-            | data::message::Link::ContractMessage(..) => false,
-        }
-    }
-}
-
-pub fn dimmed(
-    style: Style,
-    theme: &Theme,
-    dimmed: Option<(Dimmed, Color)>,
-) -> Style {
-    if let Some((dimmed, background)) = dimmed {
-        Style {
-            color: Some(dimmed.transform_color(
-                style.color.unwrap_or(theme.base().text_color),
-                background,
-            )),
-            selection_color: style.selection_color,
-        }
-    } else {
-        style
     }
 }
 

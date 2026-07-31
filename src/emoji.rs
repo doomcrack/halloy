@@ -1,26 +1,8 @@
-use std::collections::HashSet;
-
 use strsim::jaro_winkler;
 
 struct SearchMatch {
-    emoji: &'static emojis::Emoji,
     shortcode: String,
     similarity: f64,
-}
-
-pub fn matching_emojis(query: &str) -> Vec<&'static emojis::Emoji> {
-    if query.is_empty() {
-        return emojis::iter().collect();
-    }
-
-    let mut seen = HashSet::new();
-
-    search_matches(query)
-        .into_iter()
-        .filter_map(|matched| {
-            seen.insert(matched.emoji.as_str()).then_some(matched.emoji)
-        })
-        .collect()
 }
 
 pub fn matching_shortcodes(query: &str) -> Vec<String> {
@@ -66,7 +48,6 @@ fn search_matches(query: &str) -> Vec<SearchMatch> {
                 filtered.push(SearchMatch {
                     similarity: jaro_winkler(query, shortcode),
                     shortcode: shortcode.clone(),
-                    emoji,
                 });
                 any_matched = true;
             }
@@ -79,7 +60,6 @@ fn search_matches(query: &str) -> Vec<SearchMatch> {
                 filtered.push(SearchMatch {
                     similarity: jaro_winkler(query, name),
                     shortcode: shortcodes[0].clone(),
-                    emoji,
                 });
             }
         }

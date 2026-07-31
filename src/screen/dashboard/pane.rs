@@ -1,15 +1,13 @@
-use data::user::{ChannelUsers, User};
-use data::{Config, Server, file_transfer, history, preview, target};
+use data::conversation::Kind;
+use data::{Config, history};
+use iced::Size;
 use iced::widget::text::Wrapping;
-use iced::widget::{
-    button, center, column, container, pane_grid, row, sensor, text,
-};
-use iced::{Length, Padding, Size, Task, padding};
+use iced::widget::{button, center, column, pane_grid, row, sensor, text};
 
 use super::sidebar;
 use crate::buffer::{self, Buffer};
 use crate::widget::{Element, tooltip};
-use crate::{Theme, font, icon, theme, widget};
+use crate::{Theme, icon, theme, widget};
 
 #[derive(Debug, Clone)]
 pub enum Message {
@@ -20,16 +18,14 @@ pub enum Message {
     ClosePane,
     SplitPane(pane_grid::Axis),
     MaximizePane,
-    ToggleShowUserList,
-    ToggleShowTopic,
+    ToggleShowMemberList,
+    ToggleShowDetails,
     Popout,
     Merge,
     ScrollToBottom,
     MarkAsRead,
     ClearBuffer,
     ContentResized(pane_grid::Pane, Size),
-    Modal(pane_grid::Pane, super::modal::Message),
-    CloseBufferModal(pane_grid::Pane),
 }
 
 #[derive(Clone, Debug)]
@@ -37,7 +33,6 @@ pub struct Pane {
     pub buffer: Buffer,
     pub size: Size,
     title_bar: TitleBar,
-    pub modal: Option<super::modal::Modal>,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -49,7 +44,6 @@ impl Pane {
             buffer,
             size: Size::default(), // Will get set initially via `Message::Resized`
             title_bar: TitleBar::default(),
-            modal: None,
         }
     }
 
@@ -59,111 +53,50 @@ impl Pane {
         panes: usize,
         is_focused: bool,
         maximized: bool,
-        typing_animation: Option<&'a buffer::typing::Animation>,
-        clients: &'a data::client::Map,
-        file_transfers: &'a file_transfer::Manager,
+        session: &'a data::Session,
         history: &'a history::Manager,
-        previews: &'a preview::Collection,
         sidebar: &'a sidebar::Sidebar,
         config: &'a Config,
         theme: &'a Theme,
-        settings: Option<&'a buffer::Settings>,
+        settings: Option<&'a data::buffer::Settings>,
         is_popout: bool,
-        channel_is_focused: impl Fn(&Server, &target::Channel) -> bool + Copy + 'a,
-        channel_is_open: impl Fn(&Server, &target::Channel) -> bool + Copy + 'a,
     ) -> widget::Content<'a, Message> {
         let title: Element<'a, Message> = match &self.buffer {
             Buffer::Empty => text("").into(),
-            Buffer::Channel(state) => {
-                let raw_channel = state.target.as_str();
-                let display_channel = if let Some(casing) =
-                    config.buffer.channel.channel_name_casing
-                {
-                    let casemapping = clients
-                        .get_server_casemapping_or_default(&state.server);
-                    casing.apply(raw_channel, casemapping)
-                } else {
-                    raw_channel.to_owned()
-                };
+            Buffer::Conversation(state) => {
+                let conversation = session.conversations.get(&state.convo_id);
 
-                let server = &state.server;
-                row![
-                    text(display_channel)
-                        .style(theme::text::url)
-                        .font_maybe(
-                            theme::font_style::url(theme).map(font::get),
+                let display_name = conversation.map_or_else(
+                    || format!("Conversation {}", state.convo_id.short_label()),
+                    data::Conversation::display_name,
+                );
+
+                let member_count = conversation.and_then(|conversation| {
+                    (conversation.kind == Kind::Group
+                        && !conversation.members.is_empty())
+                    .then(|| {
+                        format!(
+                            " · {} members",
+                            conversation.joined_member_count()
                         )
+                    })
+                });
+
+                row![
+                    text(display_name)
+                        .style(theme::text::primary)
                         .wrapping(Wrapping::None)
                         .ellipsis(text::Ellipsis::End),
-                    if let Some(mode) =
-                        clients.get_channel_mode(&state.server, &state.target)
-                    {
-                        let users = clients
-                            .get_channel_users(&state.server, &state.target)
-                            .map(ChannelUsers::len)
-                            .unwrap_or_default();
-
-                        text(format!(" ({mode}) @ {server} - {users} users"))
+                    member_count.map(|member_count| {
+                        text(member_count)
+                            .style(theme::text::secondary)
                             .wrapping(Wrapping::None)
                             .ellipsis(text::Ellipsis::End)
-                    } else {
-                        text(format!(" @ {server}"))
-                            .wrapping(Wrapping::None)
-                            .ellipsis(text::Ellipsis::End)
-                    }
+                    }),
                 ]
                 .into()
             }
-            Buffer::Server(state) => text(state.server.to_string())
-                .style(|theme| theme::text::server(theme, None))
-                .font_maybe(
-                    theme::font_style::server(theme, None).map(font::get),
-                )
-                .wrapping(Wrapping::None)
-                .ellipsis(text::Ellipsis::End)
-                .into(),
-            Buffer::Query(state) => query_title(
-                &state.server,
-                &state.target,
-                clients,
-                config,
-                theme,
-            ),
-            Buffer::FileTransfers(_) => text("File Transfers")
-                .wrapping(Wrapping::None)
-                .ellipsis(text::Ellipsis::End)
-                .into(),
-            Buffer::ChannelDiscovery(state) => {
-                let base = "Channel Discovery";
-                if let Some(server) = state.server.as_ref() {
-                    let base = format!("{base} @ {server}");
-                    let channel_count = clients
-                        .get_channel_discovery_manager(server)
-                        .map(data::channel_discovery::Manager::amount_of_channels)
-                        .unwrap_or_default();
-                    if channel_count > 0 {
-                        text(format!("{base} - {channel_count} channels"))
-                            .wrapping(Wrapping::None)
-                            .ellipsis(text::Ellipsis::End)
-                            .into()
-                    } else {
-                        text(base)
-                            .wrapping(Wrapping::None)
-                            .ellipsis(text::Ellipsis::End)
-                            .into()
-                    }
-                } else {
-                    text(base)
-                        .wrapping(Wrapping::None)
-                        .ellipsis(text::Ellipsis::End)
-                        .into()
-                }
-            }
             Buffer::Logs(_) => text("Logs")
-                .wrapping(Wrapping::None)
-                .ellipsis(text::Ellipsis::End)
-                .into(),
-            Buffer::Highlights(_) => text("Highlights")
                 .wrapping(Wrapping::None)
                 .ellipsis(text::Ellipsis::End)
                 .into(),
@@ -171,24 +104,20 @@ impl Pane {
                 .wrapping(Wrapping::None)
                 .ellipsis(text::Ellipsis::End)
                 .into(),
-            Buffer::ChannelMonitor(_) => text("Channel Monitor")
-                .wrapping(Wrapping::None)
-                .ellipsis(text::Ellipsis::End)
-                .into(),
         };
 
         let title_bar = self.title_bar.view(
             &self.buffer,
+            session,
             history,
             title,
             id,
             panes,
             maximized,
-            clients,
             settings,
             !config.pane.always_show_title_bar_buttons,
-            self.modal.is_some(),
-            config.tooltips.show_for_buttons() && self.modal.is_none(),
+            false,
+            config.tooltips.show_for_buttons(),
             is_popout,
             config,
             theme,
@@ -197,102 +126,28 @@ impl Pane {
         let content = self
             .buffer
             .view(
-                typing_animation,
-                clients,
-                file_transfers,
-                history,
-                previews,
-                settings,
-                config,
-                theme,
-                is_focused,
-                sidebar,
-                channel_is_focused,
-                channel_is_open,
+                session, history, settings, config, theme, is_focused, sidebar,
             )
             .map(move |msg| Message::Buffer(id, msg));
 
         let content = sensor(content)
             .on_resize(move |size| Message::ContentResized(id, size));
 
-        let content = match &self.modal {
-            Some(modal) => widget::modal(
-                content,
-                modal
-                    .view(config)
-                    .map(move |message| Message::Modal(id, message)),
-                move || Message::CloseBufferModal(id),
-                0.2,
-            ),
-            None => column![content].into(),
-        };
+        let content: Element<'a, Message> = column![content].into();
 
         widget::Content::new(content)
             .style(move |theme| theme::container::buffer(theme, is_focused))
             .title_bar(title_bar.style(theme::container::buffer_title_bar))
     }
 
-    pub fn open_modal(
-        &mut self,
-        id: pane_grid::Pane,
-        modal: super::modal::Modal,
-    ) -> Task<Message> {
-        let focus_task = modal
-            .focus()
-            .map(move |message| Message::Modal(id, message));
-
-        self.modal = Some(modal);
-
-        focus_task
-    }
-
-    pub fn close_buffer_modal(&mut self) {
-        self.modal = None;
-    }
-
     pub fn resource(&self) -> Option<history::Resource> {
         match &self.buffer {
             Buffer::Empty => None,
-            Buffer::Channel(state) => Some(history::Resource {
-                kind: history::Kind::Channel(
-                    state.server.clone(),
-                    state.target.clone(),
-                ),
-            }),
-            Buffer::Server(state) => Some(history::Resource {
-                kind: history::Kind::Server(state.server.clone()),
-            }),
-            Buffer::Query(state) => Some(history::Resource {
-                kind: history::Kind::Query(
-                    state.server.clone(),
-                    state.target.clone(),
-                ),
+            Buffer::Conversation(state) => Some(history::Resource {
+                kind: history::Kind::Conversation(state.convo_id.clone()),
             }),
             Buffer::Logs(_) => Some(history::Resource::logs()),
-            Buffer::Highlights(_) => Some(history::Resource::highlights()),
-            Buffer::ChannelDiscovery(_)
-            | Buffer::FileTransfers(_)
-            | Buffer::ConfigEditor(_) => None,
-            Buffer::ChannelMonitor(_) => {
-                Some(history::Resource::channel_monitor())
-            }
-        }
-    }
-
-    pub fn visible_urls(&self) -> Vec<&url::Url> {
-        match &self.buffer {
-            Buffer::Channel(channel) => {
-                channel.scroll_view.visible_urls().collect()
-            }
-            Buffer::Query(query) => query.scroll_view.visible_urls().collect(),
-            Buffer::Empty
-            | Buffer::Server(_)
-            | Buffer::FileTransfers(_)
-            | Buffer::Logs(_)
-            | Buffer::Highlights(_)
-            | Buffer::ChannelDiscovery(_)
-            | Buffer::ChannelMonitor(_)
-            | Buffer::ConfigEditor(_) => vec![],
+            Buffer::ConfigEditor(_) => None,
         }
     }
 }
@@ -301,13 +156,13 @@ impl TitleBar {
     fn view<'a>(
         &'a self,
         buffer: &Buffer,
+        session: &'a data::Session,
         history: &'a history::Manager,
         title: Element<'a, Message>,
         id: pane_grid::Pane,
         panes: usize,
         maximized: bool,
-        clients: &'a data::client::Map,
-        settings: Option<&'a buffer::Settings>,
+        settings: Option<&'a data::buffer::Settings>,
         only_show_controls_on_hover: bool,
         hide_controls: bool,
         show_tooltips: bool,
@@ -327,6 +182,13 @@ impl TitleBar {
         } else {
             false
         };
+
+        let is_group = buffer.convo_id().is_some_and(|convo_id| {
+            session
+                .conversations
+                .get(convo_id)
+                .is_some_and(|conversation| conversation.kind == Kind::Group)
+        });
 
         // Pane controls.
         let controls = row![
@@ -557,112 +419,62 @@ impl TitleBar {
                     None
                 }
             },
-            if let Buffer::Channel(state) = &buffer {
-                if let Some(topic) =
-                    clients.get_channel_topic(&state.server, &state.target)
-                    && topic.content.is_some()
-                {
-                    let topic_enabled = settings.map_or(
-                        config.buffer.channel.topic_banner.enabled,
-                        |settings| settings.channel.topic_banner.enabled,
-                    );
+            if let Buffer::Conversation(state) = &buffer {
+                let details_shown = state.show_details;
 
-                    let topic_button = button(center(icon::topic()))
-                        .padding(5)
-                        .width(22)
-                        .height(22)
-                        .on_press(Message::ToggleShowTopic)
-                        .style(move |theme, status| {
-                            theme::button::secondary(
-                                theme,
-                                status,
-                                topic_enabled,
-                            )
-                        });
-
-                    let topic_button_with_tooltip = tooltip(
-                        topic_button,
-                        show_tooltips.then_some(if topic_enabled {
-                            match config.keyboard.toggle_topic.primary() {
-                                Some(
-                                    keybind @ data::shortcut::KeyBind::Bind {
-                                        ..
-                                    },
-                                ) => {
-                                    format!("Hide topic banner ({keybind})")
-                                }
-                                _ => "Hide topic banner".to_string(),
-                            }
-                        } else {
-                            match config.keyboard.toggle_topic.primary() {
-                                Some(
-                                    keybind @ data::shortcut::KeyBind::Bind {
-                                        ..
-                                    },
-                                ) => {
-                                    format!("Show topic banner ({keybind})")
-                                }
-                                _ => "Show topic banner".to_string(),
-                            }
-                        }),
-                        tooltip::Position::Bottom,
-                        theme,
-                    );
-                    Some(topic_button_with_tooltip)
-                } else {
-                    None
-                }
-            } else {
-                None
-            },
-            if matches!(buffer, Buffer::Channel(_)) {
-                let nicklist_enabled = settings.map_or(
-                    config.buffer.channel.nicklist.enabled,
-                    |settings| settings.channel.nicklist.enabled,
-                );
-
-                let nicklist_button = button(center(icon::people()))
+                let details_button = button(center(icon::about()))
                     .padding(5)
                     .width(22)
                     .height(22)
-                    .on_press(Message::ToggleShowUserList)
+                    .on_press(Message::ToggleShowDetails)
                     .style(move |theme, status| {
-                        theme::button::secondary(
-                            theme,
-                            status,
-                            nicklist_enabled,
-                        )
+                        theme::button::secondary(theme, status, details_shown)
                     });
 
-                let nicklist_button_with_tooltip = tooltip(
-                    nicklist_button,
-                    show_tooltips.then_some(if nicklist_enabled {
-                        match config.keyboard.toggle_nick_list.primary() {
-                            Some(
-                                keybind @ data::shortcut::KeyBind::Bind {
-                                    ..
-                                },
-                            ) => {
-                                format!("Hide nicklist ({keybind})")
-                            }
-                            _ => "Hide nicklist".to_string(),
-                        }
+                let details_button_with_tooltip = tooltip(
+                    details_button,
+                    show_tooltips.then_some(if details_shown {
+                        "Hide details".to_string()
                     } else {
-                        match config.keyboard.toggle_nick_list.primary() {
-                            Some(
-                                keybind @ data::shortcut::KeyBind::Bind {
-                                    ..
-                                },
-                            ) => {
-                                format!("Show nicklist ({keybind})")
-                            }
-                            _ => "Show nicklist".to_string(),
-                        }
+                        "Show details".to_string()
                     }),
                     tooltip::Position::Bottom,
                     theme,
                 );
-                Some(nicklist_button_with_tooltip)
+                Some(details_button_with_tooltip)
+            } else {
+                None
+            },
+            if is_group {
+                let member_list_enabled = settings.map_or(
+                    config.buffer.conversation.member_list.enabled,
+                    |settings| settings.conversation.member_list.enabled,
+                );
+
+                let member_list_button = button(center(icon::people()))
+                    .padding(5)
+                    .width(22)
+                    .height(22)
+                    .on_press(Message::ToggleShowMemberList)
+                    .style(move |theme, status| {
+                        theme::button::secondary(
+                            theme,
+                            status,
+                            member_list_enabled,
+                        )
+                    });
+
+                let member_list_button_with_tooltip = tooltip(
+                    member_list_button,
+                    show_tooltips.then_some(if member_list_enabled {
+                        "Hide member list".to_string()
+                    } else {
+                        "Show member list".to_string()
+                    }),
+                    tooltip::Position::Bottom,
+                    theme,
+                );
+                Some(member_list_button_with_tooltip)
             } else {
                 None
             },
@@ -783,7 +595,7 @@ impl TitleBar {
         ]
         .spacing(2);
 
-        let title = container(title)
+        let title = iced::widget::container(title)
             .height(theme::resolve_line_height(&config.font).ceil().max(22.0))
             .padding([0, 4])
             .align_y(iced::alignment::Vertical::Center);
@@ -818,149 +630,18 @@ fn save_config_tooltip(
     }
 }
 
-fn query_title<'a>(
-    server: &'a data::Server,
-    query: &'a data::target::Query,
-    clients: &'a data::client::Map,
-    config: &'a Config,
-    theme: &'a Theme,
-) -> Element<'a, Message> {
-    let resolved_query = clients.resolve_query(server, query).unwrap_or(query);
-    let user = User::from(data::user::Nick::from(resolved_query));
-    let shared_channels = clients.get_user_channels(server, user.nickname());
-    let current_user = shared_channels.iter().find_map(|channel| {
-        clients.resolve_user_attributes(server, channel, &user)
-    });
-
-    let is_user_away = config
-        .buffer
-        .nickname
-        .away
-        .is_away(current_user.is_some_and(User::is_away));
-    let is_user_offline = config.buffer.nickname.offline.is_offline(
-        shared_channels.is_empty()
-            && !clients
-                .client(server)
-                .is_some_and(|client| client.is_monitored_user_online(&user)),
-    );
-
-    let state = if is_user_offline {
-        Some(
-            container(
-                text("(Offline)").style(theme::text::secondary).font_maybe(
-                    theme::font_style::secondary(theme).map(font::get),
-                ),
-            )
-            .padding(Padding::default().left(5)),
-        )
-    } else {
-        None
-    };
-
-    let nickname = text(resolved_query.as_str())
-        .style(move |_| {
-            theme::text::nickname(
-                theme,
-                &config.buffer.nickname.color,
-                Some(user.seed()),
-                is_user_away,
-                is_user_offline,
-            )
-        })
-        .font_maybe(
-            theme::font_style::nickname(theme, is_user_offline).map(font::get),
-        )
-        .shaping(text::Shaping::Advanced)
-        .wrapping(Wrapping::None)
-        .ellipsis(text::Ellipsis::End);
-
-    row![
-        nickname,
-        current_user.and_then(User::accountname).map(
-            |accountname| -> Element<'a, Message> {
-                iced::widget::tooltip(
-                    row![
-                        icon::lock()
-                            .size(theme::TEXT_SIZE - 2.0)
-                            .style(move |_| {
-                                theme::text::nickname(
-                                    theme,
-                                    &config.buffer.nickname.color,
-                                    Some(resolved_query.as_str()),
-                                    is_user_away,
-                                    is_user_offline,
-                                )
-                            })
-                            .line_height(1.0)
-                            .wrapping(Wrapping::None)
-                            .ellipsis(text::Ellipsis::End)
-                    ]
-                    .padding(padding::horizontal(4))
-                    .align_y(iced::Alignment::Center),
-                    container(
-                        text(format!("Authenticated as {accountname}"))
-                            .style(theme::text::secondary)
-                            .line_height(
-                                iced::widget::text::LineHeight::Relative(1.0),
-                            )
-                            .font_maybe(
-                                theme::font_style::secondary(theme)
-                                    .map(font::get),
-                            )
-                            .wrapping(Wrapping::None)
-                            .ellipsis(text::Ellipsis::End),
-                    )
-                    .style(theme::container::tooltip)
-                    .padding(8),
-                    crate::widget::tooltip::Position::Bottom,
-                )
-                .delay(iced::time::Duration::ZERO)
-                .into()
-            }
-        ),
-        state,
-        text(format!(" @ {server}"))
-            .style(theme::text::buffer_title_bar)
-            .font_maybe(
-                theme::font_style::buffer_title_bar(theme).map(font::get)
-            )
-            .shaping(text::Shaping::Advanced)
-            .wrapping(Wrapping::None)
-            .ellipsis(text::Ellipsis::End),
-    ]
-    .width(Length::Shrink)
-    .align_y(iced::Alignment::Center)
-    .into()
-}
-
 impl From<Pane> for data::Pane {
     fn from(pane: Pane) -> Self {
         let buffer = match pane.buffer {
             Buffer::Empty => return data::Pane::Empty,
-            Buffer::Channel(state) => data::Buffer::Upstream(
-                buffer::Upstream::Channel(state.server, state.target),
-            ),
-            Buffer::Server(state) => {
-                data::Buffer::Upstream(buffer::Upstream::Server(state.server))
+            Buffer::Conversation(state) => {
+                data::Buffer::Conversation(state.convo_id)
             }
-            Buffer::Query(state) => data::Buffer::Upstream(
-                buffer::Upstream::Query(state.server, state.target),
-            ),
-            Buffer::FileTransfers(_) => {
-                data::Buffer::Internal(buffer::Internal::FileTransfers)
+            Buffer::Logs(_) => {
+                data::Buffer::Internal(data::buffer::Internal::Logs)
             }
-            Buffer::Logs(_) => data::Buffer::Internal(buffer::Internal::Logs),
-            Buffer::Highlights(_) => {
-                data::Buffer::Internal(buffer::Internal::Highlights)
-            }
-            Buffer::ChannelMonitor(_) => {
-                data::Buffer::Internal(buffer::Internal::ChannelMonitor)
-            }
-            Buffer::ChannelDiscovery(state) => data::Buffer::Internal(
-                buffer::Internal::ChannelDiscovery(state.server.clone()),
-            ),
             Buffer::ConfigEditor(_) => {
-                data::Buffer::Internal(buffer::Internal::ConfigEditor)
+                data::Buffer::Internal(data::buffer::Internal::ConfigEditor)
             }
         };
 

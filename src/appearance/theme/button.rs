@@ -211,44 +211,6 @@ pub fn picker(theme: &Theme, status: Status, is_selected: bool) -> Style {
     )
 }
 
-pub fn reaction(
-    theme: &Theme,
-    status: Status,
-    already_reacted: bool,
-    selection: bool,
-) -> Style {
-    let foreground = theme.styles().text.secondary.color;
-    let button_colors = theme.styles().buttons.secondary;
-
-    let background = if selection {
-        button_colors.background_selected
-    } else {
-        button_colors.background
-    };
-
-    let background_hover = if selection {
-        button_colors.background_selected_hover
-    } else {
-        button_colors.background_hover
-    };
-
-    let background_pressed = button_colors.background_selected;
-
-    button(
-        foreground,
-        background,
-        background_hover,
-        background_pressed,
-        if matches!(status, Status::Pressed) {
-            !already_reacted
-        } else {
-            already_reacted
-        }
-        .then_some(button_colors.border_active.unwrap_or(foreground)),
-        status,
-    )
-}
-
 pub fn bare(_theme: &Theme, status: Status) -> Style {
     match status {
         Status::Active | Status::Pressed | Status::Hovered => Style {
@@ -273,50 +235,5 @@ pub fn bare(_theme: &Theme, status: Status) -> Style {
                 ..active
             }
         }
-    }
-}
-
-pub fn reply_preview(theme: &Theme, status: Status) -> Style {
-    let text = theme.styles().text;
-    Style {
-        background: Some(Background::Color(Color::TRANSPARENT)),
-        text_color: match status {
-            Status::Active | Status::Pressed => text.secondary.color,
-            Status::Hovered => text.primary.color,
-            Status::Disabled => Color {
-                a: 0.2,
-                ..text.secondary.color
-            },
-        },
-        ..Default::default()
-    }
-}
-
-pub fn preview_card(theme: &Theme, status: Status) -> Style {
-    let foreground = theme.styles().text.primary.color;
-    let background = theme.styles().buttons.secondary.background;
-    let background_hover = theme.styles().buttons.secondary.background_hover;
-
-    let border = Border {
-        radius: 4.0.into(),
-        width: 1.0,
-        color: theme.styles().general.border,
-    };
-
-    match status {
-        Status::Active | Status::Pressed => Style {
-            background: Some(Background::Color(background)),
-            text_color: foreground,
-            border,
-            ..Default::default()
-        },
-        Status::Hovered => Style {
-            background: Some(Background::Color(background_hover)),
-            text_color: foreground,
-            border,
-            ..Default::default()
-        },
-        // Not possible to disable this button style.
-        Status::Disabled => self::primary(theme, status, false),
     }
 }

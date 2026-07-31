@@ -20,7 +20,7 @@ pub enum Field {
     Vsync,
     Antialiasing,
     All,
-    Mail,
+    Source,
 }
 
 #[derive(Debug, Clone)]
@@ -224,7 +224,11 @@ impl About {
                     container(rule::horizontal(1))
                         .padding([6, 0])
                         .width(Length::Fill),
-                    item("Contact", data::environment::EMAIL, Field::Mail),
+                    item(
+                        "Source",
+                        data::environment::SOURCE_WEBSITE,
+                        Field::Source,
+                    ),
                 ],
                 column![copy_all, close]
                     .spacing(8)

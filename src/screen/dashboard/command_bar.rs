@@ -1,4 +1,4 @@
-use data::{Config, buffer, client, server};
+use data::{Config, buffer};
 use iced::Length;
 use iced::widget::{column, container, text};
 
@@ -21,26 +21,20 @@ pub enum Message {
 
 impl CommandBar {
     pub fn new(
-        servers: &server::Map,
-        clients: &client::Map,
-        buffers: &[buffer::Upstream],
+        session: &data::Session,
         version: &data::Version,
         config: &Config,
         focus: Focus,
         resize_buffer: data::buffer::Resize,
         main_window: window::Id,
-        show_muted_buffers: bool,
     ) -> Self {
         let state = combo_box::State::new(Command::list(
-            servers,
-            clients,
-            buffers,
+            session,
             config,
             focus,
             resize_buffer,
             version,
             main_window,
-            show_muted_buffers,
         ));
         state.focus();
 
@@ -61,15 +55,12 @@ impl CommandBar {
 
     pub fn view<'a>(
         &'a self,
-        servers: &server::Map,
-        clients: &client::Map,
-        buffers: &[buffer::Upstream],
+        session: &data::Session,
         focus: Focus,
         resize_buffer: data::buffer::Resize,
         version: &data::Version,
         config: &'a Config,
         main_window: window::Id,
-        show_muted_buffers: bool,
     ) -> Element<'a, Message> {
         // 1px larger than default
         let font_size =
@@ -103,15 +94,12 @@ impl CommandBar {
                 )
                 .chain(
                     Command::list(
-                        servers,
-                        clients,
-                        buffers,
+                        session,
                         config,
                         focus,
                         resize_buffer,
                         version,
                         main_window,
-                        show_muted_buffers,
                     )
                     .iter()
                     .map(|command| {
@@ -142,7 +130,6 @@ pub enum Event {
 pub enum Command {
     Application(Application),
     Version(Version),
-    Server(Server),
     Buffer(Buffer),
     Configuration(Configuration),
     Theme(Theme),
@@ -161,22 +148,16 @@ pub enum Version {
 }
 
 #[derive(Debug, Clone)]
-pub enum Server {
-    Connect(data::Server),
-    Disconnect(data::Server),
-    ReloadIcon(data::Server),
-}
-
-#[derive(Debug, Clone)]
 pub enum Buffer {
     Maximize(bool),
     NewHorizontal,
     NewVertical,
     Close,
-    Replace(data::Buffer),
+    /// Open the buffer in the focused pane; the label is resolved at list
+    /// time so conversations are searchable by display name.
+    Replace(data::Buffer, String),
     Popout,
     Merge,
-    ShowMutedBuffers(bool),
 }
 
 #[derive(Debug, Clone)]
@@ -198,29 +179,16 @@ pub enum Theme {
 
 impl Command {
     pub fn list(
-        servers: &server::Map,
-        clients: &client::Map,
-        buffers: &[buffer::Upstream],
+        session: &data::Session,
         config: &Config,
         focus: Focus,
         resize_buffer: buffer::Resize,
         version: &data::Version,
         main_window: window::Id,
-        show_muted_buffers: bool,
     ) -> Vec<Self> {
-        let servers = Server::list(clients, servers)
+        let buffers = Buffer::list(session, focus, resize_buffer, main_window)
             .into_iter()
-            .map(Command::Server);
-
-        let buffers = Buffer::list(
-            buffers,
-            focus,
-            resize_buffer,
-            main_window,
-            show_muted_buffers,
-        )
-        .into_iter()
-        .map(Command::Buffer);
+            .map(Command::Buffer);
 
         let configs = Configuration::list()
             .into_iter()
@@ -236,7 +204,6 @@ impl Command {
         version
             .chain(application)
             .chain(buffers)
-            .chain(servers)
             .chain(configs)
             .chain(themes)
             .collect()
@@ -247,7 +214,6 @@ impl std::fmt::Display for Command {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Command::Buffer(buffer) => write!(f, "Buffer: {buffer}"),
-            Command::Server(server) => write!(f, "Server: {server}"),
             Command::Configuration(config) => {
                 write!(f, "Configuration: {config}")
             }
@@ -262,53 +228,21 @@ impl std::fmt::Display for Command {
     }
 }
 
-impl Server {
-    fn list(clients: &client::Map, servers: &server::Map) -> Vec<Self> {
-        let mut list = vec![];
-
-        for server in servers.keys() {
-            if clients.get_server_is_connected(server) {
-                list.push(Server::Disconnect(server.clone()));
-
-                if clients.get_icon_url(server).is_some() {
-                    list.push(Server::ReloadIcon(server.clone()));
-                }
-            } else {
-                list.push(Server::Connect(server.clone()));
-            }
-        }
-
-        list
-    }
-}
-
-impl std::fmt::Display for Server {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            Server::Connect(server) => write!(f, "Connect to {server}"),
-            Server::Disconnect(server) => write!(f, "Disconnect from {server}"),
-            Server::ReloadIcon(server) => {
-                write!(f, "Reload {server} server icon")
-            }
-        }
-    }
-}
-
 impl Buffer {
     fn list(
-        buffers: &[buffer::Upstream],
+        session: &data::Session,
         focus: Focus,
         resize_buffer: data::buffer::Resize,
         main_window: window::Id,
-        show_muted_buffers: bool,
     ) -> Vec<Self> {
         let mut list = vec![Buffer::NewHorizontal, Buffer::NewVertical];
-        list.extend(
-            buffer::Internal::ALL
-                .iter()
-                .cloned()
-                .map(|buffer| Buffer::Replace(buffer.into())),
-        );
+
+        list.extend(buffer::Internal::ALL.iter().map(|internal| {
+            Buffer::Replace(
+                data::Buffer::Internal(*internal),
+                format!("Open {}", internal.to_string().to_lowercase()),
+            )
+        }));
 
         list.push(Buffer::Close);
 
@@ -324,14 +258,14 @@ impl Buffer {
             list.push(Buffer::Merge);
         }
 
-        list.extend(
-            buffers
-                .iter()
-                .cloned()
-                .map(|buffer| Buffer::Replace(buffer.into())),
-        );
-
-        list.push(Buffer::ShowMutedBuffers(!show_muted_buffers));
+        list.extend(session.conversations.sorted().into_iter().map(
+            |conversation| {
+                Buffer::Replace(
+                    data::Buffer::Conversation(conversation.id.clone()),
+                    format!("Open {}", conversation.display_name()),
+                )
+            },
+        ));
 
         list
     }
@@ -379,7 +313,7 @@ impl Theme {
 impl std::fmt::Display for Application {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            Application::Quit => write!(f, "Quit Halloy"),
+            Application::Quit => write!(f, "Quit Frigicom"),
             Application::ToggleFullscreen => write!(f, "Fullscreen"),
             Application::ToggleSidebarVisibility => write!(f, "Toggle Sidebar"),
         }
@@ -421,46 +355,7 @@ impl std::fmt::Display for Buffer {
             Buffer::Close => write!(f, "Close buffer"),
             Buffer::Popout => write!(f, "Pop out buffer"),
             Buffer::Merge => write!(f, "Merge buffer"),
-            Buffer::Replace(buffer) => match buffer {
-                data::Buffer::Internal(internal) => match internal {
-                    buffer::Internal::FileTransfers => {
-                        write!(f, "Open file transfers")
-                    }
-                    buffer::Internal::Logs => write!(f, "Open logs"),
-                    buffer::Internal::Highlights => {
-                        write!(f, "Open highlights")
-                    }
-                    buffer::Internal::ChannelDiscovery(_) => {
-                        write!(f, "Open channel discovery")
-                    }
-                    buffer::Internal::ConfigEditor => {
-                        write!(f, "Open config editor")
-                    }
-                    buffer::Internal::ChannelMonitor => {
-                        write!(f, "Open channel monitor")
-                    }
-                },
-                data::Buffer::Upstream(upstream) => match upstream {
-                    buffer::Upstream::Server(server) => {
-                        write!(f, "Open server {server}")
-                    }
-                    buffer::Upstream::Channel(server, channel) => {
-                        write!(f, "Open {channel} on {server}")
-                    }
-                    buffer::Upstream::Query(server, nick) => {
-                        write!(f, "Open query with {nick} on {server}")
-                    }
-                },
-            },
-            Buffer::ShowMutedBuffers(show_muted_buffers) => write!(
-                f,
-                "{}",
-                if *show_muted_buffers {
-                    "Show muted buffers"
-                } else {
-                    "Hide muted buffers"
-                }
-            ),
+            Buffer::Replace(_, label) => write!(f, "{label}"),
         }
     }
 }

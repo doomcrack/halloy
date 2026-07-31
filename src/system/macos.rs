@@ -18,7 +18,7 @@ struct Ivars {
 define_class! {
     // SAFETY: NSObject has no subclassing requirements and the ivars are Send.
     #[unsafe(super(NSObject))]
-    #[name = "HalloyPowerObserver"]
+    #[name = "FrigicomPowerObserver"]
     // An instance variable (ivar) is a variable that exists and holds its
     // value for the life of the NSObject.
     #[ivars = Ivars]

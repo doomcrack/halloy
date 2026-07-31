@@ -1,157 +1,76 @@
-use std::borrow::Cow;
-use std::fmt;
-
-use chrono::{DateTime, Utc};
-pub use data::buffer::{Internal, Settings, Upstream};
-use data::config::buffer::text_input::Autocomplete;
-use data::dashboard::BufferAction;
-use data::target::{self, Target, TargetRef};
-use data::user::Nick;
-use data::{
-    Config, Image, buffer, file_transfer, history, input, message, preview,
-};
+use data::address::Address;
+use data::conversation::ConvoId;
+use data::{Config, buffer, history};
 use iced::advanced::widget;
 use iced::advanced::widget::operation::focusable;
 use iced::{Size, Task};
 
-pub use self::channel::Channel;
-pub use self::channel_discovery::ChannelDiscovery;
 pub use self::config_editor::ConfigEditor;
-pub use self::file_transfers::FileTransfers;
+pub use self::conversation::Conversation;
 pub use self::logs::Logs;
-pub use self::message_feed::MessageFeed;
-pub use self::query::Query;
-pub use self::server::Server;
 use crate::Theme;
 use crate::screen::dashboard::sidebar;
 use crate::widget::Element;
 
-pub mod channel;
-pub mod channel_discovery;
 pub mod config_editor;
 pub mod context_menu;
+pub mod conversation;
 pub mod empty;
-pub mod file_transfers;
 mod input_view;
 pub mod logs;
-pub mod message_feed;
 mod message_view;
-pub mod query;
 mod scroll_view;
-pub mod server;
-pub mod typing;
-
-pub type Highlights = MessageFeed;
-pub type ChannelMonitor = MessageFeed;
 
 #[derive(Clone, Debug)]
 pub enum Buffer {
     Empty,
-    Channel(Channel),
-    Server(Server),
-    Query(Query),
-    FileTransfers(FileTransfers),
+    Conversation(Conversation),
     Logs(Logs),
-    Highlights(Highlights),
-    ChannelMonitor(ChannelMonitor),
-    ChannelDiscovery(ChannelDiscovery),
     ConfigEditor(ConfigEditor),
 }
 
 #[derive(Debug, Clone)]
 pub enum Message {
-    Channel(channel::Message),
-    Server(server::Message),
-    Query(query::Message),
-    FileTransfers(file_transfers::Message),
+    Conversation(conversation::Message),
     Logs(logs::Message),
-    Highlights(message_feed::Message),
-    ChannelMonitor(message_feed::Message),
-    ChannelList(channel_discovery::Message),
     ConfigEditor(config_editor::Message),
 }
 
 pub enum Event {
     ContextMenu(context_menu::Event),
-    OpenBuffers(data::Server, Vec<(Target, BufferAction)>),
-    OpenInternalBuffer(buffer::Internal),
-    OpenServer(String),
-    Reconnect(data::Server),
-    LeaveBuffers(Vec<Target>, Option<String>),
-    SelectedServer(data::Server),
-    GoToMessage(data::Server, target::Channel, message::Hash, BufferAction),
-    History(Task<history::manager::Message>),
-    RequestOlderChatHistory,
-    PreviewChanged,
-    HidePreview(history::Kind, message::Hash, url::Url),
-    MarkAsRead(history::Kind),
     OpenUrl(String),
-    ImagePreview(Image),
-    ExpandMessage(DateTime<Utc>, message::Hash),
-    ContractMessage(DateTime<Utc>, message::Hash),
-    InputSent {
-        history_task: Task<history::manager::Message>,
-        open_buffers: Vec<(Target, BufferAction)>,
-        was_join_command: bool,
+    MarkAsRead(history::Kind),
+    /// Enter-send from the composer; the dashboard forwards this to the
+    /// backend as `Control::SendMessage`.
+    SendMessage {
+        convo_id: ConvoId,
+        content: String,
     },
-    SendUnsafeList(data::Server),
+    /// A parsed slash command from the composer.
+    Command(data::Command),
     ConfigSaved,
-    FilehostUpload {
-        server: data::Server,
-        target: Option<Target>,
-        file_paths: Vec<std::path::PathBuf>,
-        upload_ids: Vec<u32>,
-        abort_registrations: Vec<futures::future::AbortRegistration>,
-    },
+    /// Copy-to-clipboard requests from the roster and details panels.
+    CopyText(String),
+    /// Open (or create) a direct conversation with the address.
+    OpenDm(String),
+    /// Open the add-member dialog for this group conversation.
+    OpenAddMember(ConvoId),
 }
 
 impl Buffer {
     pub fn from_data(
         buffer: data::Buffer,
-        clients: &data::client::Map,
         history: &history::Manager,
         pane_size: Size,
         config: &Config,
     ) -> Self {
         match buffer {
-            data::Buffer::Upstream(upstream) => match upstream {
-                buffer::Upstream::Server(server) => Self::Server(Server::new(
-                    server, clients, history, pane_size, config,
-                )),
-                buffer::Upstream::Channel(server, channel) => {
-                    Self::Channel(Channel::new(
-                        server, channel, clients, history, pane_size, config,
-                    ))
-                }
-                buffer::Upstream::Query(server, query) => {
-                    Self::Query(Query::new(
-                        server, query, clients, history, pane_size, config,
-                    ))
-                }
-            },
+            data::Buffer::Conversation(convo_id) => Self::Conversation(
+                Conversation::new(convo_id, history, pane_size, config),
+            ),
             data::Buffer::Internal(internal) => match internal {
-                buffer::Internal::FileTransfers => {
-                    Self::FileTransfers(FileTransfers::new())
-                }
                 buffer::Internal::Logs => {
                     Self::Logs(Logs::new(pane_size, config))
-                }
-                buffer::Internal::Highlights => {
-                    Self::Highlights(Highlights::new(
-                        message_feed::Kind::Highlights,
-                        pane_size,
-                        config,
-                    ))
-                }
-                buffer::Internal::ChannelMonitor => {
-                    Self::ChannelMonitor(ChannelMonitor::new(
-                        message_feed::Kind::ChannelMonitor,
-                        pane_size,
-                        config,
-                    ))
-                }
-                buffer::Internal::ChannelDiscovery(server) => {
-                    Self::ChannelDiscovery(ChannelDiscovery::new(server))
                 }
                 buffer::Internal::ConfigEditor => {
                     Self::ConfigEditor(ConfigEditor::new())
@@ -159,38 +78,22 @@ impl Buffer {
             },
         }
     }
+
     pub fn empty() -> Self {
         Self::Empty
     }
 
-    pub fn upstream(&self) -> Option<&buffer::Upstream> {
+    pub fn convo_id(&self) -> Option<&ConvoId> {
         match self {
-            Buffer::Channel(state) => Some(&state.buffer),
-            Buffer::Server(state) => Some(&state.buffer),
-            Buffer::Query(state) => Some(&state.buffer),
-            Buffer::Empty
-            | Buffer::FileTransfers(_)
-            | Buffer::Logs(_)
-            | Buffer::Highlights(_)
-            | Buffer::ChannelDiscovery(_)
-            | Buffer::ChannelMonitor(_)
-            | Buffer::ConfigEditor(_) => None,
+            Buffer::Conversation(state) => Some(&state.convo_id),
+            Buffer::Empty | Buffer::Logs(_) | Buffer::ConfigEditor(_) => None,
         }
     }
 
     pub fn internal(&self) -> Option<buffer::Internal> {
         match self {
-            Buffer::Empty
-            | Buffer::Channel(_)
-            | Buffer::Server(_)
-            | Buffer::Query(_) => None,
-            Buffer::FileTransfers(_) => Some(buffer::Internal::FileTransfers),
+            Buffer::Empty | Buffer::Conversation(_) => None,
             Buffer::Logs(_) => Some(buffer::Internal::Logs),
-            Buffer::Highlights(_) => Some(buffer::Internal::Highlights),
-            Buffer::ChannelMonitor(_) => Some(buffer::Internal::ChannelMonitor),
-            Buffer::ChannelDiscovery(state) => {
-                Some(buffer::Internal::ChannelDiscovery(state.server.clone()))
-            }
             Buffer::ConfigEditor(_) => Some(buffer::Internal::ConfigEditor),
         }
     }
@@ -198,363 +101,69 @@ impl Buffer {
     pub fn data(&self) -> Option<data::Buffer> {
         match self {
             Buffer::Empty => None,
-            Buffer::Channel(state) => {
-                Some(data::Buffer::Upstream(state.buffer.clone()))
-            }
-            Buffer::Server(state) => {
-                Some(data::Buffer::Upstream(state.buffer.clone()))
-            }
-            Buffer::Query(state) => {
-                Some(data::Buffer::Upstream(state.buffer.clone()))
-            }
-            Buffer::FileTransfers(_) => {
-                Some(data::Buffer::Internal(buffer::Internal::FileTransfers))
+            Buffer::Conversation(state) => {
+                Some(data::Buffer::Conversation(state.convo_id.clone()))
             }
             Buffer::Logs(_) => {
                 Some(data::Buffer::Internal(buffer::Internal::Logs))
             }
-            Buffer::Highlights(_) => {
-                Some(data::Buffer::Internal(buffer::Internal::Highlights))
-            }
-            Buffer::ChannelMonitor(_) => {
-                Some(data::Buffer::Internal(buffer::Internal::ChannelMonitor))
-            }
-            Buffer::ChannelDiscovery(state) => Some(data::Buffer::Internal(
-                buffer::Internal::ChannelDiscovery(state.server.clone()),
-            )),
             Buffer::ConfigEditor(_) => {
                 Some(data::Buffer::Internal(buffer::Internal::ConfigEditor))
             }
         }
     }
 
-    pub fn server(&self) -> Option<data::Server> {
-        match self {
-            Buffer::Channel(state) => Some(state.server.clone()),
-            Buffer::Query(state) => Some(state.server.clone()),
-            Buffer::Server(state) => Some(state.server.clone()),
-            Buffer::Empty
-            | Buffer::FileTransfers(_)
-            | Buffer::Logs(_)
-            | Buffer::Highlights(_)
-            | Buffer::ChannelDiscovery(_)
-            | Buffer::ChannelMonitor(_)
-            | Buffer::ConfigEditor(_) => None,
-        }
-    }
-
-    pub fn target(&self) -> Option<Target> {
-        match self {
-            Buffer::Channel(state) => {
-                Some(Target::Channel(state.target.clone()))
-            }
-            Buffer::Query(state) => Some(Target::Query(state.target.clone())),
-            Buffer::Empty
-            | Buffer::Server(_)
-            | Buffer::FileTransfers(_)
-            | Buffer::Logs(_)
-            | Buffer::Highlights(_)
-            | Buffer::ChannelDiscovery(_)
-            | Buffer::ChannelMonitor(_)
-            | Buffer::ConfigEditor(_) => None,
-        }
-    }
-
-    pub fn target_ref<'a>(&'a self) -> Option<TargetRef<'a>> {
-        match self {
-            Buffer::Channel(state) => Some(TargetRef::Channel(&state.target)),
-            Buffer::Query(state) => Some(TargetRef::Query(&state.target)),
-            Buffer::Empty
-            | Buffer::Server(_)
-            | Buffer::FileTransfers(_)
-            | Buffer::Logs(_)
-            | Buffer::Highlights(_)
-            | Buffer::ChannelMonitor(_)
-            | Buffer::ChannelDiscovery(_)
-            | Buffer::ConfigEditor(_) => None,
-        }
-    }
-
-    pub fn reaction_message(
-        &self,
-        msgid: message::Id,
-        text: Cow<'static, str>,
-        unreact: bool,
-    ) -> Option<Message> {
-        match self {
-            Buffer::Channel(_) => Some(Message::Channel(
-                channel::Message::ScrollView(if unreact {
-                    scroll_view::Message::Unreacted { msgid, text }
-                } else {
-                    scroll_view::Message::Reacted { msgid, text }
-                }),
-            )),
-            Buffer::Query(_) => {
-                Some(Message::Query(query::Message::ScrollView(if unreact {
-                    scroll_view::Message::Unreacted { msgid, text }
-                } else {
-                    scroll_view::Message::Reacted { msgid, text }
-                })))
-            }
-            Buffer::Empty
-            | Buffer::Server(_)
-            | Buffer::FileTransfers(_)
-            | Buffer::Logs(_)
-            | Buffer::Highlights(_)
-            | Buffer::ChannelDiscovery(_)
-            | Buffer::ChannelMonitor(_)
-            | Buffer::ConfigEditor(_) => None,
-        }
-    }
-
     pub fn update(
         &mut self,
         message: Message,
-        clients: &mut data::client::Map,
         history: &mut history::Manager,
-        previews: &preview::Collection,
-        file_transfers: &mut file_transfer::Manager,
         config: &Config,
     ) -> (Task<Message>, Option<Event>) {
         match (self, message) {
-            (Buffer::Channel(state), Message::Channel(message)) => {
-                let (command, event) =
-                    state.update(message, clients, history, previews, config);
+            (Buffer::Conversation(state), Message::Conversation(message)) => {
+                let (command, event) = state.update(message, history, config);
 
                 let event = event.map(|event| match event {
-                    channel::Event::ContextMenu(event) => {
+                    conversation::Event::ContextMenu(event) => {
                         Event::ContextMenu(event)
                     }
-                    channel::Event::OpenBuffers(server, targets) => {
-                        Event::OpenBuffers(server, targets)
+                    conversation::Event::MarkAsRead(kind) => {
+                        Event::MarkAsRead(kind)
                     }
-                    channel::Event::OpenInternalBuffer(buffer) => {
-                        Event::OpenInternalBuffer(buffer)
+                    conversation::Event::OpenUrl(url) => Event::OpenUrl(url),
+                    conversation::Event::SendMessage { convo_id, content } => {
+                        Event::SendMessage { convo_id, content }
                     }
-                    channel::Event::OpenServer(server) => {
-                        Event::OpenServer(server)
+                    conversation::Event::Command(command) => {
+                        Event::Command(command)
                     }
-                    channel::Event::Reconnect(server) => {
-                        Event::Reconnect(server)
+                    conversation::Event::CopyText(text) => {
+                        Event::CopyText(text)
                     }
-                    channel::Event::LeaveBuffers(targets, reason) => {
-                        Event::LeaveBuffers(targets, reason)
+                    conversation::Event::OpenDm(address) => {
+                        Event::OpenDm(address)
                     }
-                    channel::Event::History(task) => Event::History(task),
-                    channel::Event::RequestOlderChatHistory => {
-                        Event::RequestOlderChatHistory
-                    }
-                    channel::Event::PreviewChanged => Event::PreviewChanged,
-                    channel::Event::HidePreview(kind, hash, url) => {
-                        Event::HidePreview(kind, hash, url)
-                    }
-                    channel::Event::MarkAsRead(kind) => Event::MarkAsRead(kind),
-                    channel::Event::OpenUrl(url) => Event::OpenUrl(url),
-                    channel::Event::ImagePreview(image) => {
-                        Event::ImagePreview(image)
-                    }
-                    channel::Event::ExpandMessage(server_time, hash) => {
-                        Event::ExpandMessage(server_time, hash)
-                    }
-                    channel::Event::ContractMessage(server_time, hash) => {
-                        Event::ContractMessage(server_time, hash)
-                    }
-                    channel::Event::GoToMessage(
-                        server,
-                        channel,
-                        hash,
-                        buffer_action,
-                    ) => {
-                        Event::GoToMessage(server, channel, hash, buffer_action)
-                    }
-                    channel::Event::InputSent {
-                        history_task,
-                        open_buffers,
-                        was_join_command,
-                    } => Event::InputSent {
-                        history_task,
-                        open_buffers,
-                        was_join_command,
-                    },
-                    channel::Event::FilehostUpload {
-                        server,
-                        target,
-                        file_paths,
-                        upload_ids,
-                        abort_registrations,
-                    } => Event::FilehostUpload {
-                        server,
-                        target,
-                        file_paths,
-                        upload_ids,
-                        abort_registrations,
-                    },
-                });
-
-                (command.map(Message::Channel), event)
-            }
-            (Buffer::Server(state), Message::Server(message)) => {
-                let (command, event) =
-                    state.update(message, clients, history, previews, config);
-
-                let event = event.map(|event| match event {
-                    server::Event::ContextMenu(event) => {
-                        Event::ContextMenu(event)
-                    }
-                    server::Event::OpenInternalBuffer(buffer) => {
-                        Event::OpenInternalBuffer(buffer)
-                    }
-                    server::Event::OpenServer(server) => {
-                        Event::OpenServer(server)
-                    }
-                    server::Event::Reconnect(server) => {
-                        Event::Reconnect(server)
-                    }
-                    server::Event::OpenBuffers(server, targets) => {
-                        Event::OpenBuffers(server, targets)
-                    }
-                    server::Event::LeaveBuffers(targets, reason) => {
-                        Event::LeaveBuffers(targets, reason)
-                    }
-                    server::Event::History(task) => Event::History(task),
-                    server::Event::MarkAsRead(kind) => Event::MarkAsRead(kind),
-                    server::Event::OpenUrl(url) => Event::OpenUrl(url),
-                    server::Event::ImagePreview(image) => {
-                        Event::ImagePreview(image)
-                    }
-                    server::Event::ExpandMessage(server_time, hash) => {
-                        Event::ExpandMessage(server_time, hash)
-                    }
-                    server::Event::ContractMessage(server_time, hash) => {
-                        Event::ContractMessage(server_time, hash)
-                    }
-                    server::Event::InputSent {
-                        history_task,
-                        open_buffers,
-                        was_join_command,
-                    } => Event::InputSent {
-                        history_task,
-                        open_buffers,
-                        was_join_command,
-                    },
-                    server::Event::FilehostUpload {
-                        server,
-                        target,
-                        file_paths,
-                        upload_ids,
-                        abort_registrations,
-                    } => Event::FilehostUpload {
-                        server,
-                        target,
-                        file_paths,
-                        upload_ids,
-                        abort_registrations,
-                    },
-                });
-
-                (command.map(Message::Server), event)
-            }
-            (Buffer::Query(state), Message::Query(message)) => {
-                let (command, event) =
-                    state.update(message, clients, history, previews, config);
-
-                let event = event.map(|event| match event {
-                    query::Event::ContextMenu(event) => {
-                        Event::ContextMenu(event)
-                    }
-                    query::Event::OpenBuffers(server, targets) => {
-                        Event::OpenBuffers(server, targets)
-                    }
-                    query::Event::OpenInternalBuffer(buffer) => {
-                        Event::OpenInternalBuffer(buffer)
-                    }
-                    query::Event::OpenServer(server) => {
-                        Event::OpenServer(server)
-                    }
-                    query::Event::Reconnect(server) => Event::Reconnect(server),
-                    query::Event::LeaveBuffers(targets, reason) => {
-                        Event::LeaveBuffers(targets, reason)
-                    }
-                    query::Event::History(task) => Event::History(task),
-                    query::Event::RequestOlderChatHistory => {
-                        Event::RequestOlderChatHistory
-                    }
-                    query::Event::PreviewChanged => Event::PreviewChanged,
-                    query::Event::HidePreview(kind, hash, url) => {
-                        Event::HidePreview(kind, hash, url)
-                    }
-                    query::Event::MarkAsRead(kind) => Event::MarkAsRead(kind),
-                    query::Event::OpenUrl(url) => Event::OpenUrl(url),
-                    query::Event::ImagePreview(image) => {
-                        Event::ImagePreview(image)
-                    }
-                    query::Event::ExpandMessage(server_time, hash) => {
-                        Event::ExpandMessage(server_time, hash)
-                    }
-                    query::Event::ContractMessage(server_time, hash) => {
-                        Event::ContractMessage(server_time, hash)
-                    }
-                    query::Event::InputSent {
-                        history_task,
-                        open_buffers,
-                        was_join_command,
-                    } => Event::InputSent {
-                        history_task,
-                        open_buffers,
-                        was_join_command,
-                    },
-                    query::Event::FilehostUpload {
-                        server,
-                        target,
-                        file_paths,
-                        upload_ids,
-                        abort_registrations,
-                    } => Event::FilehostUpload {
-                        server,
-                        target,
-                        file_paths,
-                        upload_ids,
-                        abort_registrations,
-                    },
-                });
-
-                (command.map(Message::Query), event)
-            }
-            (Buffer::FileTransfers(state), Message::FileTransfers(message)) => {
-                let command = state.update(message, file_transfers, config);
-
-                (command.map(Message::FileTransfers), None)
-            }
-            (
-                Buffer::ChannelDiscovery(state),
-                Message::ChannelList(message),
-            ) => {
-                let (command, event) = state.update(message, config);
-
-                let event = event.map(|event| match event {
-                    channel_discovery::Event::SelectedServer(server) => {
-                        Event::SelectedServer(server)
-                    }
-                    channel_discovery::Event::SendUnsafeList(server) => {
-                        Event::SendUnsafeList(server)
-                    }
-                    channel_discovery::Event::OpenUrl(url) => {
-                        Event::OpenUrl(url)
-                    }
-                    channel_discovery::Event::OpenChannelForServer(
-                        server,
-                        channel,
-                        buffer_action,
-                    ) => Event::OpenBuffers(
-                        server,
-                        vec![(Target::Channel(channel), buffer_action)],
-                    ),
-                    channel_discovery::Event::ContextMenu(event) => {
-                        Event::ContextMenu(event)
+                    conversation::Event::OpenAddMember(convo_id) => {
+                        Event::OpenAddMember(convo_id)
                     }
                 });
 
-                (command.map(Message::ChannelList), event)
+                (command.map(Message::Conversation), event)
+            }
+            (Buffer::Logs(state), Message::Logs(message)) => {
+                let (command, event) = state.update(message, history, config);
+
+                let event = event.map(|event| match event {
+                    logs::Event::ContextMenu(event) => {
+                        Event::ContextMenu(event)
+                    }
+                    logs::Event::MarkAsRead => {
+                        Event::MarkAsRead(history::Kind::Logs)
+                    }
+                    logs::Event::OpenUrl(url) => Event::OpenUrl(url),
+                });
+
+                (command.map(Message::Logs), event)
             }
             (Buffer::ConfigEditor(state), Message::ConfigEditor(message)) => {
                 let (command, event) = state.update(message, config);
@@ -565,151 +174,37 @@ impl Buffer {
 
                 (command.map(Message::ConfigEditor), event)
             }
-            (Buffer::Logs(state), Message::Logs(message)) => {
-                let (command, event) =
-                    state.update(message, history, clients, previews, config);
-
-                let event = event.map(|event| match event {
-                    logs::Event::ContextMenu(event) => {
-                        Event::ContextMenu(event)
-                    }
-                    logs::Event::History(task) => Event::History(task),
-                    logs::Event::MarkAsRead => {
-                        Event::MarkAsRead(history::Kind::Logs)
-                    }
-                    logs::Event::OpenUrl(url) => Event::OpenUrl(url),
-                    logs::Event::ImagePreview(image) => {
-                        Event::ImagePreview(image)
-                    }
-                    logs::Event::ExpandMessage(server_time, hash) => {
-                        Event::ExpandMessage(server_time, hash)
-                    }
-                    logs::Event::ContractMessage(server_time, hash) => {
-                        Event::ContractMessage(server_time, hash)
-                    }
-                });
-
-                (command.map(Message::Logs), event)
-            }
-            (Buffer::Highlights(state), Message::Highlights(message))
-            | (
-                Buffer::ChannelMonitor(state),
-                Message::ChannelMonitor(message),
-            ) => {
-                let kind = state.kind;
-                let (command, event) =
-                    state.update(message, history, clients, previews, config);
-
-                (
-                    command.map(move |message| {
-                        map_message_feed_message(kind, message)
-                    }),
-                    event.map(|event| {
-                        map_message_feed_event(event, kind.history())
-                    }),
-                )
-            }
             _ => (Task::none(), None),
         }
     }
 
     pub fn view<'a>(
         &'a self,
-        typing_animation: Option<&'a typing::Animation>,
-        clients: &'a data::client::Map,
-        file_transfers: &'a file_transfer::Manager,
+        session: &'a data::Session,
         history: &'a history::Manager,
-        previews: &'a preview::Collection,
         settings: Option<&'a buffer::Settings>,
         config: &'a Config,
         theme: &'a Theme,
         is_focused: bool,
         sidebar: &'a sidebar::Sidebar,
-        channel_is_focused: impl Fn(&data::Server, &target::Channel) -> bool
-        + Copy
-        + 'a,
-        channel_is_open: impl Fn(&data::Server, &target::Channel) -> bool
-        + Copy
-        + 'a,
     ) -> Element<'a, Message> {
         match self {
             Buffer::Empty => empty::view(config, sidebar),
-            Buffer::Channel(state) => channel::view(
+            Buffer::Conversation(state) => conversation::view(
                 state,
-                typing_animation,
-                clients,
+                session.conversations.get(&state.convo_id),
+                our_address(session),
+                session.delivery.can_act(),
                 history,
-                previews,
                 settings,
                 config,
                 theme,
                 is_focused,
-                channel_is_focused,
-                channel_is_open,
             )
-            .map(Message::Channel),
-            Buffer::Server(state) => server::view(
-                state,
-                clients,
-                history,
-                previews,
-                config,
-                theme,
-                is_focused,
-                channel_is_focused,
-                channel_is_open,
-            )
-            .map(Message::Server),
-            Buffer::Query(state) => query::view(
-                state,
-                typing_animation,
-                clients,
-                history,
-                previews,
-                config,
-                theme,
-                is_focused,
-                channel_is_focused,
-                channel_is_open,
-            )
-            .map(Message::Query),
-            Buffer::FileTransfers(state) => {
-                file_transfers::view(state, file_transfers, theme)
-                    .map(Message::FileTransfers)
+            .map(Message::Conversation),
+            Buffer::Logs(state) => {
+                logs::view(state, history, config, theme).map(Message::Logs)
             }
-            Buffer::Logs(state) => logs::view(
-                state,
-                history,
-                config,
-                theme,
-                channel_is_focused,
-                channel_is_open,
-            )
-            .map(Message::Logs),
-            Buffer::Highlights(state) | Buffer::ChannelMonitor(state) => {
-                let kind = state.kind;
-
-                message_feed::view(
-                    state,
-                    clients,
-                    history,
-                    previews,
-                    config,
-                    theme,
-                    channel_is_focused,
-                    channel_is_open,
-                )
-                .map(move |message| map_message_feed_message(kind, message))
-            }
-            Buffer::ChannelDiscovery(state) => channel_discovery::view(
-                state,
-                clients,
-                config,
-                theme,
-                channel_is_focused,
-                channel_is_open,
-            )
-            .map(Message::ChannelList),
             Buffer::ConfigEditor(state) => {
                 config_editor::view(state, config, theme)
                     .map(Message::ConfigEditor)
@@ -717,180 +212,61 @@ impl Buffer {
         }
     }
 
-    pub fn has_typing_activity(&self, clients: &data::client::Map) -> bool {
-        match self {
-            Buffer::Channel(channel) => channel.has_typing_activity(clients),
-            Buffer::Query(query) => query.has_typing_activity(clients),
-            Buffer::Empty
-            | Buffer::Server(_)
-            | Buffer::FileTransfers(_)
-            | Buffer::Logs(_)
-            | Buffer::Highlights(_)
-            | Buffer::ChannelDiscovery(_)
-            | Buffer::ChannelMonitor(_)
-            | Buffer::ConfigEditor(_) => false,
-        }
-    }
-
-    // TODO: Placeholder in case we need
-    #[allow(unused)]
-    pub fn get_server(&self, server: &data::Server) -> Option<&Server> {
-        if let Buffer::Server(state) = self {
-            (&state.server == server).then_some(state)
-        } else {
-            None
-        }
-    }
-
-    // TODO: Placeholder in case we need
-    #[allow(unused)]
-    pub fn get_channel(
-        &self,
-        server: &data::Server,
-        channel: &target::Channel,
-    ) -> Option<&Channel> {
-        if let Buffer::Channel(state) = self {
-            (&state.server == server && state.target == *channel)
-                .then_some(state)
-        } else {
-            None
-        }
-    }
-
     pub fn focus(&self) -> Task<Message> {
         match self {
-            Buffer::Empty
-            | Buffer::FileTransfers(_)
-            | Buffer::Logs(_)
-            | Buffer::Highlights(_)
-            | Buffer::ChannelMonitor(_) => {
+            Buffer::Empty | Buffer::Logs(_) => {
                 widget::operate(focusable::unfocus())
             }
             Buffer::ConfigEditor(config_editor) => {
                 config_editor.focus().map(Message::ConfigEditor)
             }
-            Buffer::Channel(channel) => channel.focus().map(Message::Channel),
-            Buffer::Server(server) => server.focus().map(Message::Server),
-            Buffer::Query(query) => query.focus().map(Message::Query),
-            Buffer::ChannelDiscovery(channel_discovery) => {
-                channel_discovery.focus().map(Message::ChannelList)
+            Buffer::Conversation(conversation) => {
+                conversation.focus().map(Message::Conversation)
             }
         }
     }
 
     pub fn reset(&mut self) {
         match self {
-            Buffer::Empty
-            | Buffer::FileTransfers(_)
-            | Buffer::Logs(_)
-            | Buffer::Highlights(_)
-            | Buffer::ChannelDiscovery(_)
-            | Buffer::ChannelMonitor(_)
-            | Buffer::ConfigEditor(_) => {}
-            Buffer::Channel(channel) => channel.reset(),
-            Buffer::Server(server) => server.reset(),
-            Buffer::Query(query) => query.reset(),
+            Buffer::Empty | Buffer::Logs(_) | Buffer::ConfigEditor(_) => {}
+            Buffer::Conversation(conversation) => conversation.reset(),
         }
     }
 
-    pub fn insert_user_to_input(
-        &mut self,
-        nick: Nick,
-        history: &mut history::Manager,
-        autocomplete: &Autocomplete,
-    ) {
-        match self {
-            Buffer::Empty
-            | Buffer::FileTransfers(_)
-            | Buffer::Logs(_)
-            | Buffer::Highlights(_)
-            | Buffer::ChannelDiscovery(_)
-            | Buffer::ChannelMonitor(_)
-            | Buffer::ConfigEditor(_) => (),
-            Buffer::Server(state) => state.input_view.insert_user(
-                nick,
-                state.buffer.clone(),
-                history,
-                autocomplete,
-            ),
-            Buffer::Channel(state) => state.input_view.insert_user(
-                nick,
-                state.buffer.clone(),
-                history,
-                autocomplete,
-            ),
-            Buffer::Query(state) => state.input_view.insert_user(
-                nick,
-                state.buffer.clone(),
-                history,
-                autocomplete,
-            ),
+    /// Tells the thread showing `kind` that its messages landed, so its
+    /// settle window starts from there.
+    pub fn messages_loaded(&mut self, kind: &history::Kind) -> Task<Message> {
+        if let Buffer::Conversation(conversation) = self
+            && let history::Kind::Conversation(convo_id) = kind
+            && conversation.convo_id == *convo_id
+        {
+            conversation.messages_loaded().map(Message::Conversation)
+        } else {
+            Task::none()
         }
     }
 
-    pub fn process_input_completion_and_notice(
-        &mut self,
-        clients: &data::client::Map,
-        history: &history::Manager,
-        config: &Config,
-    ) {
-        match self {
-            Buffer::Empty
-            | Buffer::FileTransfers(_)
-            | Buffer::Logs(_)
-            | Buffer::Highlights(_)
-            | Buffer::ChannelDiscovery(_)
-            | Buffer::ChannelMonitor(_)
-            | Buffer::ConfigEditor(_) => (),
-            Buffer::Server(state) => {
-                state.input_view.process_completion_and_notice(
-                    &state.buffer,
-                    clients,
-                    history,
-                    config,
-                );
-            }
-            Buffer::Channel(state) => {
-                state.input_view.process_completion_and_notice(
-                    &state.buffer,
-                    clients,
-                    history,
-                    config,
-                );
-            }
-            Buffer::Query(state) => {
-                state.input_view.process_completion_and_notice(
-                    &state.buffer,
-                    clients,
-                    history,
-                    config,
-                );
-            }
+    /// Restores an unsent draft into the composer after a failed send.
+    pub fn restore_draft(&mut self, convo_id: &ConvoId, content: &str) {
+        if let Buffer::Conversation(conversation) = self
+            && conversation.convo_id == *convo_id
+        {
+            conversation.restore_draft(content);
         }
     }
 
     pub fn scroll_up_page(&mut self) -> Task<Message> {
         match self {
-            Buffer::Empty
-            | Buffer::FileTransfers(_)
-            | Buffer::ChannelDiscovery(_) => Task::none(),
+            Buffer::Empty => Task::none(),
             Buffer::ConfigEditor(state) => {
                 state.scroll_up_page();
                 Task::none()
             }
-            Buffer::Channel(channel) => {
-                channel.scroll_view.scroll_up_page().map(|message| {
-                    Message::Channel(channel::Message::ScrollView(message))
-                })
-            }
-            Buffer::Server(server) => {
-                server.scroll_view.scroll_up_page().map(|message| {
-                    Message::Server(server::Message::ScrollView(message))
-                })
-            }
-            Buffer::Query(query) => {
-                query.scroll_view.scroll_up_page().map(|message| {
-                    Message::Query(query::Message::ScrollView(message))
+            Buffer::Conversation(conversation) => {
+                conversation.scroll_view.scroll_up_page().map(|message| {
+                    Message::Conversation(conversation::Message::ScrollView(
+                        message,
+                    ))
                 })
             }
             Buffer::Logs(log) => {
@@ -898,41 +274,21 @@ impl Buffer {
                     Message::Logs(logs::Message::ScrollView(message))
                 })
             }
-            Buffer::Highlights(state) | Buffer::ChannelMonitor(state) => {
-                let kind = state.kind;
-
-                state.scroll_view.scroll_up_page().map(move |message| {
-                    map_message_feed_message(
-                        kind,
-                        message_feed::Message::ScrollView(message),
-                    )
-                })
-            }
         }
     }
 
     pub fn scroll_down_page(&mut self) -> Task<Message> {
         match self {
-            Buffer::Empty
-            | Buffer::FileTransfers(_)
-            | Buffer::ChannelDiscovery(_) => Task::none(),
+            Buffer::Empty => Task::none(),
             Buffer::ConfigEditor(state) => {
                 state.scroll_down_page();
                 Task::none()
             }
-            Buffer::Channel(channel) => {
-                channel.scroll_view.scroll_down_page().map(|message| {
-                    Message::Channel(channel::Message::ScrollView(message))
-                })
-            }
-            Buffer::Server(server) => {
-                server.scroll_view.scroll_down_page().map(|message| {
-                    Message::Server(server::Message::ScrollView(message))
-                })
-            }
-            Buffer::Query(query) => {
-                query.scroll_view.scroll_down_page().map(|message| {
-                    Message::Query(query::Message::ScrollView(message))
+            Buffer::Conversation(conversation) => {
+                conversation.scroll_view.scroll_down_page().map(|message| {
+                    Message::Conversation(conversation::Message::ScrollView(
+                        message,
+                    ))
                 })
             }
             Buffer::Logs(log) => {
@@ -940,178 +296,51 @@ impl Buffer {
                     Message::Logs(logs::Message::ScrollView(message))
                 })
             }
-            Buffer::Highlights(state) | Buffer::ChannelMonitor(state) => {
-                let kind = state.kind;
-
-                state.scroll_view.scroll_down_page().map(move |message| {
-                    map_message_feed_message(
-                        kind,
-                        message_feed::Message::ScrollView(message),
-                    )
-                })
-            }
         }
     }
 
     pub fn scroll_to_start(&mut self, config: &Config) -> Task<Message> {
         match self {
-            Buffer::Empty
-            | Buffer::FileTransfers(_)
-            | Buffer::ChannelDiscovery(_) => Task::none(),
+            Buffer::Empty => Task::none(),
             Buffer::ConfigEditor(state) => {
                 state.scroll_to_start();
                 Task::none()
             }
-            Buffer::Channel(channel) => {
-                channel.scroll_view.scroll_to_start(config).map(|message| {
-                    Message::Channel(channel::Message::ScrollView(message))
-                })
-            }
-            Buffer::Server(server) => {
-                server.scroll_view.scroll_to_start(config).map(|message| {
-                    Message::Server(server::Message::ScrollView(message))
-                })
-            }
-            Buffer::Query(query) => {
-                query.scroll_view.scroll_to_start(config).map(|message| {
-                    Message::Query(query::Message::ScrollView(message))
-                })
-            }
+            Buffer::Conversation(conversation) => conversation
+                .scroll_view
+                .scroll_to_start(config)
+                .map(|message| {
+                    Message::Conversation(conversation::Message::ScrollView(
+                        message,
+                    ))
+                }),
             Buffer::Logs(log) => {
                 log.scroll_view.scroll_to_start(config).map(|message| {
                     Message::Logs(logs::Message::ScrollView(message))
                 })
-            }
-            Buffer::Highlights(state) | Buffer::ChannelMonitor(state) => {
-                let kind = state.kind;
-
-                state
-                    .scroll_view
-                    .scroll_to_start(config)
-                    .map(move |message| {
-                        map_message_feed_message(
-                            kind,
-                            message_feed::Message::ScrollView(message),
-                        )
-                    })
             }
         }
     }
 
     pub fn scroll_to_end(&mut self, config: &Config) -> Task<Message> {
         match self {
-            Buffer::Empty
-            | Buffer::FileTransfers(_)
-            | Buffer::ChannelDiscovery(_) => Task::none(),
+            Buffer::Empty => Task::none(),
             Buffer::ConfigEditor(state) => {
                 state.scroll_to_end();
                 Task::none()
             }
-            Buffer::Channel(channel) => {
-                channel.scroll_view.scroll_to_end(config).map(|message| {
-                    Message::Channel(channel::Message::ScrollView(message))
-                })
-            }
-            Buffer::Server(server) => {
-                server.scroll_view.scroll_to_end(config).map(|message| {
-                    Message::Server(server::Message::ScrollView(message))
-                })
-            }
-            Buffer::Query(query) => {
-                query.scroll_view.scroll_to_end(config).map(|message| {
-                    Message::Query(query::Message::ScrollView(message))
-                })
-            }
+            Buffer::Conversation(conversation) => conversation
+                .scroll_view
+                .scroll_to_end(config)
+                .map(|message| {
+                    Message::Conversation(conversation::Message::ScrollView(
+                        message,
+                    ))
+                }),
             Buffer::Logs(log) => {
                 log.scroll_view.scroll_to_end(config).map(|message| {
                     Message::Logs(logs::Message::ScrollView(message))
                 })
-            }
-            Buffer::Highlights(state) | Buffer::ChannelMonitor(state) => {
-                let kind = state.kind;
-
-                state.scroll_view.scroll_to_end(config).map(move |message| {
-                    map_message_feed_message(
-                        kind,
-                        message_feed::Message::ScrollView(message),
-                    )
-                })
-            }
-        }
-    }
-
-    pub fn scroll_to_message(
-        &mut self,
-        message: message::Hash,
-        history: &history::Manager,
-        config: &Config,
-    ) -> Task<Message> {
-        match self {
-            Buffer::Empty
-            | Buffer::FileTransfers(_)
-            | Buffer::ChannelDiscovery(_)
-            | Buffer::ConfigEditor(_) => Task::none(),
-            Buffer::Channel(state) => state
-                .scroll_view
-                .scroll_to_message(
-                    message,
-                    scroll_view::Kind::Channel(&state.server, &state.target),
-                    history,
-                    config,
-                )
-                .map(|message| {
-                    Message::Channel(channel::Message::ScrollView(message))
-                }),
-            Buffer::Server(state) => state
-                .scroll_view
-                .scroll_to_message(
-                    message,
-                    scroll_view::Kind::Server(&state.server),
-                    history,
-                    config,
-                )
-                .map(|message| {
-                    Message::Server(server::Message::ScrollView(message))
-                }),
-            Buffer::Query(state) => state
-                .scroll_view
-                .scroll_to_message(
-                    message,
-                    scroll_view::Kind::Query(&state.server, &state.target),
-                    history,
-                    config,
-                )
-                .map(|message| {
-                    Message::Query(query::Message::ScrollView(message))
-                }),
-            Buffer::Logs(state) => state
-                .scroll_view
-                .scroll_to_message(
-                    message,
-                    scroll_view::Kind::Logs,
-                    history,
-                    config,
-                )
-                .map(|message| {
-                    Message::Logs(logs::Message::ScrollView(message))
-                }),
-            Buffer::Highlights(state) | Buffer::ChannelMonitor(state) => {
-                let kind = state.kind;
-
-                state
-                    .scroll_view
-                    .scroll_to_message(
-                        message,
-                        kind.scroll_view(),
-                        history,
-                        config,
-                    )
-                    .map(move |message| {
-                        map_message_feed_message(
-                            kind,
-                            message_feed::Message::ScrollView(message),
-                        )
-                    })
             }
         }
     }
@@ -1122,75 +351,35 @@ impl Buffer {
         config: &Config,
     ) -> Task<Message> {
         match self {
-            Buffer::Empty
-            | Buffer::FileTransfers(_)
-            | Buffer::ChannelDiscovery(_)
-            | Buffer::ConfigEditor(_) => Task::none(),
-            Buffer::Channel(state) => state
-                .scroll_view
-                .scroll_to_backlog(
-                    scroll_view::Kind::Channel(&state.server, &state.target),
-                    history,
-                    config,
-                )
-                .map(|message| {
-                    Message::Channel(channel::Message::ScrollView(message))
-                }),
-            Buffer::Server(state) => state
-                .scroll_view
-                .scroll_to_backlog(
-                    scroll_view::Kind::Server(&state.server),
-                    history,
-                    config,
-                )
-                .map(|message| {
-                    Message::Server(server::Message::ScrollView(message))
-                }),
-            Buffer::Query(state) => state
-                .scroll_view
-                .scroll_to_backlog(
-                    scroll_view::Kind::Query(&state.server, &state.target),
-                    history,
-                    config,
-                )
-                .map(|message| {
-                    Message::Query(query::Message::ScrollView(message))
-                }),
+            Buffer::Empty | Buffer::ConfigEditor(_) => Task::none(),
+            Buffer::Conversation(state) => {
+                let kind = scroll_view::Kind::Conversation(&state.convo_id);
+
+                state
+                    .scroll_view
+                    .scroll_to_backlog(kind, history, config)
+                    .map(|message| {
+                        Message::Conversation(
+                            conversation::Message::ScrollView(message),
+                        )
+                    })
+            }
             Buffer::Logs(state) => state
                 .scroll_view
                 .scroll_to_backlog(scroll_view::Kind::Logs, history, config)
                 .map(|message| {
                     Message::Logs(logs::Message::ScrollView(message))
                 }),
-            Buffer::Highlights(state) | Buffer::ChannelMonitor(state) => {
-                let kind = state.kind;
-
-                state
-                    .scroll_view
-                    .scroll_to_backlog(kind.scroll_view(), history, config)
-                    .map(move |message| {
-                        map_message_feed_message(
-                            kind,
-                            message_feed::Message::ScrollView(message),
-                        )
-                    })
-            }
         }
     }
 
     pub fn has_pending_scroll_to(&self) -> bool {
         match self {
-            Buffer::Empty
-            | Buffer::FileTransfers(_)
-            | Buffer::ChannelDiscovery(_)
-            | Buffer::ConfigEditor(_) => false,
-            Buffer::Channel(state) => state.scroll_view.has_pending_scroll_to(),
-            Buffer::Server(state) => state.scroll_view.has_pending_scroll_to(),
-            Buffer::Query(state) => state.scroll_view.has_pending_scroll_to(),
-            Buffer::Logs(state) => state.scroll_view.has_pending_scroll_to(),
-            Buffer::Highlights(state) | Buffer::ChannelMonitor(state) => {
+            Buffer::Empty | Buffer::ConfigEditor(_) => false,
+            Buffer::Conversation(state) => {
                 state.scroll_view.has_pending_scroll_to()
             }
+            Buffer::Logs(state) => state.scroll_view.has_pending_scroll_to(),
         }
     }
 
@@ -1200,40 +389,19 @@ impl Buffer {
         config: &Config,
     ) -> Task<Message> {
         match self {
-            Buffer::Empty
-            | Buffer::FileTransfers(_)
-            | Buffer::ChannelDiscovery(_)
-            | Buffer::ConfigEditor(_) => Task::none(),
-            Buffer::Channel(state) => state
-                .scroll_view
-                .prepare_for_pending_scroll_to(
-                    scroll_view::Kind::Channel(&state.server, &state.target),
-                    history,
-                    config,
-                )
-                .map(|message| {
-                    Message::Channel(channel::Message::ScrollView(message))
-                }),
-            Buffer::Server(state) => state
-                .scroll_view
-                .prepare_for_pending_scroll_to(
-                    scroll_view::Kind::Server(&state.server),
-                    history,
-                    config,
-                )
-                .map(|message| {
-                    Message::Server(server::Message::ScrollView(message))
-                }),
-            Buffer::Query(state) => state
-                .scroll_view
-                .prepare_for_pending_scroll_to(
-                    scroll_view::Kind::Query(&state.server, &state.target),
-                    history,
-                    config,
-                )
-                .map(|message| {
-                    Message::Query(query::Message::ScrollView(message))
-                }),
+            Buffer::Empty | Buffer::ConfigEditor(_) => Task::none(),
+            Buffer::Conversation(state) => {
+                let kind = scroll_view::Kind::Conversation(&state.convo_id);
+
+                state
+                    .scroll_view
+                    .prepare_for_pending_scroll_to(kind, history, config)
+                    .map(|message| {
+                        Message::Conversation(
+                            conversation::Message::ScrollView(message),
+                        )
+                    })
+            }
             Buffer::Logs(state) => state
                 .scroll_view
                 .prepare_for_pending_scroll_to(
@@ -1244,206 +412,40 @@ impl Buffer {
                 .map(|message| {
                     Message::Logs(logs::Message::ScrollView(message))
                 }),
-            Buffer::Highlights(state) | Buffer::ChannelMonitor(state) => {
-                let kind = state.kind;
-
-                state
-                    .scroll_view
-                    .prepare_for_pending_scroll_to(
-                        kind.scroll_view(),
-                        history,
-                        config,
-                    )
-                    .map(move |message| {
-                        map_message_feed_message(
-                            kind,
-                            message_feed::Message::ScrollView(message),
-                        )
-                    })
-            }
         }
     }
 
     pub fn is_scrolled_to_bottom(&self) -> Option<bool> {
         match self {
-            Buffer::Empty
-            | Buffer::FileTransfers(_)
-            | Buffer::ChannelDiscovery(_)
-            | Buffer::ConfigEditor(_) => None,
-            Buffer::Channel(channel) => {
-                Some(channel.scroll_view.is_scrolled_to_bottom())
-            }
-            Buffer::Server(server) => {
-                Some(server.scroll_view.is_scrolled_to_bottom())
-            }
-            Buffer::Query(query) => {
-                Some(query.scroll_view.is_scrolled_to_bottom())
+            Buffer::Empty | Buffer::ConfigEditor(_) => None,
+            Buffer::Conversation(conversation) => {
+                Some(conversation.scroll_view.is_scrolled_to_bottom())
             }
             Buffer::Logs(log) => Some(log.scroll_view.is_scrolled_to_bottom()),
-            Buffer::Highlights(state) | Buffer::ChannelMonitor(state) => {
-                Some(state.scroll_view.is_scrolled_to_bottom())
-            }
         }
     }
 
     pub fn close_picker(&mut self) -> bool {
         match self {
-            Buffer::Empty
-            | Buffer::FileTransfers(_)
-            | Buffer::Logs(_)
-            | Buffer::Highlights(_)
-            | Buffer::ChannelDiscovery(_)
-            | Buffer::ChannelMonitor(_)
-            | Buffer::ConfigEditor(_) => false,
-            Buffer::Server(state) => state.input_view.close_picker(),
-            Buffer::Channel(state) => state.input_view.close_picker(),
-            Buffer::Query(state) => state.input_view.close_picker(),
-        }
-    }
-
-    pub fn clear_draft_reply(
-        &mut self,
-        history: &mut history::Manager,
-        config: &Config,
-    ) -> bool {
-        match self {
-            Buffer::Empty
-            | Buffer::FileTransfers(_)
-            | Buffer::Logs(_)
-            | Buffer::Highlights(_)
-            | Buffer::ChannelDiscovery(_)
-            | Buffer::ChannelMonitor(_)
-            | Buffer::ConfigEditor(_) => false,
-            Buffer::Server(state) => state.input_view.clear_draft_reply(
-                &state.buffer,
-                history,
-                config,
-            ),
-            Buffer::Channel(state) => state.input_view.clear_draft_reply(
-                &state.buffer,
-                history,
-                config,
-            ),
-            Buffer::Query(state) => state.input_view.clear_draft_reply(
-                &state.buffer,
-                history,
-                config,
-            ),
+            Buffer::Empty | Buffer::Logs(_) | Buffer::ConfigEditor(_) => false,
+            Buffer::Conversation(state) => state.input_view.close_picker(),
         }
     }
 
     pub fn update_pane_size(&mut self, pane_size: Size, config: &Config) {
         match self {
-            Buffer::Empty
-            | Buffer::FileTransfers(_)
-            | Buffer::ChannelDiscovery(_)
-            | Buffer::ConfigEditor(_) => (),
-            Buffer::Channel(channel) => {
-                channel.scroll_view.update_pane_size(pane_size, config);
-            }
-            Buffer::Server(server) => {
-                server.scroll_view.update_pane_size(pane_size, config);
-            }
-            Buffer::Query(query) => {
-                query.scroll_view.update_pane_size(pane_size, config);
+            Buffer::Empty | Buffer::ConfigEditor(_) => (),
+            Buffer::Conversation(conversation) => {
+                conversation.scroll_view.update_pane_size(pane_size, config);
             }
             Buffer::Logs(log) => {
                 log.scroll_view.update_pane_size(pane_size, config);
             }
-            Buffer::Highlights(state) | Buffer::ChannelMonitor(state) => {
-                state.scroll_view.update_pane_size(pane_size, config);
-            }
-        }
-    }
-
-    pub fn get_draft_reply(&mut self) -> Option<&input::DraftReply> {
-        match self {
-            Buffer::Empty
-            | Buffer::FileTransfers(_)
-            | Buffer::Logs(_)
-            | Buffer::Highlights(_)
-            | Buffer::ChannelDiscovery(_)
-            | Buffer::ChannelMonitor(_)
-            | Buffer::ConfigEditor(_) => None,
-            Buffer::Server(state) => state.input_view.draft_reply(),
-            Buffer::Channel(state) => state.input_view.draft_reply(),
-            Buffer::Query(state) => state.input_view.draft_reply(),
-        }
-    }
-
-    pub fn set_reply_preview(&mut self, reply_preview: message::ReplyPreview) {
-        match self {
-            Buffer::Empty
-            | Buffer::FileTransfers(_)
-            | Buffer::Logs(_)
-            | Buffer::Highlights(_)
-            | Buffer::ChannelDiscovery(_)
-            | Buffer::ChannelMonitor(_)
-            | Buffer::ConfigEditor(_) => (),
-            Buffer::Server(state) => {
-                state.input_view.set_reply_preview(reply_preview);
-            }
-            Buffer::Channel(state) => {
-                state.input_view.set_reply_preview(reply_preview);
-            }
-            Buffer::Query(state) => {
-                state.input_view.set_reply_preview(reply_preview);
-            }
         }
     }
 }
 
-fn map_message_feed_message(
-    kind: message_feed::Kind,
-    message: message_feed::Message,
-) -> Message {
-    match kind {
-        message_feed::Kind::Highlights => Message::Highlights(message),
-        message_feed::Kind::ChannelMonitor => Message::ChannelMonitor(message),
-    }
-}
-
-fn map_message_feed_event(
-    event: message_feed::Event,
-    kind: history::Kind,
-) -> Event {
-    match event {
-        message_feed::Event::ContextMenu(event) => Event::ContextMenu(event),
-        message_feed::Event::OpenBuffer(server, target, buffer_action) => {
-            Event::OpenBuffers(server, vec![(target, buffer_action)])
-        }
-        message_feed::Event::GoToMessage(
-            server,
-            channel,
-            message,
-            buffer_action,
-        ) => Event::GoToMessage(server, channel, message, buffer_action),
-        message_feed::Event::History(task) => Event::History(task),
-        message_feed::Event::MarkAsRead => Event::MarkAsRead(kind),
-        message_feed::Event::OpenUrl(url) => Event::OpenUrl(url),
-        message_feed::Event::ImagePreview(image) => Event::ImagePreview(image),
-        message_feed::Event::ExpandMessage(server_time, hash) => {
-            Event::ExpandMessage(server_time, hash)
-        }
-        message_feed::Event::ContractMessage(server_time, hash) => {
-            Event::ContractMessage(server_time, hash)
-        }
-    }
-}
-
-impl fmt::Display for Buffer {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            Buffer::Empty => write!(f, "Empty"),
-            Buffer::Channel(Channel { target, .. }) => write!(f, "{target}"),
-            Buffer::Server(Server { server, .. }) => write!(f, "{server}"),
-            Buffer::Query(Query { target, .. }) => write!(f, "{target}"),
-            Buffer::FileTransfers(_) => write!(f, "File Transfers"),
-            Buffer::Logs(_) => write!(f, "Logs"),
-            Buffer::Highlights(_) => write!(f, "Highlights"),
-            Buffer::ChannelDiscovery(_) => write!(f, "Channel Discovery"),
-            Buffer::ChannelMonitor(_) => write!(f, "Channel Monitor"),
-            Buffer::ConfigEditor(_) => write!(f, "Config Editor"),
-        }
-    }
+/// The identity address for sender-run comparison and own-message styling.
+fn our_address(session: &data::Session) -> Option<&Address> {
+    session.identity.as_ref().map(|identity| &identity.address)
 }
