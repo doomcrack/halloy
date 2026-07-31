@@ -1,23 +1,40 @@
 # Getting Started
 
-To get started with Halloy, you need to connect to at least one IRC server. The template config file has been set up with the [Libera](https://libera.chat/) server. However, there are many other servers available: [OFTC](https://www.oftc.net/), [Undernet](https://www.undernet.org/), [QuakeNet](https://www.quakenet.org/), [2600net](https://scuttled.net/) and [many more](https://netsplit.de/networks/). Halloy can connect to multiple servers at the same time.
-
-Once connected to a server, you can join channels. This can be done automatically from the config file or manually using the join command: `/join #channel`[^1]. To find channels, you can either use the list command: `/list`, or [browse for channels online](https://netsplit.de/channels/).
+Frigicom has nothing to connect to by hand: on launch it starts its own private
+`logoscore` daemon, loads `chat_module`, and waits for the delivery layer to come
+online. The sidebar and status bar show that progress; the composer stays
+disabled until the backend reports **online**, which can take anywhere from a few
+seconds to a minute on `logos.test`.
 
 ::: info
-Configuration in Halloy happens through a `config.toml` file. See [Configuration](./configuration.md).
+Configuration happens through a `config.toml` file. See
+[Configuration](./configuration.md), and [Logos](./configuration/logos.md) for
+the backend section specifically.
 :::
 
-Here are a few useful IRC commands for a new user[^2]
+## Your address
 
-| Command           | Example                | Description                                |
-| ----------------- | ---------------------- | ------------------------------------------ |
-| `/join`           | `/join #halloy`        | Join a new channel                         |
-| `/part`           | `/part #halloy`        | Part a channel                             |
-| `/nick`           | `/nick halloyisgreat`  | Change your nickname                       |
-| `/whois nickname` | `/whois halloyisgreat` | Displays information of nickname requested |
-| `/list *keyword*` | `/list *linux*`        | List channels. Keyword is optional         |
+Once online, your address is shown in the account card at the bottom of the
+sidebar; click it to copy. This is what other people use to start a conversation
+with you.
 
+::: warning
+The address is **ephemeral**. `chat_module` mints a new one every time it
+initialises and its persistence is compiled off upstream, so your address —
+along with every conversation and message — is gone after a restart.
+:::
 
-[^1]: Channel names typically start with a `#` symbol and do not contain spaces.
-[^2]: Find more commands [here](https://en.wikipedia.org/wiki/List_of_Internet_Relay_Chat_commands).
+## Starting a conversation
+
+| Command                | Example                    | Description                              |
+| ---------------------- | -------------------------- | ---------------------------------------- |
+| `/dm <address>`        | `/dm 0a1b2c3d…`            | Open (or create) a direct conversation   |
+| `/group <name> [desc]` | `/group pals weekend plan` | Create a group conversation              |
+| `/add <address>`       | `/add 0a1b2c3d…`           | Add a member to the focused group        |
+
+The same actions are available from the **New chat** button in the sidebar.
+
+Group membership commits take up to a minute to propagate; added members appear
+in the roster as *pending* until they do.
+
+See [Commands](./commands.md) for the full list.

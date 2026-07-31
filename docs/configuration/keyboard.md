@@ -55,20 +55,17 @@ Below is a list of all actions which can be mapped.
 | `scroll_down_page`             | Scroll buffer down a page           | <kbd>Fn</kbd> + <kbd>↓</kbd>                        | <kbd>pagedown</kbd>                                 |
 | `scroll_to_top`                | Scroll to top of buffer             | <kbd>⌘</kbd> + <kbd>↑</kbd>                         | <kbd>ctrl</kbd> + <kbd>↑</kbd>                      |
 | `scroll_to_bottom`             | Scroll to bottom of buffer          | <kbd>⌘</kbd> + <kbd>↓</kbd>                         | <kbd>ctrl</kbd> + <kbd>↓</kbd>                      |
-| `leave_buffer`                 | Leave channel or close query        | <kbd>⌘</kbd> + <kbd>shift</kbd> + <kbd>w</kbd>      | <kbd>ctrl</kbd> + <kbd>shift</kbd> + <kbd>w</kbd>   |
 | `mark_as_read`                 | Mark focused buffer as read         | <kbd>⌘</kbd> + <kbd>shift</kbd> + <kbd>m</kbd>      | <kbd>ctrl</kbd> + <kbd>shift</kbd> + <kbd>m</kbd>   |
-| `config_editor_save`           | Save config in Config Editor                 | <kbd>⌘</kbd> + <kbd>s</kbd>                         | <kbd>ctrl</kbd> + <kbd>s</kbd>                      |
-| `toggle_nick_list`             | Toggle nick list                    | <kbd>⌘</kbd> + <kbd>⌥</kbd> + <kbd>m</kbd>          | <kbd>ctrl</kbd> + <kbd>alt</kbd> + <kbd>m</kbd>     |
-| `toggle_topic`                 | Toggle topic                        | <kbd>⌘</kbd> + <kbd>⌥</kbd> + <kbd>t</kbd>          | <kbd>ctrl</kbd> + <kbd>alt</kbd> + <kbd>t</kbd>     |
+| `config_editor_save`           | Save config in Config Editor        | <kbd>⌘</kbd> + <kbd>s</kbd>                         | <kbd>ctrl</kbd> + <kbd>s</kbd>                      |
+| `toggle_member_list`           | Toggle member list                  | <kbd>⌘</kbd> + <kbd>⌥</kbd> + <kbd>m</kbd>          | <kbd>ctrl</kbd> + <kbd>alt</kbd> + <kbd>m</kbd>     |
+| `toggle_details`               | Toggle details panel                | <kbd>⌘</kbd> + <kbd>⌥</kbd> + <kbd>t</kbd>          | <kbd>ctrl</kbd> + <kbd>alt</kbd> + <kbd>t</kbd>     |
 | `toggle_sidebar`               | Toggle sidebar                      | <kbd>⌘</kbd> + <kbd>⌥</kbd> + <kbd>b</kbd>          | <kbd>ctrl</kbd> + <kbd>alt</kbd> + <kbd>b</kbd>     |
 | `toggle_fullscreen`            | Toggle fullscreen                   | <kbd>⌘</kbd> + <kbd>ctrl</kbd> + <kbd>f</kbd>       | <kbd>F11</kbd>                                      |
 | `command_bar`                  | Toggle command bar                  | <kbd>⌘</kbd> + <kbd>k</kbd>                         | <kbd>ctrl</kbd> + <kbd>k</kbd>                      |
 | `reload_configuration`         | Reload configuration file           | <kbd>⌘</kbd> + <kbd>r</kbd>                         | <kbd>ctrl</kbd> + <kbd>r</kbd>                      |
-| `file_transfers`               | Toggle File Transfers Buffer        | <kbd>⌘</kbd> + <kbd>j</kbd>                         | <kbd>ctrl</kbd> + <kbd>j</kbd>                      |
 | `logs`                         | Toggle Logs Buffer                  | <kbd>⌘</kbd> + <kbd>l</kbd>                         | <kbd>ctrl</kbd> + <kbd>l</kbd>                      |
 | `theme_editor`                 | Toggle Theme Editor Window          | <kbd>⌘</kbd> + <kbd>t</kbd>                         | <kbd>ctrl</kbd> + <kbd>t</kbd>                      |
-| `highlights`                   | Toggle Highlights Window            | <kbd>⌘</kbd> + <kbd>i</kbd>                         | <kbd>ctrl</kbd> + <kbd>i</kbd>                      |
-| `quit_application`             | Quit Halloy                         | None                                                | None                                                |
+| `quit_application`             | Quit Frigicom                         | None                                                | None                                                |
 | `open_config_editor`           | Toggle Config Editor Buffer         | <kbd>⌘</kbd> + <kbd>,</kbd>                         | <kbd>ctrl</kbd> + <kbd>,</kbd>                      |
 | `open_config_file`             | Open settings file in system editor | None                                                | None                                                |
 | `show_muted_buffers`           | Show muted buffers                  | None                                                | None                                                |

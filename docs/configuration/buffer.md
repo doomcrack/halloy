@@ -1,6 +1,6 @@
 # Buffer
 
-Buffer settings for Halloy.
+Buffer settings for Frigicom.
 
 ## `line_spacing`
 
@@ -13,19 +13,6 @@ Setting to control spacing between messages in buffers
 
 [buffer]
 line_spacing = 4
-```
-
-## `scroll_position_on_open`
-
-Scroll position of the buffer when it opens.
-
-```toml
-# Type: string
-# Values: "oldest-unread", "newest"
-# Default: "oldest-unread"
-
-[buffer]
-scroll_position_on_open = "newest"
 ```
 
 ## `backlog_separator`
@@ -58,419 +45,102 @@ Set the text for backlog divider or disable it
 text = false
 ```
 
-## `channel`
+## `conversation`
 
-Channel specific settings
+Defaults for conversation buffers. Individual buffers can override these from
+their context menu.
 
-### `channel_name_casing`
+### `member_list`
 
-Transform the channel name casing in the channel pane title.
-
-```toml
-# Type: string (optional)
-# Values: "lowercase"
-# Default: not set (channel name displayed as-is)
-
-[buffer.channel]
-channel_name_casing = "lowercase"
-```
-
-### `message`
-
-Message settings within a channel buffer.
-
-#### `show_emoji_reacts`
-
-Whether to display emoji reactions on messages (if [IRCv3 React](https://ircv3.net/specs/client-tags/react) is supported by the server).
-
-```toml
-# Type: boolean
-# Values: "true", "false"
-# Default: "true"
-
-[buffer.channel.message]
-show_emoji_reacts = true
-```
-
-#### `max_reaction_display`
-
-Maximum number of user-visible characters (Unicode grapheme clusters) in a reaction.
-If a reaction exceeds this value, then its display is truncated to the first `max_reaction_display` grapheme clusters.
-
-```toml
-# Type: integer
-# Values: positive integers
-# Default: 5
-
-[buffer.channel.message]
-max_reaction_display = 5
-```
-
-#### `max_reaction_chars`
-
-Maximum number of user-visible characters (Unicode grapheme clusters) in a reaction.
-If a reaction exceeds this value, then it is not stored.
-
-```toml
-# Type: integer
-# Values: positive integers
-# Default: 64
-
-[buffer.channel.message]
-max_reaction_chars = 64
-```
-
-### `nicklist`
-
-Nicklist settings within a channel buffer.
-
-#### `alignment`
-
-Horizontal alignment of nicknames.
-
-```toml
-# Type: string
-# Values: "left", "right"
-# Default: "left"
-
-[buffer.channel.nicklist]
-alignment = "left"
-```
+The roster column shown alongside group conversations.
 
 #### `enabled`
-
-Control if nicklist should be shown or not by default.
 
 ```toml
 # Type: boolean
 # Values: true, false
 # Default: true
 
-[buffer.channel.nicklist]
+[buffer.conversation.member_list]
 enabled = true
 ```
 
 #### `position`
 
-Nicklist position in the pane.
+```toml
+# Type: string
+# Values: "left", "right"
+# Default: "right"
+
+[buffer.conversation.member_list]
+position = "left"
+```
+
+#### `width`
+
+```toml
+# Type: number
+# Values: any positive number
+# Default: not set
+
+[buffer.conversation.member_list]
+width = 180.0
+```
+
+#### `alignment`
 
 ```toml
 # Type: string
 # Values: "left", "right"
 # Default: "left"
 
-[buffer.channel.nicklist]
-position = "right"
-```
-
-#### `show_access_levels`
-
-Show access level(s) in front of nicknames (`@`, `+`, `~`, etc.).
-
-```toml
-# Type: string
-# Values: "all", "highest", or "none"
-# Default: "highest"
-
-[buffer.channel.nicklist]
-show_access_levels = "all"
-```
-
-#### `show_bot_icon`
-
-Show an icon next to nicknames of users identified as bots.
-
-```toml
-# Type: bool
-# Values: true, false
-# Default: true
-
-[buffer.channel.nicklist]
-show_bot_icon = true
+[buffer.conversation.member_list]
+alignment = "right"
 ```
 
 #### `truncate`
 
-Truncate nicknames in nicklist to a maximum length. Has no effect when [`buffer.channel.nicklist.width`](#width) is set. If not set, falls back to [`buffer.nickname.truncate`](#truncate-1).
+Truncate member names longer than the given number of characters.
 
 ```toml
 # Type: integer
 # Values: any non-negative integer
 # Default: not set
 
-[buffer.channel.nicklist]
-truncate = 10
+[buffer.conversation.member_list]
+truncate = 12
 ```
 
-#### `width`
+### `description_banner`
 
-Overwrite nicklist width in pixels.
-
-```toml
-# Type: integer
-# Values: any non-negative integer
-# Default: not set
-
-[buffer.channel.nicklist]
-width = 150
-```
-
-### `topic_banner`
-
-Topic banner settings within a channel buffer.
+The group description shown under the buffer header.
 
 #### `enabled`
-
-Control if topic banner should be shown or not by default.
 
 ```toml
 # Type: boolean
 # Values: true, false
 # Default: true
 
-[buffer.channel.topic_banner]
+[buffer.conversation.description_banner]
 enabled = true
 ```
 
 #### `max_lines`
-
-Amount of visible lines before you have to scroll in topic banner.
 
 ```toml
 # Type: integer
 # Values: any non-negative integer
 # Default: 2
 
-[buffer.channel.topic_banner]
-max_lines = 2
+[buffer.conversation.description_banner]
+max_lines = 3
 ```
 
-## `chathistory`
-
-IRCv3 [`chathistory`](https://ircv3.net/specs/extensions/chathistory) extension settings
-
-### `infinite_scroll`
-
-Automatically request older history when scrolling to the top of a channel/query buffer
-
-```toml
-# Type: boolean
-# Values: true, false
-# Default: true
-
-[buffer.chathistory]
-infinite_scroll = true
-```
-
-## `commands`
-
-Commands settings.
-
-### `show_description`
-
-Show or hide the description for a command
-
-```toml
-# Type: boolean
-# Values: true, false
-# Default: true
-
-[buffer.commands]
-show_description = true
-```
-
-### `aliases`
-
-Define custom slash command aliases.
-
-```toml
-# Type: map
-# Values: map with string key/value pairs
-# Default: {}
-
-[buffer.commands.aliases]
-op = "/mode #halloy +ooo $1 $2 $3"
-halloy = "/me says halloy to $1!"
-topic = "/topic #halloy $1-"
-deopme = "/mode -o $nick"
-np = "/exec mpc current --format '/me is now playing %artist% - %title%'"
-```
-
-Use `$1` through `$9` to insert positional arguments.  A hyphen after
-the argument number (e.g. `$1-`) means that all following arguments will
-also be included in the argument; for example, `/topic our new topic`
-for the alias defined as `topic = "/topic #halloy $1-"` will expand to
-`/topic #halloy our new topic`.
-
-Optional arguments is also possible by using a `?`, eg: `$1?`. Note that
-you can't have required arguments after optional arguments.
-
-You can also use context-aware placeholders:
-
-- `$nick` inserts your current nickname.
-- `$channel` inserts the active channel name.
-- `$server` inserts the active server name.
-
-Aliases must be specified in reference to existing slash commands, so to
-send a regular message the `/msg` command (or equivalent, such as
-`/plain`/`/format` command) should be used.  For example, `welcome =
-"/msg $channel welcome to IRC $1, enjoy your stay!"`.
-
-- Aliases take precedence over built-in commands with the same name.
-- Alias expansion happens once; aliases do not expand other aliases.
-
-### `exec`
-
-Configure `/exec`.
-
-::: warning
-`/exec` runs a local shell command on your machine. Enable it only if you trust the commands you plan to run.
+::: info
+The section is also accepted under its IRC-era names: `[buffer.channel]` with
+`nicklist` and `topic_banner`.
 :::
-
-See the [Exec Command guide](../guides/exec-command.md) for a few simple examples.
-
-#### `enabled`
-
-Enable `/exec`.
-When disabled, submitting `/exec` shows an error instead of running the shell command.
-
-```toml
-# Type: boolean
-# Values: true, false
-# Default: false
-
-[buffer.commands.exec]
-enabled = false
-```
-
-#### `timeout`
-
-Time in seconds to wait before timing out `/exec`.
-
-```toml
-# Type: integer
-# Values: any non-negative integer
-# Default: 5
-
-[buffer.commands.exec]
-timeout = 5
-```
-
-#### `max_output_bytes`
-
-Maximum number of stdout bytes accepted from `/exec`.
-
-```toml
-# Type: integer
-# Values: any non-negative integer
-# Default: 4096
-
-[buffer.commands.exec]
-max_output_bytes = 4096
-```
-
-### `sysinfo`
-
-Configure which system information components to display when using the `/sysinfo` command
-
-#### `cpu`
-
-Show CPU information (processor brand and model)
-
-```toml
-# Type: boolean
-# Values: true, false
-# Default: true
-
-[buffer.commands.sysinfo]
-cpu = true
-```
-
-#### `memory`
-
-Show memory information
-
-```toml
-# Type: boolean
-# Values: true, false
-# Default: true
-
-[buffer.commands.sysinfo]
-memory = true
-```
-
-#### `gpu`
-
-Show graphics card information (adapter and backend)
-
-```toml
-# Type: boolean
-# Values: true, false
-# Default: true
-
-[buffer.commands.sysinfo]
-gpu = true
-```
-
-#### `os`
-
-Show operating system information (version and kernel)
-
-```toml
-# Type: boolean
-# Values: true, false
-# Default: true
-
-[buffer.commands.sysinfo]
-os = true
-```
-
-#### `uptime`
-
-Show system uptime information
-
-```toml
-# Type: boolean
-# Values: true, false
-# Default: true
-
-[buffer.commands.sysinfo]
-uptime = true
-```
-
-### `quit`
-
-Configure `QUIT` command
-
-#### `default_reason`
-
-Default quit (from server) reason
-
-```toml
-# Type: String
-# Values: string value
-# Default: ""
-
-[buffer.commands.quit]
-default_reason = "See you later all!"
-```
-
-### `part`
-
-Configure `PART` command
-
-#### `default_reason`
-
-Default part (from channel) reason
-
-```toml
-# Type: String
-# Values: string value
-# Default: ""
-
-[buffer.commands.part]
-default_reason = "I'll be back!"
-```
 
 ## `date_separators`
 
@@ -566,100 +236,6 @@ E.g. `:D` will not show the emoji picker unless `characters_to_trigger_picker` i
 characters_to_trigger_picker = 2
 ```
 
-## `internal_messages`
-
-Internal messages are messages sent from Halloy itself.
-
-### `default`
-
-Default settings which will be used for all internal messages when a specific value is not provided for the specific internal message type.
-
-#### `enabled`
-
-Control if internal messages are enabled by default.
-
-```toml
-# Type: boolean
-# Values: true, false
-# Default: true
-
-[buffer.internal_messages.default]
-enabled = true
-```
-
-#### `smart`
-
-By default, only show internal message if received within the given time duration (seconds).
-
-```toml
-# Type: integer
-# Values: any non-negative integer
-# Default: not set
-
-[buffer.internal_messages.default]
-smart = 180
-```
-
-### `error`
-
-Internal messages which are considered an "error" such as when a connection was lost, or when connection to server failed.
-
-#### `enabled`
-
-Control if internal message type is enabled.
-
-```toml
-# Type: boolean
-# Values: true, false
-# Default: true
-
-[buffer.internal_messages.error]
-enabled = true
-```
-
-#### `smart`
-
-Only show internal message if received within the given time duration (seconds).
-
-```toml
-# Type: integer
-# Values: any non-negative integer
-# Default: not set
-
-[buffer.internal_messages.error]
-smart = 180
-```
-
-### `success`
-
-Internal messages which are considered a "success" such as when a connection was restored, or when connected successfully to a server.
-
-#### `enabled`
-
-Control if internal message type is enabled.
-
-```toml
-# Type: boolean
-# Values: true, false
-# Default: true
-
-[buffer.internal_messages.success]
-enabled = true
-```
-
-#### `smart`
-
-Only show internal message if received within the given time duration (seconds).
-
-```toml
-# Type: integer
-# Values: any non-negative integer
-# Default: not set
-
-[buffer.internal_messages.success]
-smart = 180
-```
-
 ## `mark_as_read`
 
 When to mark a buffer as read
@@ -718,7 +294,7 @@ on_message_sent = true
 
 ### `on_message`
 
-Marks as read when Halloy is focused and a new message arrives in a buffer that is scrolled to the bottom.  If `"focused"` then only the currently focused buffer will have new messages marked as read, while `"open"` will mark messages as read for any open buffer.
+Marks as read when Frigicom is focused and a new message arrives in a buffer that is scrolled to the bottom.  If `"focused"` then only the currently focused buffer will have new messages marked as read, while `"open"` will mark messages as read for any open buffer.
 
 ```toml
 # Type: boolean
@@ -733,9 +309,10 @@ on_message = "open"
 
 Side effects for when closing buffers.
 
-### `query`
+### `direct`
 
-What happens when closing a query buffer. `"keep"` only closes the pane, while `"close"` also closes the query.
+What happens when closing a direct conversation's buffer. `"keep"` only closes
+the pane, while `"close"` also removes the conversation from the sidebar.
 
 ```toml
 # Type: string
@@ -743,439 +320,94 @@ What happens when closing a query buffer. `"keep"` only closes the pane, while `
 # Default: "keep"
 
 [buffer.close]
-query = "keep"
+direct = "keep"
 ```
 
-## `nickname`
+::: info
+The key is also accepted under its IRC-era name, `query`.
+:::
 
-Customize how nicknames are displayed within a buffer.
+## `sender`
+
+Styling for the message sender label.
 
 ### `alignment`
-
-Horizontal alignment of nicknames.
 
 ```toml
 # Type: string
 # Values: "left", "right", "top"
 # Default: "left"
 
-[buffer.nickname]
-alignment = "right"
-```
-
-### `away`
-
-Controls the appearance of away nicknames.
-
-```toml
-# Type: string or object
-# Values: "dimmed", "none" or { dimmed = float }
-# Default: "dimmed"
-[buffer.nickname]
-away = "dimmed"
-
-# with custom dimming alpha value (0.0-1.0)
-[buffer.nickname]
-away = { dimmed = 0.5 }
-
-# no away indication
-[buffer.nickname]
-away = "none"
+[buffer.sender]
+alignment = "top"
 ```
 
 ### `brackets`
 
-Brackets around nicknames.
-
 ```toml
-# Type: string
+# Type: object
 # Values: { left = "<any string>", right = "<any string>" }
 # Default: { left = "", right = "" }
 
-[buffer.nickname]
+[buffer.sender]
 brackets = { left = "<", right = ">" }
 ```
 
 ### `color`
 
-Nickname colors across nickname UI, including channel messages, nicklists, and nickname-related controls. `"unique"` generates colors by randomizing the hue, while keeping the saturation and lightness from the theme's nickname color. `{ palette = [...] }` assigns each nickname one of the provided hex colors.
+`"unique"` derives a stable color per address, matching the avatar ramp.
 
 ```toml
 # Type: string or object
 # Values: "solid", "unique", or { palette = ["#RRGGBB", ...] }
 # Default: "unique"
 
-[buffer.nickname]
-color = "unique"
-
-[buffer.nickname]
-color = { palette = ["#B11E3A", "#2A7FFF", "#1E9E5A"] }
-```
-
-### `offline`
-
-Controls the appearance of offline nicknames.
-
-```toml
-# Type: string or object
-# Values: "solid" or "none"
-# Default: "solid"
-[buffer.nickname]
-offline = "solid"
-
-# no offline indication
-[buffer.nickname]
-offline = "none"
-```
-
-### `show_access_levels`
-
-Show access level(s) in front of nicknames (`@`, `+`, `~`, etc.).
-
-```toml
-# Type: string
-# Values: "all", "highest", or "none"
-# Default: "highest"
-
-[buffer.nickname]
-show_access_levels = "none"
-```
-
-### `show_bot_icon`
-
-Show an icon next to nicknames of users identified as bots.
-
-```toml
-# Type: bool
-# Values: true, false
-# Default: true
-
-[buffer.nickname]
-show_bot_icon = true
-```
-
-### `shown_status`
-
-What status should be indicated (by either `away` or `offline` settings), the user's current status (`"current"`) or their status at the time of sending the message (`"historical"`).
-
-```toml
-# Type: string or object
-# Values: "current" or "historical"
-# Default: "current"
-[buffer.nickname]
-shown_status = "current"
+[buffer.sender]
+color = "solid"
 ```
 
 ### `truncate`
-
-Truncate nicknames in buffer to a maximum length
 
 ```toml
 # Type: integer
 # Values: any non-negative integer
 # Default: not set
 
-[buffer.nickname]
-truncate = 10
+[buffer.sender]
+truncate = 12
 ```
 
 ### `hide_consecutive`
 
-Hide nickname if consecutive messages are from the same user.
-
-::: warning
-`hide_consecutive` does not work in conjunction with `alignment = "top"` .
-:::
+Hide the sender label when the previous message came from the same sender.
+`{ smart = <seconds> }` only hides it when the two messages are within that many
+seconds of each other.
 
 #### `enabled`
 
-If specified as `{ smart = integer }` then the nickname will be hidden for consecutive messages
-are from the same user and each is within `smart` seconds of each other.
-
 ```toml
-# Type: boolean
+# Type: boolean or object
 # Values: true, false, or { smart = integer }
 # Default: false
 
-[buffer.nickname.hide_consecutive]
-enabled = true
-
-# hide if the previous message was from the same user and sent within 2m of the current message
-[buffer.nickname.hide_consecutive]
+[buffer.sender.hide_consecutive]
 enabled = { smart = 120 }
 ```
 
 #### `show_after_previews`
 
-Show nicknames after messages with visible image or link previews.
-Note: has no effect when `enabled = false`.
-
 ```toml
 # Type: boolean
 # Values: true, false
 # Default: false
 
-[buffer.nickname.hide_consecutive]
+[buffer.sender.hide_consecutive]
 show_after_previews = true
 ```
 
-## server_messages
-
-Server messages are messages sent from an IRC server.
-
-```toml
-# Hide all join messages except for #halloy channel:
-
-[buffer.server_messages.join]
-exclude = "*"
-include = { channels = ["#halloy"] }
-
-# Hide all part messages
-
-[buffer.server_messages.part]
-enabled = false
-```
-
-### Types
-
-| **Event Type**        | **Description**                                                                                                           |
-| --------------------- | ------------------------------------------------------------------------------------------------------------------------- |
-| `away`                | Message is an automated reply to a direct message, sent when a user is away                                               |
-| `change_host`         | Message is sent when a user changes host                                                                                  |
-| `change_mode`         | Message is sent when a mode is set                                                                                        |
-| `change_nick`         | Message is sent when a user changes nick                                                                                  |
-| `change_topic`        | Message is sent when a channel topic is changed (or the topic is requested via /topic)                                    |
-| `join`                | Message is sent when a user joins a channel                                                                               |
-| `join_topic`          | Message is sent when the client joins a channel (does not include message sent when topic changes)                        |
-| `kick`                | Message is sent when a user is kicked from a channel                                                                      |
-| `invite`              | Message is sent when a user is invited to a channel                                                                       |
-| `monitored_offline`   | Message is sent when a monitored user goes offline                                                                        |
-| `monitored_online`    | Message is sent when a monitored user goes online                                                                         |
-| `part`                | Message is sent when a user leaves a channel                                                                              |
-| `quit`                | Message is sent when a user closes the connection to a channel or server                                                  |
-| `request_topic`       | Message is response to a `/topic` request for the channel topic                                                           |
-| `standard_reply_fail` | Message is sent when a command/function fails or an error with the session                                                |
-| `standard_reply_note` | Message is sent when there is information about a command/function or session                                             |
-| `standard_reply_warn` | Message is sent when there is feedback about a command/function or session                                                |
-| `wallops`             | Message is sent by operators to all users with mode +w on the network                                                     |
-| `default`             | Pseudo-type to provide fallback settings for when a specific event type has not been configured                           |
-
-#### `enabled`
-
-Control if server message type is enabled;  if set to `false` then the received messages can still be revealed when later set to `true`.  For `join_topic` in particular: if set to `"drop"`, then the message is excluded from the channel history entirely (not just hidden).
-
-```toml
-# Type: boolean
-# Values: true, false
-# Default: true (except for join_topic, which is "drop")
-
-[buffer.server_messages.<server_message>]
-enabled = true
-```
-
-#### `smart`
-
-| **Event Type**        | **Behavior**                                                                                                             |
-| --------------------- | ------------------------------------------------------------------------------------------------------------------------ |
-| `away`                | Only show if an `away` message has not been shown in the given time interval (seconds) prior to the new `away` message   |
-| all other types       | Only show server message if the user has sent a message in the given time interval (seconds) prior to the server message |
-
-```toml
-# Type: integer
-# Values: any non-negative integer
-# Default: not set
-
-[buffer.server_messages.<server_message>]
-smart = 180
-```
-
-#### `exclude`
-
-[Exclusion conditions](/configuration/conditions.md) in which the server message
-will be hidden. Inclusion conditions will take precedence over exclusion
-conditions. You can also exclude all conditions by setting to `"all"` or `"*"`.
-
-```toml
-# Type: inclusion/exclusion conditions
-# Values: user, channel, & server inclusion/exclusion conditions
-# Default: not set
-
-[buffer.server_messages.<server_message>]
-exclude = "*"
-```
-
-#### `include`
-
-[Inclusion conditions](/configuration/conditions.md) in which the server message
-will be shown. Server messages will be shown in all conditions (when enabled)
-unless explicitly excluded, so this setting is only relevant when combined with
-the `exclude` setting.
-
-```toml
-# Type: inclusion/exclusion conditions
-# Values: user, channel, & server inclusion/exclusion conditions
-# Default: not set
-
-[buffer.server_messages.<server_message>]
-include = { channels = ["#halloy"] }
-```
-
-#### `dimmed`
-
-Dim server message.  Either automatically, based on text/background colors (by setting to `true`), or specify a dimming value in the range `0.0` (transparent) to `1.0` (no dimming).
-
-```toml
-# Type: bool or float
-# Values: true, false, or float
-# Default: true
-
-[buffer.server_messages.<server_message>]
-dimmed = true
-```
-
 ::: info
-The default server message type (`buffer.server_messages.default`) splits this setting into two categories.  Passive server messages and action server messages, which are designated as follows:
-
-| **Categories**         | Passive                      | Actions               |
-| ---------------------- | ---------------------------- | --------------------- |
-| **Setting**            | `passive_dimmed` or `dimmed` | `actions_dimmed`      |
-| **Default**            | `true`                       | `false`               |
-| **Event Types**        | `away`                       | `change_mode`         |
-|                        | `change_host`                | `change_topic`        |
-|                        | `change_nick`                | `invite`              |
-|                        | `join`                       | `kick`                |
-|                        | `join_topic`                 | `monitored_offline`   |
-|                        | `part`                       | `monitored_online`    |
-|                        | `quit`                       | `request_topic`       |
-|                        |                              | `standard_reply_fail` |
-|                        |                              | `standard_reply_note` |
-|                        |                              | `standard_reply_warn` |
-|                        |                              | `wallops`             |
+The section is also accepted under its IRC-era name, `[buffer.nickname]`.
 :::
-
-#### `username_format`
-
-Adjust the amount of information displayed for a username in server messages. If you choose `"short"`, only the nickname will be shown. If you choose `"full"`, the nickname, username, and hostname (if available) will be displayed.
-
-::: info
-Not all server messages use this setting.
-:::
-
-```toml
-# Type: string
-# Values: "full", "short"
-# Default: "full"
-
-[buffer.server_messages.<server_message>]
-username_format = "full"
-```
-
-### `condense`
-
-Condense multiple consecutive server messages into a single abbreviated message.
-
-#### `messages`
-
- Message type(s) to condense. Supported types:
-
-| **Event Type** | **Symbol** |
-| -------------- | ---------- |
-| `change-host`  | `→`        |
-| `change-nick`  | `→`        |
-| `join`         | `+`        |
-| `part`         | `-`        |
-| `quit`         | `-`        |
-| `kick`         | `!`        |
-
-```toml
-# Type: array of strings
-# Values: ["change-host", "change-nick", "join", "kick", "part", "quit"]
-# Default: ["change-host", "change-nick", "join", "part", "quit"]
-
-[buffer.server_messages.condense]
-messages = ["change-nick", "join", "part", "quit"]
-```
-
-The color and font style of the symbols is taken from the theme setting for that event type. It is recommended that you specify colors for the condensed messages in your [theme](../configuration/themes).  Those colors will be used for the abbreviations used in the condensed messages.  For example, these theme settings could be added:
-
-```toml
-[buffer.server_messages]
-join = "#efff95"
-part = "#ff6b77"
-quit = "#ff6b77"
-```
-
-#### `dimmed`
-
-Dim condensed messages.  Either automatically, based on text/background colors (by setting to `true`), or specify a dimming value in the range `0.0` (transparent) to `1.0` (no dimming).
-
-```toml
-# Type: boolean or float
-# Values: true, false, or float
-# Default: true
-
-[buffer.server_messages.condense]
-dimmed = true
-```
-
-#### `format`
-
-How to format condensed messages:
-
-- `"brief"`:  Only show changes to channel state.  If a user joins then leaves, then do not show any message.  If a user joins, leaves, then joins again, then show that they joined the channel (`+`).
-- `"detailed"`: Include messages that do not change channel state, but do not show repeated events.  If a user joins then leaves, show a condensed message with both events (`+-`).  But, if a user joins and leaves many times in a row, only indicate that they left and re-joined (i.e. still `+-`).
-- `"full"`:  Include all messages in the condensed message.  If a user joins and leaves three times, then show a symbol for each event (`+-+-+-`).
-
-```toml
-# Type: string
-# Values: "brief", "detailed", "full"
-# Default: "brief"
-
-[buffer.server_messages.condense]
-format = "full"
-```
-
-#### `icon`
-
-Marker style for condensed server messages.
-
-```toml
-# Type: string
-# Values: "none", "chevron", "dot"
-# Default: "none"
-
-[buffer.server_messages.condense]
-icon = "chevron"
-```
-
-#### `max`
-
-Maximum number of user entries to show in a condensed group.
-
-```toml
-# Type: integer
-# Default: not set (show all)
-
-[buffer.server_messages.condense]
-max = 20
-```
-
-## `status_message_prefix`
-
-Status message prefix settings.
-
-### `brackets`
-
-Brackets around status message prefix.
-
-```toml
-# Type: string
-# Values: { left = "<any string>", right = "<any string>" }
-# Default: { left = "", right = "" }
-
-[buffer.status_message_prefix]
-brackets = { left = "<", right = ">" }
-```
 
 ## `text_input`
 
@@ -1207,9 +439,9 @@ Control if the text input should auto format the input. By default text is only 
 auto_format = "markdown"
 ```
 
-::: tip
-Token-based formatting is included in `"all"`, in addition to Markdown formatting, which provides underline and color formatting that `"markdown"` does not.
-Read more about [text formatting](/guides/text-formatting).
+::: warning
+`chat_module` carries plain text only, so formatting is a local rendering
+convenience — it is not transmitted.
 :::
 
 ### `key_bindings`
@@ -1259,11 +491,7 @@ kill_to_clipboard = true
 
 ### `max_lines`
 
-Maximum number of lines in a single input.  If [`multiline`](https://ircv3.net/specs/extensions/multiline) is supported by the server then it will be utilized, otherwise messages will be sent individually with [`send_line_delay`](#send_line_delay) milliseconds between them.
-
-::: warning
-In many IRC communities sending multiple lines in quick succession is frowned upon (and may be a bannable offense); be mindful of community norms when using this feature
-:::
+Maximum number of lines in a single input. Longer input is sent as separate messages, [`send_line_delay`](#send_line_delay) milliseconds apart.
 
 ```toml
 # Type: integer
@@ -1276,7 +504,7 @@ max_lines = 5
 
 ### `send_line_delay`
 
-Delay (milliseconds) between each line when sending multiple lines.  When the server does not support SAFERATE messages may be delayed longer due to [anti-flood protections](/configuration/servers#anti_flood).
+Delay (milliseconds) between each line when sending multiple lines. `chat_module` is single-dispatch, so a slow send can delay the following lines further.
 
 ```toml
 # Type: integer
@@ -1306,10 +534,10 @@ Customize autocomplete.
 
 #### `order_by`
 
-Ordering that autocomplete uses to select from matching users.
+Ordering that autocomplete uses to select from matching members.
 
-- `"recent"`: Autocomplete users by their last message in the channel;  the user with most recent message autocompletes first, then increasingly older messages.  Users with no seen messages are matched last, in the order specified by `sort_direction`.
-- `"alpha"`: Autocomplete users based on alphabetical ordering of potential matches.  Ordering is ascending/descending based on `sort_direction`.
+- `"recent"`: Autocomplete members by their last message in the conversation; the member with the most recent message autocompletes first, then increasingly older messages. Members with no seen messages are matched last, in the order specified by `sort_direction`.
+- `"alpha"`: Autocomplete members based on alphabetical ordering of potential matches. Ordering is ascending/descending based on `sort_direction`.
 
 ```toml
 # Type: string
@@ -1338,7 +566,7 @@ sort_direction = "asc"
 
 #### `completion_suffixes`
 
-Sets what suffix is added after autocompleting. The first option is for when a nickname is autocompleted at the beginning of a sentence. The second is for when it's autocompleted in the middle of a sentence.
+Sets what suffix is added after autocompleting. The first option is for when a name is autocompleted at the beginning of a sentence. The second is for when it's autocompleted in the middle of a sentence.
 
 ```toml
 # Type: array of 2 strings
@@ -1347,123 +575,6 @@ Sets what suffix is added after autocompleting. The first option is for when a n
 
 [buffer.text_input.autocomplete]
 completion_suffixes = [": ", " "]
-```
-
-### `nickname`
-
-Customize nickname left of text input
-
-#### `enabled`
-
-Display own nickname next to text input field
-
-```toml
-# Type: boolean
-# Values: true, false
-# Default: true
-
-[buffer.text_input.nickname]
-enabled = true
-```
-
-#### `show_access_levels`
-
-Show access level(s) in front of nickname (`@`, `+`, `~`, etc.).
-
-```toml
-# Type: string
-# Values: "all", "highest", or "none"
-# Default: "highest"
-
-[buffer.text_input.nickname]
-show_access_level = "highest"
-```
-
-## `typing`
-
-Typing settings for channel and query buffers.
-
-### `font_size`
-
-Control the font size of the typing indicator. This also adjusts the height of the typing row when it is shown, and the reserved bottom padding when `style = "padded"`.
-
-```toml
-# Type: integer
-# Values: positive integers
-# Default: not set
-# When omitted, Halloy uses the main configured font size.
-
-[buffer.typing]
-font_size = 12
-```
-
-### `style`
-
-Control how the typing indicator uses vertical space.
-
-```toml
-# Type: string
-# Values: "padded", "popped"
-# Default: "popped"
-
-[buffer.typing]
-style = "padded"
-```
-
-### `share`
-
-Control whether Halloy shares your typing status with other users.
-
-```toml
-# Type: boolean
-# Values: true, false
-# Default: false
-
-[buffer.typing]
-share = false
-```
-
-### `show`
-
-Control whether Halloy shows typing status from other users.
-
-```toml
-# Type: boolean
-# Values: true, false
-# Default: true
-
-[buffer.typing]
-show = true
-```
-
-### `animation`
-
-Configure the animated dots shown next to the typing indicator text.
-
-#### `enabled`
-
-Control whether the animated dots are shown.
-
-```toml
-# Type: boolean
-# Values: true, false
-# Default: true
-
-[buffer.typing.animation]
-enabled = true
-```
-
-#### `size`
-
-Control the size of the animated typing dots. If not set we use `typing.font_size * 0.33`.
-
-```toml
-# Type: integer
-# Values: positive integers
-# Default: not set
-
-[buffer.typing.animation]
-size = 12
 ```
 
 ## `timestamp`
@@ -1498,7 +609,7 @@ context_menu_format = "%x"
 
 ### `copy_format`
 
-Controls the format used when copying the timestamp into the clipboard from its context menu. The expected format is [strftime](https://pubs.opengroup.org/onlinepubs/007908799/xsh/strftime.html).  If not set, then the timestamp is copied in the [date and time of day in UTC using extended format ISO 8601:2004(E) 4.3.2 with millisecond precision](https://en.wikipedia.org/wiki/ISO_8601) as is utilized in IRCv3.
+Controls the format used when copying the timestamp into the clipboard from its context menu. The expected format is [strftime](https://pubs.opengroup.org/onlinepubs/007908799/xsh/strftime.html).  If not set, then the timestamp is copied as [ISO 8601:2004(E) 4.3.2 UTC with millisecond precision](https://en.wikipedia.org/wiki/ISO_8601).
 
 ```toml
 # Type: string
@@ -1570,171 +681,4 @@ Prompt before opening a hyperlink.
 
 [buffer.url]
 prompt_before_open = true
-```
-
-## `redaction`
-
-Customize how redacted messages behave in buffers
-
-### `display`
-
-How to display redacted messages in the buffer.  If displayed as `"dimmed"` then the message will be displayed dimmed and the redaction reason viewable via tooltip.  If displayed as `"redacted"` then the message will be replaced with the redaction reason, and the redcated message can be revealed by clicking on the message.
-
-```toml
-# Type: string
-# Values: "none", "dimmed", "redacted"
-# Default: "none"
-
-[buffer.redaction]
-display = "dimmed"
-```
-
-## `reply`
-
-Customize how reply previews are displayed within a buffer.
-
-### `enabled`
-
-Show reply previews above messages that are replies.
-
-```toml
-# Type: bool
-# Values: true, false
-# Default: true
-
-[buffer.reply]
-enabled = true
-```
-
-### `show_icon`
-
-Show a reply icon next to replies
-
-```toml
-# Type: bool
-# Values: true, false
-# Default: false
-
-[buffer.reply]
-show_icon = true
-```
-
-### `icon_size`
-
-Size of the reply icon.
-
-```toml
-# Type: float
-# Values: positive floats
-# Default: 10.0
-
-[buffer.reply]
-icon_size = 12.0
-```
-
-### `insert_nick`
-
-When replying to `alice`, insert `alice: ` at the start of the input.
-
-This is useful for clients that don't support replies, as they may not otherwise be highlighted.
-
-```toml
-# Type: bool
-# Values: true, false
-# Default: true
-
-[buffer.reply]
-insert_nick = false
-```
-
-### `highlight_hovered_message`
-
-When hovering a reply, highlight the target message if it visible in the buffer. This takes precedence over the tooltip.
-
-```toml
-# Type: bool
-# Values: true, false
-# Default: true
-
-[buffer.reply]
-highlight_hovered_message = false
-```
-
-### `hide_redundant_nicks`
-
-When a reply message starts with `alice: ` and is directed at that same nick, hide the leading mention in the text.
-
-```
-┌── <alice> hi bob
-<bob> alice: hello, alice
-```
-
-becomes
-
-```
-┌── <alice> hi bob
-<bob> hello, alice
-```
-
-```toml
-# Type: bool
-# Values: true, false
-# Default: true
-
-[buffer.reply]
-hide_redundant_nicks = false
-```
-
-### `tooltip`
-
-#### `enabled`
-
-Show a tooltip when hovering a reply.
-
-```toml
-# Type: bool
-# Values: true, false
-# Default: true
-
-[buffer.reply.tooltip]
-enabled = false
-```
-
-#### `delay`
-
-Delay in milliseconds before tooltip appears.
-
-```toml
-# Type: integer
-# Values: non-negative integer
-# Default: 500
-
-[buffer.reply.tooltip]
-delay = 0
-```
-
-#### `max_width`
-
-Maximum width of the hover tooltip in pixels.
-
-```toml
-# Type: float
-# Values: positive float
-# Default: 500.0
-
-[buffer.reply.tooltip]
-max_width = 400.0
-```
-
-#### `max_chars`
-
-Maximum number of characters to show before truncating. Set to `0` to disable.
-
-```toml
-# Type: integer
-# Values: non-negative integer
-# Default: 1024
-
-[buffer.reply.tooltip]
-max_chars = 0
 ```

@@ -4,7 +4,7 @@ Pane settings
 
 ## `restore_on_launch`
 
-Restore the panes that were open when Halloy was last closed when launching the application.
+Restore the panes that were open when Frigicom was last closed when launching the application.
 
 ```toml
 # Type: boolean

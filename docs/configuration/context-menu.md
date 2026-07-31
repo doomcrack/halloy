@@ -9,7 +9,7 @@ Adjust padding for context menu
 ### `entry`
 
 Controls the padding around each entry in context menus.
-The value is an array where the first value is vertical padding and the second is horizontal padding. 
+The value is an array where the first value is vertical padding and the second is horizontal padding.
 
 ```toml
 # Type: array
@@ -18,17 +18,4 @@ The value is an array where the first value is vertical padding and the second i
 
 [context_menu.padding]
 entry = [2, 5]
-```
-
-## `show_user_metadata`
-
-Control whether user metadata is shown in user context menus when metadata is available.
-
-```toml
-# Type: boolean
-# Values: true, false
-# Default: true
-
-[context_menu]
-show_user_metadata = true
 ```

@@ -1,82 +1,44 @@
-# Installing Halloy
+# Installing Frigicom
 
-## Pre-built binaries
+There are no pre-built binaries or packages yet — build from source.
 
-Download pre-built binaries from [GitHub](https://github.com/squidowl/halloy/releases) page.
+## Requirements
 
-### Packaging status
-
-<a href="https://repology.org/project/halloy/versions">
-    <img src="https://repology.org/badge/vertical-allrepos/halloy.svg" alt="Packaging status">
-</a>
-
-### macOS
-
-The following third party repositories are available for macOS
-
-#### Homebrew
-
-```
-brew install --cask halloy 
-```
-
-#### MacPorts
-
-```sh
-sudo port install halloy
-```
-
-### Linux
-
-The following third party repositories are available for Linux
-
-#### Flatpak
-
-[https://flathub.org/apps/org.squidowl.halloy](https://flathub.org/apps/org.squidowl.halloy)
-
-#### Snapcraft
-
-[https://snapcraft.io/halloy](https://snapcraft.io/halloy)
-
-### Windows
-
-#### Winget
-
-```sh
-winget install squidowl.halloy
-```
-
-### Build from source
-
-Clone the Halloy GitHub repository into a directory of your choice and build with cargo.
-
-Requirements:
-
-* [Rust toolchain](https://www.rust-lang.org/tools/install)
-* [Git version control system](https://git-scm.com/)
-* Packages:
+* [Rust toolchain](https://www.rust-lang.org/tools/install) (stable; the
+  workspace tracks recent stable, so `rustup update` first)
+* [Git](https://git-scm.com/)
+* Platform packages:
   - Fedora-based distributions: `alsa-lib-devel openssl-devel libxcb-devel`
   - Debian-based distributions: `librust-alsa-sys-dev libssl-dev libxcb1-dev`
+* The Logos artifacts — `liblogos_protocol`, the `logoscore` binary, and the
+  staged module directory. Both [Nix](https://nixos.org/download/) dev shells
+  in the repository provide them; see below.
+
+## Build
 
 ```sh
-# Clone the repository
-git clone https://github.com/squidowl/halloy.git
-
+git clone https://github.com/doomcrack/halloy.git
 cd halloy
 
-# Build and run
-cargo build --release
-cargo run --release
+# Logos artifacts on the environment (either one):
+nix develop
+# ... or, without nix:
+. scripts/dev-env.sh
+
+cargo build --release --features live
+cargo run --release --features live
 ```
 
-#### Install from Source
+The `live` feature links `liblogos_protocol` and is **not** enabled by default,
+because it needs `LOGOS_PROTOCOL_ROOT` at build time. Without it the binary can
+only drive the scripted mock — see [`[logos] mock`](./configuration/logos.md#mock).
 
-The script `install-linux.sh` in the `scripts` directory of the Halloy repository will build and install Halloy on Linux systems (with the same requirements as building from source).  By default the script will install Halloy in the `~/.local/` base directory (i.e. the executable will be put in `~/.local/bin/`).  To change the installation base directory, provide `install-linux.sh` with the long flag <nobr>`--prefix=<base/directory>`</nobr>.
+## UI-only build
+
+For UI work no daemon, dylib, or nix is required:
 
 ```sh
-git clone https://github.com/squidowl/halloy.git
-
-cd halloy
-
-./scripts/install-linux.sh --prefix=<base/directory>
+cargo run
 ```
+
+with `mock = true` under `[logos]` in your `config.toml`.

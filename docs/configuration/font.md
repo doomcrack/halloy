@@ -7,7 +7,7 @@ Changes to font settings require an application restart to take effect.
 :::
 
 ::: info
-If Halloy is unable to load the specified font, stretch, & weight, an fallback font may be used.  If the font looks wrong, double-check the family name and that the font family has the specified stretch & weight.
+If Frigicom is unable to load the specified font, stretch, & weight, an fallback font may be used.  If the font looks wrong, double-check the family name and that the font family has the specified stretch & weight.
 :::
 
 ## `family`
@@ -23,8 +23,8 @@ Variable-weight fonts are not currently supported.
 # Values: any string
 # Default: not set
 #
-# Note: With the default `iosevka-font` feature enabled, Halloy
-# uses Iosevka Term by default. Without that feature, Halloy falls back
+# Note: With the default `iosevka-font` feature enabled, Frigicom
+# uses Iosevka Term by default. Without that feature, Frigicom falls back
 # to the system monospace font.
 
 [font]

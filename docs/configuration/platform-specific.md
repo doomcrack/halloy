@@ -1,6 +1,6 @@
 # Platform Specific
 
-Platform specific settings for Halloy.
+Platform specific settings for Frigicom.
 
 - [Linux](#linux)
 - [macOS](#macos)

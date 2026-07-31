@@ -8,43 +8,23 @@ Customize and enable notifications.
 [notifications]
 direct_message = { sound = "peck", show_toast = true }
 
-[notifications.highlight]
+[notifications.group_invite]
 sound = "dong"
-exclude = { users = ["NickServ"], channels = ["#halloy"] }
+show_toast = true
 ```
 
 ## Types
 
-Following notifications are available:
+The following notifications are available:
 
-| Name                    | Description                                          | Content      |
-| ----------------------- | ---------------------------------------------------- | ------------ |
-| `channel`               | Triggered when a message is received in a channel    | Message text |
-| `connected`             | Triggered when a server is connected                 | N/A          |
-| `direct_message`        | Triggered when a direct message is received          | Message text |
-| `disconnected`          | Triggered when a server disconnects                  | N/A          |
-| `file_transfer_request` | Triggered when a file transfer request is received   | File name    |
-| `highlight`             | Triggered when highlighted in a buffer or replied to | Message text |
-| `monitored_online`      | Triggered when a user you're monitoring is online    | N/A          |
-| `monitored_offline`     | Triggered when a user you're monitoring is offline   | N/A          |
-| `reconnected`           | Triggered when a server reconnects                   | N/A          |
-| `reaction`              | Triggered when another user reacts to your message   | Message text |
-
-::: info
-
-`channel` is an array of tables, with each entry a notification for a single
-channel. For example, the following shows a toast notification for every
-message in `#halloy`:
-
-```toml
-[notifications.channel."#halloy"]
-show_toast = true
-# these two options will restrict the notifications to a server named "Libera"
-exclude = "*"
-include = { servers = ["Libera"] }
-```
-
-:::
+| Name             | Description                                              | Content      |
+| ---------------- | -------------------------------------------------------- | ------------ |
+| `direct_message` | Triggered when a message is received in a direct conversation | Message text |
+| `group_message`  | Triggered when a message is received in a group conversation  | Message text |
+| `group_invite`   | Triggered when you are added to a group conversation      | Group name   |
+| `connected`      | Triggered when the backend first comes online            | N/A          |
+| `disconnected`   | Triggered when the backend leaves the online state       | N/A          |
+| `reconnected`    | Triggered when the backend comes back online             | N/A          |
 
 ## Built-in Sounds
 
@@ -66,17 +46,17 @@ The following table shows all available built-in sounds
 
 ## `sound`
 
-Notification sound. Supports both built-in sounds, and external sound files
-(`mp3`, `ogg`, `flac` or `wav` placed inside the `sounds` folder within the
-[configuration directory](/configuration#directory)).
+Notification sound. Supports both built-in sounds and external sound files
+(`.ogg`, `.mp3`, `.flac`, `.wav`) placed in a `sounds` folder inside the
+[configuration directory](/configuration#directory).
 
 ```toml
 # Type: string
 # Values: see above for built-in sounds, eg: "zone" or external sound.
 # Default: not set
 
-[notifications.<notification>]
-sound = "zone"
+[notifications.direct_message]
+sound = "peck"
 ```
 
 ## `show_toast`
@@ -88,93 +68,46 @@ Notification should trigger a OS toast.
 # Values: true, false
 # Default: false
 
-[notifications.<notification>]
+[notifications.direct_message]
 show_toast = true
 ```
 
 ## `request_attention`
 
-Notification should request user attention for its window (aka urgency). Exact
-behavior is platform specific:
-
-- macOS: Bounces the dock icon once.
-- Windows: Flashes the taskbar button until the application is in focus.
-- Linux: Depends on the desktop environment.
+Request attention from the OS (bounce the dock icon on macOS, flash the
+taskbar entry on Windows and Linux) when the window is not focused.
 
 ```toml
 # Type: boolean
 # Values: true, false
 # Default: false
 
-[notifications.<notification>]
+[notifications.direct_message]
 request_attention = true
 ```
 
 ## `show_content`
 
-Notification should show the content of the trigger (as described in the [table above](#types))).
+Include the message content in the OS toast.
 
 ```toml
 # Type: boolean
 # Values: true, false
 # Default: false
 
-[notifications.<notification>]
+[notifications.direct_message]
 show_content = true
 ```
 
 ## `delay`
 
-Delay in milliseconds before triggering the next notification.
+Minimum delay in milliseconds between two notifications of this type.
 
 ```toml
 # Type: integer
 # Values: any non-negative integer
 # Default: 500
 
-[notifications.<notification>]
+[notifications.direct_message]
 delay = 250
-```
-
-## `exclude`
-
-[Exclusion conditions](/configuration/conditions.md) in which you won't be
-notified. Inclusion conditions will take precedence over exclusion conditions.
-You can also exclude all conditions by setting to `"all"` or `"*"`.
-
-Only available for `channel`, `direct_message`, `file_transfer_request`, and
-`highlight` notifications.
-
-```toml
-# Type: inclusion/exclusion conditions
-# Values: any inclusion/exclusion conditions
-# Default: not set
-
-[notifications.<direct_message|file_transfer_request>]
-exclude = { users = ["HalloyUser1"] }
-
-[notifications.highlight]
-exclude = { users = ["HalloyUser1", "#halloy"] }
-```
-
-## `include`
-
-[Inclusion conditions](/configuration/conditions.md) in which you will be
-notified. Notifications are enabled in all conditions unless explicitly
-excluded, so this setting is only relevant when combined with the `exclude`
-setting.
-
-Only available for `channel`, `direct_message`, `file_transfer_request`, and
-`highlight` notifications.
-
-```toml
-# Type: inclusion/exclusion conditions
-# Values: any inclusion/exclusion conditions
-# Default: not set
-
-[notifications.<direct_message|file_transfer_request>]
-include = { users = ["HalloyUser1"] }
-
-[notifications.highlight]
-include = { users = ["HalloyUser1", "#halloy"] }
 ```

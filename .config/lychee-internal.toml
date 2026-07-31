@@ -7,4 +7,4 @@ exclude_path = ["docs/node_modules/**", "docs/.vitepress/**"]
 include_fragments = "full"
 
 exclude_all_private = true
-exclude = [ '^http://.*', '^https://.*', '^irc://.*', '^ircs://.*' ]
+exclude = [ '^http://.*', '^https://.*' ]

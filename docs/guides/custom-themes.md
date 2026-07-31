@@ -1,6 +1,6 @@
 # Custom themes
 
-To create a custom theme for Halloy, simply place a theme file (with a `.toml` extension) inside the `themes` folder within the [configuration directory](/configuration#directory).
+To create a custom theme for Frigicom, simply place a theme file (with a `.toml` extension) inside the `themes` folder within the [configuration directory](/configuration#directory).
 
 ```toml
 # Consider we have a theme called "foobar.toml" inside the themes folder.
@@ -11,7 +11,7 @@ theme = "foobar"
 ```
 
 ::: tip
-Halloy has a built in theme editor which makes theme creation easier
+Frigicom has a built in theme editor which makes theme creation easier
 :::
 
  Each `"<color string>"` is expected to be a valid hex color. If invalid, or if
@@ -123,25 +123,39 @@ default = <text style>
 # pink = "<color string>"
 # grey = "<color string>"
 # lightgrey = "<color string>"
+
+[avatars]
+# Optional avatar gradient overrides. Any stop left unset falls back to
+# a pair derived from the theme palette (hue-rotated from
+# `buffer.nickname`), so every theme works without this section.
+# `self_ramp` colors this account's own avatar; `ink` is the color of
+# initials/glyphs drawn on the gradients.
+#
+# ramp1 = { start = "<color string>", end = "<color string>" }
+# ramp2 = { start = "<color string>", end = "<color string>" }
+# ramp3 = { start = "<color string>", end = "<color string>" }
+# ramp4 = { start = "<color string>", end = "<color string>" }
+# ramp5 = { start = "<color string>", end = "<color string>" }
+# self_ramp = { start = "<color string>", end = "<color string>" }
+# ink = "<color string>"
 ```
 
-More information on formatting colors is available in the [text formatting guide](/guides/text-formatting.md).
 
 ::: info
-The default Ferra theme toml file can be viewed [on GitHub](https://github.com/squidowl/halloy/blob/main/assets/themes/ferra.toml).
+The default Ferra theme toml file can be viewed [on GitHub](https://github.com/doomcrack/halloy/blob/main/assets/themes/ferra.toml).
 :::
 
 ## Base16
 
 The [base16](https://github.com/chriskempson/base16) color scheme framework
 includes hundreds of color schemes build using 16 colors. These color schemes have
-are compiled for Halloy in the
+are compiled for Frigicom in the
 [`4e554c4c/base16-halloy`](https://github.com/4e554c4c/base16-halloy)
 repository.
 
 To use these themes, download `themes.tar.gz` from the
 [latest release](https://github.com/4e554c4c/base16-halloy/releases/latest)
-and unpack it to the `themes` folder in the Halloy configuration directory. Then
+and unpack it to the `themes` folder in the Frigicom configuration directory. Then
 you can enable themes individually in `config.toml`.
 
 ### Example

@@ -1,6 +1,6 @@
 # Preview
 
-URL preview settings for Halloy.
+URL preview settings for Frigicom.
 
 ## `enabled`
 
@@ -76,12 +76,6 @@ max_per_message = 1
 ## `card`
 
 Specific card preview settings.
-
-```toml
-[preview.card]
-exclude = "*" # hide card previews in all channels
-include = { channels = ["#halloy"] } # show card previews in #halloy
-```
 
 ### `hide_url`
 
@@ -186,37 +180,6 @@ Action when clicking on the card preview image.
 image_action = "preview"
 ```
 
-### `exclude`
-
-[Exclusion conditions](/configuration/conditions.md) for when card previews will
-be hidden. Inclusion conditions will take precedence over exclusion conditions.
-You can also exclude all conditions by setting to `"all"` or `"*"`.
-
-```toml
-# Type: inclusion/exclusion conditions
-# Values: any inclusion/exclusion conditions
-# Default: not set
-
-[preview.card]
-exclude = { criteria = [{ server_message = "topic", channel = "#linux" }] } # exclude previews from topic messages in #linux
-```
-
-### `include`
-
-[Inclusion conditions](/configuration/conditions.md) for when card previews will
-be shown. Card previews will be shown for all conditions (when enabled) unless
-explicitly excluded, so this setting is only relevant when combined with the
-`exclude` setting.
-
-```toml
-# Type: inclusion/exclusion conditions
-# Values: any inclusion/exclusion conditions
-# Default: not set
-
-[preview.card]
-include = { users = ["BridgeBot"] }
-```
-
 ### `description_decode_html`
 
 `og:description` is always a string, but due to it being in HTML it needs to be
@@ -255,12 +218,6 @@ description_decode_html = [
 ## `image`
 
 Specific image preview settings.
-
-```toml
-[preview.image]
-exclude = "*" # hide image previews in all channels
-include = { channels = ["#halloy"] } # show image previews in #halloy
-```
 
 ### `action`
 
@@ -333,44 +290,13 @@ Maximum height of the image in pixels.
 max_height = 350.0
 ```
 
-### `exclude`
-
-[Exclusion conditions](/configuration/conditions.md) for when image previews
-will be hidden. Inclusion conditions will take precedence over exclusion
-conditions. You can also exclude all conditions by setting to `"all"` or `"*"`.
-
-```toml
-# Type: inclusion/exclusion conditions
-# Values: any inclusion/exclusion conditions
-# Default: not set
-
-[preview.image]
-exclude = { criteria = [{ server_message = "topic", channel = "#linux" }] } # exclude previews from topic messages in #linux
-```
-
-### `include`
-
-[Inclusion conditions](/configuration/conditions.md) for when image previews
-will be shown. Image previews will be shown for all conditions (when enabled)
-unless explicitly excluded, so this setting is only relevant when combined with
-the `exclude` setting.
-
-```toml
-# Type: inclusion/exclusion conditions
-# Values: any inclusion/exclusion conditions
-# Default: not set
-
-[preview.image]
-include = { users = ["BridgeBot"] }
-```
-
 ## `image_cache`
 
 Settings to control how the image cache is managed. The cache is stored in:
 
-- Windows: `%AppData%\Roaming\Local\halloy\previews\images\`
-- Mac: `~/Library/Caches/halloy/previews/images/` or `$HOME/.cache/halloy/previews/images/`
-- Linux: `$XDG_CACHE_HOME/halloy/previews/images/`, `$HOME/.cache/halloy/previews/images/`, or `$HOME/.var/app/org.squidowl.halloy/cache/halloy/previews/images/` (Flatpak)
+- Windows: `%AppData%\Roaming\Local\frigicom\previews\images\`
+- Mac: `~/Library/Caches/frigicom/previews/images/`
+- Linux: `$XDG_CACHE_HOME/frigicom/previews/images/` or `$HOME/.cache/frigicom/previews/images/`
 
 ### `max_size`
 

@@ -1,65 +1,36 @@
-# Halloy
+# Frigicom
 
-An open-source IRC client for Mac, Windows, and Linux, focused on being simple and fast.
+A standalone desktop chat client for the Logos network, built with Rust and
+[iced](https://github.com/iced-rs/iced/).
 
-<br />
-<img src="./images/banner.png" style="display: block; width: 100%; margin: 0;" alt="Halloy banner">
-<img src="./images/animation.gif" style="display: block; width: 100%; margin: 0;" alt="Halloy in action">
+::: warning
+Pre-alpha. Identity is ephemeral upstream — `chat_module` mints a new address
+on every start and its persistence is compiled off, so conversations and
+messages do not survive a restart.
+:::
 
-## Cross platform
+## What it is
 
-Halloy is a native desktop IRC client built with Rust and the [iced](https://github.com/iced-rs/iced/) GUI library. We use a single codebase to build natively to both Linux, macOS and Windows. See [Installation guide](./installation.md) to get started.
+Frigicom talks to `logos-chat-module` through a **private `logoscore` daemon**
+that it starts and stops with the app. There are no servers to configure and
+nothing to log into: the [`[logos]` section](./configuration/logos.md) points
+the app at the daemon and the module artifacts, and the app does the rest.
 
-## Free and open source
+It is a fork of [halloy](https://github.com/squidowl/halloy), an IRC client, and
+keeps its chrome — panes, sidebar, themes, keyboard navigation. The IRC stack
+underneath has been replaced.
 
-Halloy is free and open source. You can find the source code as well as report issues and feature requests on [GitHub](https://github.com/squidowl/halloy).
+## Getting started
 
+Frigicom is not packaged yet. See [Installation](./installation.md) for building
+from source, then [Getting Started](./getting-started.md).
 
 ## Customization
 
-Halloy is configured through a `config.toml` file. From servers and notifications to themes, fonts, panes, and keyboard shortcuts, there are many options available to tune Halloy to your liking. See [Configuration](./configuration.md) to get started.
+Frigicom is configured through a `config.toml` file. From the backend and
+notifications to themes, fonts, panes, and keyboard shortcuts, there are many
+options available. See [Configuration](./configuration.md) to get started.
 
-## IRCv3 Capabilities
+## License
 
-We strive to be a leading irc client with a rich IRCv3 feature set. Currently supported capabilities:
-
-- [account-notify](https://ircv3.net/specs/extensions/account-notify)
-- [away-notify](https://ircv3.net/specs/extensions/away-notify)
-- [batch](https://ircv3.net/specs/extensions/batch)
-- [bot mode](https://ircv3.net/specs/extensions/bot-mode)
-- [cap-notify](https://ircv3.net/specs/extensions/capability-negotiation.html#cap-notify)
-- [channel-context](https://ircv3.net/specs/client-tags/channel-context)
-- [chathistory](https://ircv3.net/specs/extensions/chathistory)
-- [chghost](https://ircv3.net/specs/extensions/chghost)
-- [echo-message](https://ircv3.net/specs/extensions/echo-message)
-- [extended-join](https://ircv3.net/specs/extensions/extended-join)
-- [invite-notify](https://ircv3.net/specs/extensions/invite-notify)
-- [labeled-response](https://ircv3.net/specs/extensions/labeled-response)
-- [message-redaction](https://ircv3.net/specs/extensions/message-redaction)
-- [message-tags](https://ircv3.net/specs/extensions/message-tags)
-- [metadata](https://ircv3.net/specs/extensions/metadata)
-  - `display-name`
-  - `avatar`
-  - `pronouns`
-  - `homepage`
-  - `color`
-  - `status`
-- [Monitor](https://ircv3.net/specs/extensions/monitor)
-- [msgid](https://ircv3.net/specs/extensions/message-ids)
-- [multi-prefix](https://ircv3.net/specs/extensions/multi-prefix)
-- [multiline](https://ircv3.net/specs/extensions/multiline)
-- [network-icon](https://ircv3.net/specs/extensions/network-icon)
-- [no-implicit-names](https://ircv3.net/specs/extensions/no-implicit-names)
-- [react](https://ircv3.net/specs/client-tags/react.html)
-- [read-marker](https://ircv3.net/specs/extensions/read-marker)
-- [reply](https://ircv3.net/specs/client-tags/reply)
-- [sasl-3.1](https://ircv3.net/specs/extensions/sasl-3.1)
-- [server-time](https://ircv3.net/specs/extensions/server-time)
-- [setname](https://ircv3.net/specs/extensions/setname.html)
-- [Standard Replies](https://ircv3.net/specs/extensions/standard-replies)
-- [typing](https://ircv3.net/specs/client-tags/typing)
-- [userhost-in-names](https://ircv3.net/specs/extensions/userhost-in-names)
-- [`UTF8ONLY`](https://ircv3.net/specs/extensions/utf8-only)
-- [`WHOX`](https://ircv3.net/specs/extensions/whox)
-- [`soju.im/bouncer-networks`](https://soju.im/bouncer-networks)
-- [`soju.im/filehost`](https://soju.im/filehost)
+Frigicom is released under GPL-3.0-or-later, inherited from halloy.

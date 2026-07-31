@@ -1,23 +1,21 @@
 # Configuration
 
-Halloy uses a TOML file for configuration called `config.toml`.  The specification for the configuration file format ([TOML](https://toml.io/)) can be found at [https://toml.io/](https://toml.io/).
+Frigicom uses a TOML file for configuration called `config.toml`.  The specification for the configuration file format ([TOML](https://toml.io/)) can be found at [https://toml.io/](https://toml.io/).
 
-A default file is created in the [configuration directory](#directory) when you launch Halloy for the first time.
+A default file is created in the [configuration directory](#directory) when you launch Frigicom for the first time.
 
 ::: tip
 Most configuration changes can be applied by reloading the configuration file from the sidebar menu, [keyboard shortcut](./configuration/keyboard.md), or the command bar
 :::
 
-See the following guides for example configurations:
-- [Example Server Configurations](./guides/example-server-configurations.md)
-- [Multiple Servers](./guides/multiple-servers.md)
-- [Connect with soju](./guides/connect-with-soju.md)
-- [Connect with ZNC](./guides/connect-with-znc.md)
+The backend is configured in the [`[logos]` section](./configuration/logos.md) — that is where the daemon, the modules directory, and the mock driver are set.
 
 ## Directory
 
 The location of the configuration directory depends on your system:
 
-* Windows: `%AppData%\halloy`
-* Mac: `~/Library/Application Support/halloy` or `$HOME/.config/halloy`
-* Linux: `$XDG_CONFIG_HOME/halloy`, `$HOME/.config/halloy` or `$HOME/.var/app/org.squidowl.halloy/config` (Flatpak)
+* Windows: `%AppData%\frigicom`
+* Mac: `~/Library/Application Support/frigicom` or `$HOME/.config/frigicom`
+* Linux: `$XDG_CONFIG_HOME/frigicom` or `$HOME/.config/frigicom`
+
+Placing a `config.toml` next to the executable, or setting `FRIGICOM_PORTABLE_DIR`, switches to [portable mode](./guides/portable-mode.md) and uses that directory for both config and data.

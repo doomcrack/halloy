@@ -1,11 +1,15 @@
 # Portable Mode
 
-To enable portable mode for Halloy, simply place the `config.toml` file in the same directory as the running executable.
+To enable portable mode, place the `config.toml` file in the same directory as
+the running executable.
 
 ```
 .
-├── Halloy.app
+├── frigicom
 └── config.toml
 ```
 
-Or you can set the `HALLOY_PORTABLE_DIR` environment variable to a valid directory path explicitly.
+Or set the `FRIGICOM_PORTABLE_DIR` environment variable to a valid directory
+path explicitly. Both config and data (including the private
+[logoscore instance directory](../configuration/logos.md#instance_dir)) then
+live in that directory.
