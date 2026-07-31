@@ -27,3 +27,10 @@
 /docs/node_modules/
 /docs/.vitepress/cache/
 /docs/.vitepress/dist/
+
+# Nix build results
+/result
+/result-*
+
+# Dev-shell GC roots (see scripts/dev-env.sh, $FRIGICOM_ARTIFACTS)
+/.gcroots/
