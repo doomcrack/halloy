@@ -17,6 +17,9 @@ required-features = ["message_tests"]
 [features]
 tor = ["irc/tor"]
 message_tests = ["iced/tokio"]
+# Pulls the lp_* FFI transport into the session state machine; the final
+# binary must then link liblogos_protocol (see the workspace build.rs).
+live = ["logos-chat/ffi"]
 
 [dependencies]
 thiserror = { workspace = true }
@@ -57,6 +60,7 @@ hex = "0.4.3"
 iced_core = "0.15.0-dev"
 iced_wgpu = "0.15.0-dev"
 indexmap = { version = "2.14", features = ["std", "serde"] }
+logos-chat = { version = "0.1.0", path = "../logos/chat", default-features = false }
 seahash = "4.1.0"
 serde_json = "1.0"
 serde_ignored = "0.1"

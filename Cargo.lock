@@ -1582,6 +1582,7 @@ dependencies = [
  "itertools 0.15.0",
  "keyring-core",
  "log",
+ "logos-chat",
  "mime_guess",
  "nom 8.0.0",
  "nucleo-matcher",
