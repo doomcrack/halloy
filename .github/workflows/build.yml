@@ -76,6 +76,14 @@ jobs:
       - run: cargo version
       - name: Check
         run: cargo check --locked --profile ci
+      # `live`/`ffi` link liblogos_protocol, which no runner has, so they
+      # are opt-in features and every step that LINKS leaves them off.
+      # `cargo check` and `clippy` never link, so the FFI paths still get
+      # type-checked here.
+      - name: Check (live backend)
+        run: |
+          cargo check --locked --profile ci -p frigicom --features live --all-targets
+          cargo check --locked --profile ci -p logos-chat --features ffi --all-targets
       - name: Clippy
         run: cargo clippy --locked --profile ci --workspace --all-targets -- -D warnings
 

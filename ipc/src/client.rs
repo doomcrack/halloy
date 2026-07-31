@@ -1,27 +1,24 @@
-use std::io::{self, Write};
+//! Hands a payload to the instance that already owns a state directory.
+
+use std::io::Write;
+use std::path::Path;
 
 use interprocess::local_socket::LocalSocketStream;
 
-use super::server;
+use crate::server::socket_name;
 
-#[cfg(not(windows))]
-fn connect() -> Result<LocalSocketStream, io::Error> {
-    futures::executor::block_on(server::with_socket_path(|path| async {
-        LocalSocketStream::connect(path)
-    }))
-}
+/// Sends `payload` to the instance owning `state_dir`. Closing the stream
+/// is what ends the read on the other side, so nothing is framed.
+pub fn connect_and_send(state_dir: &Path, payload: impl AsRef<[u8]>) -> bool {
+    match LocalSocketStream::connect(socket_name(state_dir)) {
+        Ok(mut stream) => stream
+            .write_all(payload.as_ref())
+            .and_then(|()| stream.flush())
+            .is_ok(),
+        Err(error) => {
+            log::warn!("instance handoff failed: {error}");
 
-#[cfg(windows)]
-fn connect() -> Result<LocalSocketStream, io::Error> {
-    let register_path = server::server_path_register_path();
-    let client_path = std::fs::read_to_string(register_path)?;
-
-    LocalSocketStream::connect(client_path)
-}
-
-pub fn connect_and_send(url: impl AsRef<[u8]>) -> bool {
-    match connect() {
-        Ok(mut conn) => conn.write_all(url.as_ref()).is_ok(),
-        Err(_) => false,
+            false
+        }
     }
 }

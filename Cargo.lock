@@ -900,12 +900,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "8ae3f5d315924270530207e2a68396c3cc547f6dca3fbdca317cfb1a51edb593"
 
 [[package]]
-name = "bytesize"
-version = "2.4.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "49e78e506b9d7633710dab98996f22f95f3d0f488e8f1aa162830556ed9fc14d"
-
-[[package]]
 name = "calloop"
 version = "0.13.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2420,6 +2414,45 @@ dependencies = [
 ]
 
 [[package]]
+name = "frigicom"
+version = "0.1.0"
+dependencies = [
+ "chrono",
+ "data",
+ "embed-resource 3.0.9",
+ "emojis",
+ "fern",
+ "futures",
+ "iced",
+ "image",
+ "ipc",
+ "itertools 0.15.0",
+ "log",
+ "logos-client",
+ "mundy",
+ "notify-rust",
+ "nucleo-matcher",
+ "objc2 0.6.4",
+ "objc2-app-kit 0.3.2",
+ "objc2-foundation 0.3.2",
+ "open",
+ "palette",
+ "rfd",
+ "rodio",
+ "rustls",
+ "serde_json",
+ "signal-hook",
+ "strsim 0.11.1",
+ "strum",
+ "thiserror 2.0.18",
+ "tokio",
+ "tokio-stream",
+ "unicode-segmentation",
+ "url",
+ "windows_exe_info",
+]
+
+[[package]]
 name = "fs-mistrust"
 version = "0.15.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2787,55 +2820,6 @@ dependencies = [
  "crunchy",
  "num-traits",
  "zerocopy",
-]
-
-[[package]]
-name = "halloy"
-version = "0.1.0"
-dependencies = [
- "anyhow",
- "bytesize",
- "chrono",
- "const_format",
- "data",
- "dirs-next",
- "embed-resource 3.0.9",
- "emojis",
- "fern",
- "futures",
- "humantime",
- "iced",
- "image",
- "ipc",
- "irc",
- "itertools 0.15.0",
- "log",
- "mundy",
- "notify-rust",
- "nucleo-matcher",
- "objc2 0.6.4",
- "objc2-app-kit 0.3.2",
- "objc2-foundation 0.3.2",
- "open",
- "palette",
- "percent-encoding",
- "rand 0.10.1",
- "rand_chacha 0.10.0",
- "reqwest",
- "rfd",
- "rodio",
- "signal-hook",
- "strsim 0.11.1",
- "strum",
- "thiserror 2.0.18",
- "timeago",
- "tokio",
- "tokio-stream",
- "unicode-segmentation",
- "uptime_lib",
- "url",
- "uuid",
- "windows_exe_info",
 ]
 
 [[package]]
@@ -3583,7 +3567,6 @@ dependencies = [
  "spinning",
  "thiserror 1.0.69",
  "to_method",
- "tokio",
  "winapi",
 ]
 
@@ -3606,15 +3589,9 @@ dependencies = [
 name = "ipc"
 version = "0.1.0"
 dependencies = [
- "data",
  "futures",
  "interprocess",
  "log",
- "rand 0.10.1",
- "rand_chacha 0.10.0",
- "thiserror 2.0.18",
- "tokio",
- "url",
 ]
 
 [[package]]
@@ -3678,15 +3655,6 @@ checksum = "173609498df190136aa7dea1a91db051746d339e18476eed5ca40521f02d7aa5"
 dependencies = [
  "is-docker",
  "once_cell",
-]
-
-[[package]]
-name = "isolang"
-version = "2.4.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "fe50d48c77760c55188549098b9a7f6e37ae980c586a24693d6b01c3b2010c3c"
-dependencies = [
- "phf 0.11.3",
 ]
 
 [[package]]
@@ -7542,16 +7510,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "timeago"
-version = "0.6.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "e86660b0935ca5912eb155f5b3794e2f8f1a09d8c00c9efd5c1075ca26403638"
-dependencies = [
- "chrono",
- "isolang",
-]
-
-[[package]]
 name = "tiny-skia"
 version = "0.11.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -9121,17 +9079,6 @@ name = "unty"
 version = "0.0.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "6d49784317cd0d1ee7ec5c716dd598ec5b4483ea832a2dced265471cc0f690ae"
-
-[[package]]
-name = "uptime_lib"
-version = "0.3.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "9e64b558561f12a171bbea5325c3f24f129db371adee1d7ae93b6e310bd69192"
-dependencies = [
- "libc",
- "thiserror 1.0.69",
- "windows 0.57.0",
-]
 
 [[package]]
 name = "url"
