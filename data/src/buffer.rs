@@ -1,35 +1,28 @@
-use core::fmt;
 use std::str::FromStr;
 
 use chrono::Locale;
 use iced_core::Color as IcedColor;
 use serde::{Deserialize, Deserializer, Serialize};
 
+pub mod conversation;
 pub mod timestamp;
 
 pub use self::timestamp::Timestamp;
 use crate::appearance::theme::hex_to_color;
+use crate::config;
+use crate::conversation::ConvoId;
 use crate::serde::deserialize_strftime_date;
-use crate::target::{self, Target};
-use crate::{Server, channel, config};
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
-#[serde(untagged)]
+#[serde(tag = "type", content = "id", rename_all = "kebab-case")]
 pub enum Buffer {
-    Upstream(Upstream),
+    Conversation(ConvoId),
     Internal(Internal),
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
-pub enum Upstream {
-    Server(Server),
-    Channel(Server, target::Channel),
-    Query(Server, target::Query),
-}
-
-impl From<Upstream> for Buffer {
-    fn from(upstream: Upstream) -> Self {
-        Self::Upstream(upstream)
+impl From<ConvoId> for Buffer {
+    fn from(convo_id: ConvoId) -> Self {
+        Self::Conversation(convo_id)
     }
 }
 
@@ -42,6 +35,7 @@ impl From<Internal> for Buffer {
 #[derive(
     Debug,
     Clone,
+    Copy,
     PartialEq,
     Eq,
     Hash,
@@ -51,14 +45,7 @@ impl From<Internal> for Buffer {
     strum::IntoStaticStr,
 )]
 pub enum Internal {
-    #[strum(serialize = "File Transfers")]
-    FileTransfers,
     Logs,
-    Highlights,
-    #[strum(serialize = "Channel Monitor")]
-    ChannelMonitor,
-    #[strum(serialize = "Channel Discovery")]
-    ChannelDiscovery(Option<Server>),
     #[strum(serialize = "Config Editor")]
     ConfigEditor,
 }
@@ -66,14 +53,14 @@ pub enum Internal {
 impl Buffer {
     pub fn key(&self) -> String {
         match self {
-            Buffer::Upstream(upstream) => upstream.key(),
+            Buffer::Conversation(convo_id) => format!("convo:{convo_id}"),
             Buffer::Internal(internal) => internal.key(),
         }
     }
 
-    pub fn upstream(&self) -> Option<&Upstream> {
-        if let Self::Upstream(upstream) = self {
-            Some(upstream)
+    pub fn convo_id(&self) -> Option<&ConvoId> {
+        if let Self::Conversation(convo_id) = self {
+            Some(convo_id)
         } else {
             None
         }
@@ -88,67 +75,12 @@ impl Buffer {
     }
 }
 
-impl Upstream {
-    pub fn key(&self) -> String {
-        match self {
-            Upstream::Server(server) => format!("server:{server}"),
-            Upstream::Channel(server, channel) => {
-                format!("server:{server}:{}", channel.as_str())
-            }
-            Upstream::Query(server, query) => {
-                format!("server:{server}:{}", query.as_str())
-            }
-        }
-    }
-
-    pub fn server(&self) -> &Server {
-        match self {
-            Self::Server(server)
-            | Self::Channel(server, _)
-            | Self::Query(server, _) => server,
-        }
-    }
-
-    pub fn channel(&self) -> Option<&target::Channel> {
-        match self {
-            Self::Channel(_, channel) => Some(channel),
-            Self::Server(_) | Self::Query(_, _) => None,
-        }
-    }
-
-    pub fn target(&self) -> Option<Target> {
-        match self {
-            Self::Channel(_, channel) => Some(Target::Channel(channel.clone())),
-            Self::Query(_, query) => Some(Target::Query(query.clone())),
-            Self::Server(_) => None,
-        }
-    }
-
-    pub fn query(&self) -> Option<Target> {
-        match self {
-            Self::Query(_, query) => Some(Target::Query(query.clone())),
-            _ => None,
-        }
-    }
-}
-
 impl Internal {
-    pub const ALL: &'static [Self] = &[
-        Self::FileTransfers,
-        Self::Logs,
-        Self::Highlights,
-        Self::ChannelMonitor,
-        Self::ChannelDiscovery(None),
-        Self::ConfigEditor,
-    ];
+    pub const ALL: &'static [Self] = &[Self::Logs, Self::ConfigEditor];
 
     pub fn key(&self) -> String {
         match self {
-            Internal::FileTransfers => "file-transfers",
             Internal::Logs => "logs",
-            Internal::Highlights => "highlights",
-            Internal::ChannelMonitor => "channel-monitor",
-            Internal::ChannelDiscovery(_) => "channel-discovery",
             Internal::ConfigEditor => "config-editor",
         }
         .to_string()
@@ -159,17 +91,7 @@ impl From<&config::sidebar::InternalBuffer> for Internal {
     fn from(config: &config::sidebar::InternalBuffer) -> Self {
         match config {
             config::sidebar::InternalBuffer::ConfigEditor => Self::ConfigEditor,
-            config::sidebar::InternalBuffer::FileTransfers => {
-                Self::FileTransfers
-            }
             config::sidebar::InternalBuffer::Logs => Self::Logs,
-            config::sidebar::InternalBuffer::Highlights => Self::Highlights,
-            config::sidebar::InternalBuffer::ChannelMonitor => {
-                Self::ChannelMonitor
-            }
-            config::sidebar::InternalBuffer::ChannelDiscovery => {
-                Self::ChannelDiscovery(None)
-            }
         }
     }
 }
@@ -184,11 +106,7 @@ impl From<&Internal> for config::sidebar::InternalBuffer {
     fn from(buffer: &Internal) -> Self {
         match buffer {
             Internal::ConfigEditor => Self::ConfigEditor,
-            Internal::FileTransfers => Self::FileTransfers,
             Internal::Logs => Self::Logs,
-            Internal::Highlights => Self::Highlights,
-            Internal::ChannelDiscovery(_) => Self::ChannelDiscovery,
-            Internal::ChannelMonitor => Self::ChannelMonitor,
         }
     }
 }
@@ -196,14 +114,26 @@ impl From<&Internal> for config::sidebar::InternalBuffer {
 #[derive(Debug, Clone, Default, Deserialize, Serialize)]
 #[serde(default)]
 pub struct Settings {
-    pub channel: channel::Settings,
+    pub conversation: conversation::Settings,
 }
 
 impl From<config::Buffer> for Settings {
     fn from(config: config::Buffer) -> Self {
         Self {
-            channel: channel::Settings::from(config.channel),
+            conversation: conversation::Settings::from(config.conversation),
         }
+    }
+}
+
+#[derive(Debug, Clone, Default, Deserialize)]
+pub struct Brackets {
+    pub left: String,
+    pub right: String,
+}
+
+impl Brackets {
+    pub fn format(&self, content: impl std::fmt::Display) -> String {
+        format!("{}{}{}", self.left, content, self.right)
     }
 }
 
@@ -274,24 +204,6 @@ impl Default for DateSeparators {
             format: "%A, %B %-d".to_string(),
             show: true,
         }
-    }
-}
-
-#[derive(Debug, Clone, Default, Deserialize)]
-#[serde(default)]
-pub struct StatusMessagePrefix {
-    pub brackets: Brackets,
-}
-
-#[derive(Debug, Clone, Default, Deserialize)]
-pub struct Brackets {
-    pub left: String,
-    pub right: String,
-}
-
-impl Brackets {
-    pub fn format(&self, content: impl fmt::Display) -> String {
-        format!("{}{}{}", self.left, content, self.right)
     }
 }
 
@@ -394,50 +306,6 @@ impl Resize {
     }
 }
 
-#[cfg(test)]
-mod tests {
-    use super::Color;
-
-    #[derive(Debug, serde::Deserialize)]
-    struct Root {
-        color: Color,
-    }
-
-    #[test]
-    fn color_deserializes_palette() {
-        let root: Root = toml::from_str(
-            r##"color = { palette = ["#112233", "#445566", "#778899"] }"##,
-        )
-        .expect("valid palette color");
-
-        match root.color {
-            Color::Palette(colors) => assert_eq!(colors.len(), 3),
-            _ => panic!("expected palette color"),
-        }
-    }
-
-    #[test]
-    fn color_rejects_empty_palette() {
-        let err = toml::from_str::<Root>(r#"color = { palette = [] }"#)
-            .expect_err("empty palette should be rejected");
-
-        assert!(
-            err.to_string()
-                .contains("palette must contain at least one")
-        );
-    }
-
-    #[test]
-    fn color_rejects_invalid_palette_hex() {
-        let err = toml::from_str::<Root>(
-            r##"color = { palette = ["#112233", "not-a-color"] }"##,
-        )
-        .expect_err("invalid palette hex should be rejected");
-
-        assert!(err.to_string().contains("invalid hex color in palette"));
-    }
-}
-
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Deserialize)]
 #[serde(rename_all = "kebab-case")]
 pub enum SkinTone {
@@ -485,5 +353,90 @@ where
                 Locale::from_str(&locale_string.replace("-", "_")).ok()
             })
             .unwrap_or_default())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{Buffer, Color, Internal};
+    use crate::conversation::ConvoId;
+
+    #[derive(Debug, serde::Deserialize)]
+    struct Root {
+        color: Color,
+    }
+
+    #[test]
+    fn color_deserializes_palette() {
+        let root: Root = toml::from_str(
+            r##"color = { palette = ["#112233", "#445566", "#778899"] }"##,
+        )
+        .expect("valid palette color");
+
+        match root.color {
+            Color::Palette(colors) => assert_eq!(colors.len(), 3),
+            _ => panic!("expected palette color"),
+        }
+    }
+
+    #[test]
+    fn color_rejects_empty_palette() {
+        let err = toml::from_str::<Root>(r#"color = { palette = [] }"#)
+            .expect_err("empty palette should be rejected");
+
+        assert!(
+            err.to_string()
+                .contains("palette must contain at least one")
+        );
+    }
+
+    #[test]
+    fn color_rejects_invalid_palette_hex() {
+        let err = toml::from_str::<Root>(
+            r##"color = { palette = ["#112233", "not-a-color"] }"##,
+        )
+        .expect_err("invalid palette hex should be rejected");
+
+        assert!(err.to_string().contains("invalid hex color in palette"));
+    }
+
+    #[test]
+    fn buffer_serde_is_tagged_and_round_trips() {
+        let conversation = Buffer::Conversation(ConvoId::from("logs"));
+        let json = serde_json::to_string(&conversation).unwrap();
+        assert_eq!(json, r#"{"type":"conversation","id":"logs"}"#);
+        assert_eq!(
+            serde_json::from_str::<Buffer>(&json).unwrap(),
+            conversation
+        );
+
+        let internal = Buffer::Internal(Internal::Logs);
+        let json = serde_json::to_string(&internal).unwrap();
+        assert_eq!(json, r#"{"type":"internal","id":"Logs"}"#);
+        assert_eq!(serde_json::from_str::<Buffer>(&json).unwrap(), internal);
+    }
+
+    #[test]
+    fn buffer_rejects_old_untagged_format() {
+        assert!(serde_json::from_str::<Buffer>(r#""logs""#).is_err());
+        assert!(
+            serde_json::from_str::<Buffer>(
+                r#"{"Upstream":{"Server":"libera"}}"#
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn buffer_keys() {
+        assert_eq!(
+            Buffer::Conversation(ConvoId::from("abc123")).key(),
+            "convo:abc123"
+        );
+        assert_eq!(Buffer::Internal(Internal::Logs).key(), "logs");
+        assert_eq!(
+            Buffer::Internal(Internal::ConfigEditor).key(),
+            "config-editor"
+        );
     }
 }

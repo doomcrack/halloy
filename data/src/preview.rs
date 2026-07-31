@@ -18,12 +18,9 @@ use url::Url;
 
 pub use self::card::Card;
 use crate::cache::{self, Asset, CacheState, CachedAsset, FileCache};
-use crate::config::preview::{Enabled, Visibility};
+use crate::config::preview::Enabled;
 use crate::image::Image;
-use crate::message::Source;
-use crate::server::Server;
-use crate::target::{self, TargetRef};
-use crate::{config, image, isupport};
+use crate::{config, image};
 
 pub mod card;
 
@@ -39,61 +36,25 @@ static META_ATTR_REGEX: LazyLock<Regex> = LazyLock::new(|| {
     .expect("valid meta attribute regex")
 });
 
+// Per-target/user visibility criteria were IRC-shaped (inclusivities over
+// servers/channels/users); previews are now gated solely by the enable
+// regexes in `config::Preview`.
 #[derive(Clone, Copy)]
 pub struct Previews<'a> {
     collection: &'a Collection,
-    cards_are_visible: Visibility,
-    images_are_visible: Visibility,
 }
 
 impl<'a> Previews<'a> {
-    pub fn new(
-        collection: &'a Collection,
-        target_ref: TargetRef,
-        server: &Server,
-        config: &config::Preview,
-        casemapping: isupport::CaseMap,
-    ) -> Previews<'a> {
-        Self {
-            collection,
-            cards_are_visible: config.card.visible(
-                target_ref,
-                server,
-                casemapping,
-            ),
-            images_are_visible: config.image.visible(
-                target_ref,
-                server,
-                casemapping,
-            ),
-        }
+    pub fn new(collection: &'a Collection) -> Previews<'a> {
+        Self { collection }
     }
 
     pub fn get(&self, url: &Url) -> Option<&'a State> {
-        self.collection.get(url).filter(|state| match state {
-            State::Loading => true,
-            State::Loaded(preview) => {
-                let visibility = match preview {
-                    Preview::Card(_) => self.cards_are_visible,
-                    Preview::Image(_) => self.images_are_visible,
-                };
-
-                matches!(visibility, Visibility::All | Visibility::BySource)
-            }
-            State::Error(_) => true,
-        })
+        self.collection.get(url)
     }
 
     pub fn collection(&self) -> &'a Collection {
         self.collection
-    }
-
-    pub fn cards_visibility(&self) -> Visibility {
-        self.cards_are_visible
-    }
-
-    pub fn images_visibility(&self) -> Visibility {
-        self.images_are_visible
     }
 }
 
@@ -111,40 +72,6 @@ impl Preview {
         match self {
             Self::Card(card) => &card.image,
             Self::Image(image) => image,
-        }
-    }
-
-    pub fn visible_for_source(
-        &self,
-        source: &Source,
-        channel: Option<&target::Channel>,
-        server: Option<&Server>,
-        casemapping: isupport::CaseMap,
-        cards_visibility: Visibility,
-        images_visibility: Visibility,
-        config: &config::Preview,
-    ) -> bool {
-        match self {
-            Self::Card(_) => match cards_visibility {
-                Visibility::All => true,
-                Visibility::BySource => config.card.visible_for_source(
-                    source,
-                    channel,
-                    server,
-                    casemapping,
-                ),
-                Visibility::None => false,
-            },
-            Self::Image(_) => match images_visibility {
-                Visibility::All => true,
-                Visibility::BySource => config.image.visible_for_source(
-                    source,
-                    channel,
-                    server,
-                    casemapping,
-                ),
-                Visibility::None => false,
-            },
         }
     }
 }
@@ -167,52 +94,15 @@ pub enum State {
     Error(LoadError),
 }
 
-#[derive(Debug, Clone, Copy)]
-enum Kind {
-    Preview,
-    Avatar,
-}
-
 pub async fn load(
     url: Url,
     client: Arc<reqwest::Client>,
     config: config::Preview,
     cache: Arc<FileCache>,
 ) -> Result<Preview, LoadError> {
-    let is_enabled = config.is_enabled(url.as_str());
-    load_inner(url, client, &config, cache, is_enabled, Kind::Preview).await
-}
-
-pub async fn load_avatar(
-    url: Url,
-    client: Arc<reqwest::Client>,
-    avatar_config: config::metadata::Avatar,
-    preview_config: config::Preview,
-    cache: Arc<FileCache>,
-) -> Result<Preview, LoadError> {
-    let is_enabled = avatar_config.is_enabled(url.as_str());
-    load_inner(
-        url,
-        client,
-        &preview_config,
-        cache,
-        is_enabled,
-        Kind::Avatar,
-    )
-    .await
-}
-
-async fn load_inner(
-    url: Url,
-    client: Arc<reqwest::Client>,
-    preview_config: &config::Preview,
-    cache: Arc<FileCache>,
-    is_enabled: bool,
-    kind: Kind,
-) -> Result<Preview, LoadError> {
     let cache_key_url = canonical_preview_url(&url);
 
-    if !is_enabled {
+    if !config.is_enabled(url.as_str()) {
         return Err(LoadError::Disabled);
     }
 
@@ -222,20 +112,7 @@ async fn load_inner(
             CacheState::Error => Err(LoadError::CachedFailed),
         }
     } else {
-        let loaded = match kind {
-            Kind::Preview => {
-                load_uncached(url.clone(), client, preview_config, &cache).await
-            }
-            Kind::Avatar => {
-                load_avatar_uncached(
-                    url.clone(),
-                    client,
-                    preview_config,
-                    &cache,
-                )
-                .await
-            }
-        };
+        let loaded = load_uncached(url.clone(), client, &config, &cache).await;
 
         match loaded {
             Ok(preview) => {
@@ -349,21 +226,6 @@ async fn load_uncached(
             }))
         }
     }
-}
-
-async fn load_avatar_uncached(
-    url: Url,
-    client: Arc<reqwest::Client>,
-    config: &config::Preview,
-    cache: &FileCache,
-) -> Result<Preview, LoadError> {
-    log::trace!("Loading avatar for {url}");
-
-    let Fetched::Image(image) = fetch(url, client, config, cache).await? else {
-        return Err(LoadError::NotImage);
-    };
-
-    Ok(Preview::Image(image))
 }
 
 enum Fetched {

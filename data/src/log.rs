@@ -9,7 +9,7 @@ use crate::config::logs::{LevelFilter, Timestamp};
 use crate::environment;
 
 pub fn file(timestamp: Timestamp) -> Result<fs::File, Error> {
-    let file_format = "halloy.%Y-%m-%d-%H-%M-%S.log";
+    let file_format = "frigicom.%Y-%m-%d-%H-%M-%S.log";
     let path = dir()?.join(
         match timestamp {
             Timestamp::Local => Local::now().format(file_format),
@@ -46,7 +46,7 @@ pub fn clear(number_of_logs_to_keep: usize) {
             .filter(|dir_entry| {
                 dir_entry.file_type().is_file()
                     && dir_entry.file_name().to_str().is_some_and(|file_name| {
-                        file_name.starts_with("halloy.")
+                        file_name.starts_with("frigicom.")
                             && file_name.ends_with(".log")
                     })
             })

@@ -1,8 +1,7 @@
-use crate::config;
 use crate::environment::VERSION;
 
 const LATEST_REMOTE_RELEASE_URL: &str =
-    "https://api.github.com/repos/squidowl/halloy/releases/latest";
+    "https://api.github.com/repos/doomcrack/halloy/releases/latest";
 
 #[derive(Debug, Clone)]
 pub struct Version {
@@ -34,19 +33,17 @@ impl Version {
     }
 }
 
-pub async fn latest_remote_version(
-    proxy: Option<config::Proxy>,
-) -> Option<String> {
+pub async fn latest_remote_version() -> Option<String> {
     #[derive(serde::Deserialize)]
     struct Release {
         tag_name: String,
     }
 
-    let client = config::proxy::build_client(proxy.as_ref(), None).ok()?;
+    let client = reqwest::Client::builder().build().ok()?;
 
     let response = client
         .get(LATEST_REMOTE_RELEASE_URL)
-        .header(reqwest::header::USER_AGENT, "halloy")
+        .header(reqwest::header::USER_AGENT, "frigicom")
         .header(reqwest::header::ACCEPT, "application/vnd.github.v3+json")
         .send()
         .await

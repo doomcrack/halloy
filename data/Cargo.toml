@@ -9,14 +9,7 @@ edition.workspace = true
 name = "data"
 path = "src/lib.rs"
 
-[[bin]]
-name = "print_messages_json"
-path = "src/bin.rs"
-required-features = ["message_tests"]
-
 [features]
-tor = ["irc/tor"]
-message_tests = ["iced/tokio"]
 # Pulls the lp_* FFI transport into the session state machine; the final
 # binary must then link liblogos_protocol (see the workspace build.rs).
 live = ["logos-chat/ffi"]
@@ -26,20 +19,15 @@ thiserror = { workspace = true }
 futures = { workspace = true }
 tokio = { workspace = true, features = ["io-util", "fs", "rt"] }
 chrono = { workspace = true }
-bytes = { workspace = true }
 strum = { workspace = true }
-anyhow = { workspace = true }
 url = { workspace = true }
 tokio-stream = { workspace = true, features = ["time", "fs"] }
-timeago = { workspace = true }
 itertools = { workspace = true }
 emojis = { workspace = true }
-unicode-segmentation = { workspace = true }
 rand = { workspace = true }
 rand_chacha = { workspace = true }
 palette = { workspace = true }
 log = { workspace = true }
-nucleo-matcher = { workspace = true }
 reqwest = { workspace = true }
 tokio-util = { workspace = true }
 const_format = { workspace = true }
@@ -48,9 +36,7 @@ iced = { workspace = true, features = [
     "tokio",
     "wayland",
 ] }
-nom = { workspace = true }
 percent-encoding = { workspace = true }
-keyring-core = "1"
 
 base64 = "0.22.1"
 dirs-next = "2.0.0"
@@ -73,31 +59,12 @@ derive_more = { version = "2.0.1", features = ["full"] }
 image = "0.25.10"
 html-escape = "0.2.13"
 display-info = "0.5.9"
-infer = "0.19"
 sys-locale = "0.3"
-mime_guess = "2.0.5"
-any_ascii = "0.3.3"
 idna = "1.1.0"
 unicode-security = "0.1.2"
 
-[target.'cfg(target_os = "macos")'.dependencies]
-apple-native-keyring-store = { version = "1", default-features = false, features = [
-    "keychain",
-] }
-
-[target.'cfg(any(target_os = "linux", target_os = "freebsd"))'.dependencies]
-zbus-secret-service-keyring-store = { version = "1", features = [
-    "rt-tokio-crypto-rust",
-] }
-
-[target.'cfg(windows)'.dependencies]
-windows-native-keyring-store = { version = "1", default-features = false }
-
 [dev-dependencies]
 serde_test = "1.0"
-
-[dependencies.irc]
-path = "../irc"
 
 [dependencies.serde]
 version = "1.0"

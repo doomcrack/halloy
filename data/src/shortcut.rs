@@ -89,17 +89,14 @@ pub enum Command {
     RestoreBuffer,
     CycleNextBuffer,
     CyclePreviousBuffer,
-    LeaveBuffer,
-    ToggleNicklist,
-    ToggleTopic,
+    ToggleMemberList,
+    ToggleDetails,
     ToggleSidebar,
     ToggleFullscreen,
     CommandBar,
     ReloadConfiguration,
-    FileTransfers,
     Logs,
     ThemeEditor,
-    Highlights,
     QuitApplication,
     ScrollUpPage,
     ScrollDownPage,
@@ -342,20 +339,17 @@ impl KeyBind {
     default!(restore_buffer, ArrowDown, COMMAND | SHIFT);
     default!(cycle_next_buffer, Tab, CTRL);
     default!(cycle_previous_buffer, Tab, CTRL | SHIFT);
-    default!(leave_buffer, "w", COMMAND | SHIFT);
-    default!(toggle_nick_list, "m", COMMAND | ALT);
+    default!(toggle_member_list, "m", COMMAND | ALT);
     default!(toggle_sidebar, "b", COMMAND | ALT);
-    default!(toggle_topic, "t", COMMAND | ALT);
+    default!(toggle_details, "t", COMMAND | ALT);
     #[cfg(target_os = "macos")]
     default!(toggle_fullscreen, "f", COMMAND | CTRL);
     #[cfg(not(target_os = "macos"))]
     default!(toggle_fullscreen, F11);
     default!(command_bar, "k", COMMAND);
     default!(reload_configuration, "r", COMMAND);
-    default!(file_transfers, "j", COMMAND);
     default!(logs, "l", COMMAND);
     default!(theme_editor, "t", COMMAND);
-    default!(highlights, "i", COMMAND);
     default!(scroll_up_page, PageUp);
     default!(scroll_down_page, PageDown);
     // Don't use HOME / END since text input is always focused

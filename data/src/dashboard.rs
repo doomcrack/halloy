@@ -16,6 +16,9 @@ pub struct Dashboard {
     pub buffer_settings: BufferSettings,
     pub focus_buffer: Option<Buffer>,
     pub sidebar: Sidebar,
+    /// Whether the "adding a member takes up to a minute" explainer has
+    /// been acknowledged with don't-show-again (QML `memberAddExplained`).
+    pub member_add_explained: bool,
 }
 
 #[derive(Debug, Clone, Default, Serialize)]
@@ -60,6 +63,13 @@ impl<'de> Deserialize<'de> for BufferSettings {
 impl BufferSettings {
     pub fn get(&self, buffer: &buffer::Buffer) -> Option<&buffer::Settings> {
         self.settings.get(&buffer.key())
+    }
+
+    /// Drops persisted per-conversation settings. Identity is ephemeral
+    /// upstream, so `convo:` keys from a previous run can never match a
+    /// live conversation again and would otherwise grow unboundedly.
+    fn prune_orphaned_conversations(&mut self) {
+        self.settings.retain(|key, _| !key.starts_with("convo:"));
     }
 
     pub fn entry(
@@ -115,7 +125,10 @@ impl Dashboard {
 
         let bytes = std::fs::read(path)?;
 
-        Ok(compression::decompress(&bytes)?)
+        let mut dashboard: Self = compression::decompress(&bytes)?;
+        dashboard.buffer_settings.prune_orphaned_conversations();
+
+        Ok(dashboard)
     }
 
     pub async fn save(self) -> Result<(), Error> {

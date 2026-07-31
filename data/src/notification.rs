@@ -1,6 +1,5 @@
-use crate::target::Channel;
-use crate::user::Nick;
-use crate::{User, isupport, reaction};
+use crate::address::Address;
+use crate::conversation::ConvoId;
 
 #[derive(Debug, PartialEq, Eq, Clone)]
 pub enum Notification {
@@ -8,40 +7,19 @@ pub enum Notification {
     Disconnected,
     Reconnected,
     DirectMessage {
-        user: User,
-        casemapping: isupport::CaseMap,
+        convo_id: ConvoId,
+        sender: Address,
         message: String,
     },
-    Highlight {
-        user: User,
-        channel: Channel,
-        casemapping: isupport::CaseMap,
-        message: String,
-        description: String,
-        sound: Option<String>,
-    },
-    FileTransferRequest {
-        nick: Nick,
-        casemapping: isupport::CaseMap,
-        filename: String,
-    },
-    MonitoredOnline(Vec<User>),
-    MonitoredOffline(Vec<Nick>),
-    Channel {
-        user: User,
-        channel: Channel,
-        casemapping: isupport::CaseMap,
+    GroupMessage {
+        convo_id: ConvoId,
+        /// The group's display name at notify time.
+        title: String,
         message: String,
     },
-    Reaction {
-        casemapping: isupport::CaseMap,
-        reaction: reaction::Context,
-        message_text: String,
-    },
-    Reply {
-        user: User,
-        channel: Channel,
-        casemapping: isupport::CaseMap,
-        message: String,
+    /// A non-outgoing `conversation_created` — someone added us.
+    GroupInvite {
+        convo_id: ConvoId,
+        title: String,
     },
 }

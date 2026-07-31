@@ -1,188 +1,73 @@
-use std::cmp::Ordering;
-use std::collections::HashMap;
-use std::path::PathBuf;
-use std::time::Duration;
-use std::{fmt, io};
+use core::fmt;
 
 use chrono::{DateTime, Utc};
-use futures::FutureExt;
-use futures::future::BoxFuture;
-use tokio::fs;
-use tokio::time::Instant;
 
-pub use self::manager::{
-    EchoEvent, Manager, ReactionToEcho, ReplyToEcho, Resource,
-};
-pub use self::metadata::{Metadata, ReadMarker};
-use crate::capabilities::LabeledResponseContext;
-use crate::message::{self, Direction, MessageReferences, Source};
-use crate::reaction::Reaction;
-use crate::redaction::Redaction;
-use crate::target::{self, Target};
-use crate::user::Nick;
-use crate::{
-    Buffer, Message, Server, buffer, compression, config, environment,
-    isupport, reaction, redaction,
-};
+pub use self::manager::{Manager, Resource};
+pub use self::metadata::ReadMarker;
+use crate::conversation::ConvoId;
+use crate::{Buffer, Message, buffer, message};
 
-pub mod filter;
 pub mod manager;
 pub mod metadata;
-pub mod reroute;
 
-// TODO: Make this configurable?
-/// Max # messages to persist
+/// Persistence seam: module-side persistence lands upstream; until it does,
+/// histories live in memory only. When it lands, key files on
+/// `seahash("convo:{id}")` — never revive the `fmt::Binary`-of-Server scheme.
+pub mod persistence {}
+
 pub(crate) const MAX_MESSAGES: usize = 10_000;
-/// # messages to truncate after hitting [`MAX_MESSAGES`]
+
 const TRUNC_COUNT: usize = 500;
-/// Duration to wait after receiving last message before flushing
-const FLUSH_AFTER_LAST_RECEIVED: Duration = Duration::from_secs(5);
-/// # new messages to trigger flush even if FLUSH_AFTER_LAST_RECEIVED has not passed
-const FLUSH_COUNT: usize = 1000;
+
+/// Messages that arrive within this window of an existing message are
+/// candidates for deduplication (a `get_messages` snapshot racing live
+/// events delivers the same message with slightly different timestamps).
+const FUZZ_SECONDS: i64 = 1;
 
 pub(crate) fn truncate_messages(messages: &mut Vec<Message>) {
     if messages.len() > MAX_MESSAGES {
-        messages.drain(0..messages.len() - (MAX_MESSAGES - TRUNC_COUNT));
+        messages.drain(0..TRUNC_COUNT);
     }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub enum Kind {
-    Server(Server),
-    Channel(Server, target::Channel),
-    Query(Server, target::Query),
+    Conversation(ConvoId),
     Logs,
-    Highlights,
-    ChannelMonitor,
 }
 
 impl Kind {
-    pub fn from_target(server: Server, target: Target) -> Self {
-        match target {
-            Target::Channel(channel) => Self::Channel(server, channel),
-            Target::Query(query) => Self::Query(server, query),
-        }
-    }
-
-    pub fn from_str(
-        server: Server,
-        chantypes: &[char],
-        statusmsg: &[char],
-        casemapping: isupport::CaseMap,
-        target: &str,
-    ) -> Self {
-        Self::from_target(
-            server,
-            Target::parse(target, chantypes, statusmsg, casemapping),
-        )
-    }
-
-    pub fn from_input_buffer(buffer: buffer::Upstream) -> Self {
-        match buffer {
-            buffer::Upstream::Server(server) => Self::Server(server),
-            buffer::Upstream::Channel(server, channel) => {
-                Self::Channel(server, channel)
-            }
-            buffer::Upstream::Query(server, nick) => Self::Query(server, nick),
-        }
-    }
-
-    pub fn from_server_message(
-        server: &Server,
-        message: &Message,
-    ) -> Option<Self> {
-        Self::from_server_message_target(server, &message.target)
-    }
-
-    pub fn from_server_message_rerouted_from(
-        server: &Server,
-        message: &Message,
-    ) -> Option<Self> {
-        message.rerouted_from.as_ref().and_then(|rerouted_from| {
-            Self::from_server_message_target(server, rerouted_from)
-        })
-    }
-
-    fn from_server_message_target(
-        server: &Server,
-        target: &message::Target,
-    ) -> Option<Self> {
-        match target {
-            message::Target::Server { .. } => {
-                Some(Self::Server(server.clone()))
-            }
-            message::Target::Channel { channel, .. } => {
-                Some(Self::Channel(server.clone(), channel.clone()))
-            }
-            message::Target::Query { query, .. } => {
-                Some(Self::Query(server.clone(), query.clone()))
-            }
-            message::Target::Logs { .. } => None,
-            message::Target::Highlights { .. } => None,
-            message::Target::ChannelMonitor { .. } => None,
-        }
-    }
-
     pub fn from_buffer(buffer: Buffer) -> Option<Self> {
         match buffer {
-            Buffer::Upstream(buffer::Upstream::Server(server)) => {
-                Some(Kind::Server(server))
-            }
-            Buffer::Upstream(buffer::Upstream::Channel(server, channel)) => {
-                Some(Kind::Channel(server, channel))
-            }
-            Buffer::Upstream(buffer::Upstream::Query(server, nick)) => {
-                Some(Kind::Query(server, nick))
+            Buffer::Conversation(convo_id) => {
+                Some(Kind::Conversation(convo_id))
             }
             Buffer::Internal(buffer::Internal::Logs) => Some(Kind::Logs),
-            Buffer::Internal(buffer::Internal::Highlights) => {
-                Some(Kind::Highlights)
-            }
-            Buffer::Internal(buffer::Internal::FileTransfers) => None,
-            Buffer::Internal(buffer::Internal::ChannelMonitor) => {
-                Some(Kind::ChannelMonitor)
-            }
-            Buffer::Internal(buffer::Internal::ChannelDiscovery(_)) => None,
             Buffer::Internal(buffer::Internal::ConfigEditor) => None,
         }
     }
-}
 
-impl Kind {
-    pub fn server(&self) -> Option<&Server> {
+    pub fn convo_id(&self) -> Option<&ConvoId> {
         match self {
-            Kind::Server(server) => Some(server),
-            Kind::Channel(server, _) => Some(server),
-            Kind::Query(server, _) => Some(server),
+            Kind::Conversation(convo_id) => Some(convo_id),
             Kind::Logs => None,
-            Kind::Highlights => None,
-            Kind::ChannelMonitor => None,
         }
     }
+}
 
-    pub fn target(&self) -> Option<Target> {
-        match self {
-            Kind::Server(_) => None,
-            Kind::Channel(_, channel) => Some(Target::Channel(channel.clone())),
-            Kind::Query(_, nick) => Some(Target::Query(nick.clone())),
-            Kind::Logs => None,
-            Kind::Highlights => None,
-            Kind::ChannelMonitor => None,
-        }
+impl From<ConvoId> for Kind {
+    fn from(convo_id: ConvoId) -> Self {
+        Kind::Conversation(convo_id)
     }
 }
 
 impl fmt::Display for Kind {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            Kind::Server(server) => write!(f, "server on {server}"),
-            Kind::Channel(server, channel) => {
-                write!(f, "channel {channel} on {server}")
+            Kind::Conversation(convo_id) => {
+                write!(f, "conversation {convo_id}")
             }
-            Kind::Query(server, nick) => write!(f, "user {nick} on {server}"),
             Kind::Logs => write!(f, "logs"),
-            Kind::Highlights => write!(f, "highlights"),
-            Kind::ChannelMonitor => write!(f, "channel monitor"),
         }
     }
 }
@@ -190,294 +75,33 @@ impl fmt::Display for Kind {
 impl From<Kind> for Buffer {
     fn from(kind: Kind) -> Self {
         match kind {
-            Kind::Server(server) => {
-                Buffer::Upstream(buffer::Upstream::Server(server))
-            }
-            Kind::Channel(server, channel) => {
-                Buffer::Upstream(buffer::Upstream::Channel(server, channel))
-            }
-            Kind::Query(server, nick) => {
-                Buffer::Upstream(buffer::Upstream::Query(server, nick))
-            }
+            Kind::Conversation(convo_id) => Buffer::Conversation(convo_id),
             Kind::Logs => Buffer::Internal(buffer::Internal::Logs),
-            Kind::Highlights => Buffer::Internal(buffer::Internal::Highlights),
-            Kind::ChannelMonitor => {
-                Buffer::Internal(buffer::Internal::ChannelMonitor)
-            }
         }
     }
-}
-
-#[derive(Debug)]
-pub struct Loaded {
-    pub messages: Vec<Message>,
-    pub metadata: Metadata,
-}
-
-pub enum Seed {
-    Single(isupport::CaseMap),
-    Multiple(HashMap<Server, isupport::CaseMap>),
-}
-
-pub async fn load(kind: Kind, seed: Option<Seed>) -> Result<Loaded, Error> {
-    let path = path(&kind).await?;
-
-    let mut messages = read_all(&path).await.unwrap_or_default();
-
-    if let Some(seed) = seed {
-        // TODO: Utilize DeserializeSeed (or equivalent) so proper normalization
-        // happens inside read_all, rather than having to renormalize afterward
-        renormalize_messages(messages.iter_mut(), seed);
-    }
-
-    let metadata = metadata::load(kind).await.unwrap_or_default();
-
-    Ok(Loaded { messages, metadata })
-}
-
-fn renormalize_messages<'a>(
-    messages: impl Iterator<Item = &'a mut Message>,
-    seed: Seed,
-) {
-    match seed {
-        Seed::Multiple(casemappings) => {
-            messages.for_each(|message| {
-                if let message::Target::Highlights { server, .. }
-                | message::Target::ChannelMonitor { server, .. } =
-                    &message.target
-                    && let Some(casemapping) = casemappings.get(server)
-                {
-                    message.renormalize(*casemapping);
-                }
-            });
-        }
-        Seed::Single(casemapping) => {
-            messages.for_each(|message| message.renormalize(casemapping));
-        }
-    }
-}
-
-pub async fn overwrite(
-    kind: &Kind,
-    messages: &[Message],
-    read_marker: Option<ReadMarker>,
-    chathistory_references: Option<MessageReferences>,
-) -> Result<(), Error> {
-    if messages.is_empty() {
-        return metadata::save(
-            kind,
-            messages,
-            read_marker,
-            chathistory_references,
-        )
-        .await;
-    }
-
-    let messages = write_messages(kind, messages).await?;
-
-    metadata::save(kind, messages, read_marker, chathistory_references).await?;
-
-    Ok(())
-}
-
-pub async fn append(
-    kind: &Kind,
-    seed: Option<Seed>,
-    pending_messages: Vec<(Message, Option<LabeledResponseContext>)>,
-    read_marker: Option<ReadMarker>,
-    max_triggers_unread: Option<DateTime<Utc>>,
-    max_triggers_highlight: Option<DateTime<Utc>>,
-    chathistory_references: Option<MessageReferences>,
-    pending_reactions: HashMap<message::Id, reaction::Pending>,
-    pending_redactions: HashMap<message::Id, redaction::Pending>,
-) -> Result<Vec<EchoEvent>, Error> {
-    let loaded = load(kind.clone(), seed).await?;
-
-    let mut echo_events: Vec<EchoEvent> = vec![];
-
-    let mut all_messages = loaded.messages;
-
-    // pending reactions should only exist for unloaded history entries
-    for (id, pending) in pending_reactions.into_iter() {
-        if let Some(server_time) = pending.server_time()
-            && let Some(message) =
-                find_reply_target_mut(&mut all_messages, &id, &server_time)
-        {
-            if message.is_echo
-                && message.direction == Direction::Received
-                && let Ok(target) = Target::try_from(message.target.clone())
-            {
-                let message_text = message.text();
-                for pending_reaction in pending.reactions.iter() {
-                    if pending_reaction.notification_enabled {
-                        let reaction_to_echo = ReactionToEcho {
-                            reaction: reaction::Context {
-                                inner: pending_reaction.reaction.clone(),
-                                target: target.clone(),
-                                in_reply_to: id.clone(),
-                                is_echo: pending_reaction.is_echo,
-                                deduplicate: pending_reaction.deduplicate,
-                            },
-                            message_text: message_text.to_string(),
-                        };
-
-                        echo_events.push(EchoEvent::Reaction(reaction_to_echo));
-                    }
-                }
-            }
-
-            for pending_reaction in pending.reactions.into_iter() {
-                insert_reaction(
-                    &mut message.reactions,
-                    pending_reaction.reaction,
-                    pending_reaction.is_echo,
-                    pending_reaction.deduplicate,
-                    pending_reaction.labeled_response_context,
-                );
-            }
-        }
-    }
-
-    for (id, pending) in pending_redactions.into_iter() {
-        if let Some(message) =
-            find_reply_target_mut(&mut all_messages, &id, &pending.server_time)
-        {
-            message.redaction = Some(pending.redaction);
-        }
-    }
-
-    for (message, _) in &pending_messages {
-        if !message.is_echo
-            && !message.deduplicate
-            && let Some(reply_id) = &message.reply_to
-            && let Some(original) =
-                find_reply_target(&all_messages, reply_id, &message.server_time)
-            && original.is_echo
-            && original.direction == Direction::Received
-        {
-            echo_events.push(EchoEvent::Reply(ReplyToEcho {
-                message: message.clone(),
-            }));
-        }
-    }
-
-    pending_messages.into_iter().for_each(
-        |(message, labeled_response_context)| {
-            insert_message(
-                &mut all_messages,
-                message,
-                labeled_response_context,
-            );
-        },
-    );
-
-    let _ = write_messages(kind, &all_messages).await?;
-
-    // Update metadata directly, without referencing all messages, since all
-    // messages have not been processed (and so do not have their blocked state
-    // set → blocked messages may incorrectly update metadata).
-
-    metadata::update(
-        kind,
-        read_marker,
-        max_triggers_unread,
-        max_triggers_highlight,
-        chathistory_references,
-    )
-    .await?;
-
-    Ok(echo_events)
-}
-
-async fn write_messages<'a>(
-    kind: &Kind,
-    messages: &'a [Message],
-) -> Result<&'a [Message], Error> {
-    let latest_messages =
-        &messages[messages.len().saturating_sub(MAX_MESSAGES)..];
-
-    let path = path(kind).await?;
-    let compressed = compression::compress(&latest_messages)?;
-
-    fs::write(path, &compressed).await?;
-
-    Ok(latest_messages)
-}
-
-pub async fn delete(kind: &Kind) -> Result<(), Error> {
-    let path = path(kind).await?;
-
-    fs::remove_file(path).await?;
-
-    Ok(())
-}
-
-async fn read_all(path: &PathBuf) -> Result<Vec<Message>, Error> {
-    let bytes = fs::read(path).await?;
-    Ok(compression::decompress(&bytes)?)
-}
-
-pub async fn dir_path() -> Result<PathBuf, Error> {
-    let data_dir = environment::data_dir();
-
-    let history_dir = data_dir.join("history");
-
-    if !history_dir.exists() {
-        fs::create_dir_all(&history_dir).await?;
-    }
-
-    Ok(history_dir)
-}
-
-async fn path(kind: &Kind) -> Result<PathBuf, Error> {
-    let dir = dir_path().await?;
-
-    let name = match kind {
-        Kind::Server(server) => format!("{server:b}"),
-        Kind::Channel(server, channel) => {
-            format!("{server:b}channel{}", channel.as_normalized_str())
-        }
-        Kind::Query(server, query) => {
-            format!("{server:b}nickname{}", query.as_normalized_str())
-        }
-        Kind::Logs => "logs".to_string(),
-        Kind::Highlights => "highlights".to_string(),
-        Kind::ChannelMonitor => "channel_monitor".to_string(),
-    };
-
-    let hashed_name = seahash::hash(name.as_bytes());
-
-    Ok(dir.join(format!("{hashed_name}.json.gz")))
 }
 
 #[derive(Debug)]
 pub enum History {
     Partial {
         kind: Kind,
-        pending_messages: Vec<(Message, Option<LabeledResponseContext>)>, // Unordered
-        last_updated_at: Option<Instant>,
+        /// Messages recorded before the module snapshot lands (locally
+        /// generated status lines, or live pushes racing `get_messages`).
+        /// `load_full` merges them into the loaded history — without this
+        /// they would have nowhere to live and be lost.
+        pending_messages: Vec<Message>, // Sorted by Message.server_time
+        unread_count: usize,
         max_triggers_unread: Option<DateTime<Utc>>,
-        max_triggers_highlight: Option<DateTime<Utc>>,
         read_marker: Option<ReadMarker>,
-        chathistory_references: Option<MessageReferences>,
-        last_seen: HashMap<Nick, DateTime<Utc>>,
-        pending_reactions: HashMap<message::Id, reaction::Pending>,
-        pending_redactions: HashMap<message::Id, redaction::Pending>,
         show_in_sidebar: bool,
-        flushing_messages: Vec<(Message, Option<LabeledResponseContext>)>,
-        flushing_reactions: HashMap<message::Id, reaction::Pending>,
-        flushing_redactions: HashMap<message::Id, redaction::Pending>,
     },
     Full {
         kind: Kind,
         messages: Vec<Message>, // Sorted by Message.server_time
-        last_updated_at: Option<Instant>,
+        unread_count: usize,
         read_marker: Option<ReadMarker>,
         display_read_marker: Option<ReadMarker>,
-        chathistory_references: Option<MessageReferences>,
-        last_seen: HashMap<Nick, DateTime<Utc>>,
         cleared: bool,
-        last_flushed_at: usize,
     },
 }
 
@@ -486,42 +110,41 @@ impl History {
         Self::Partial {
             kind,
             pending_messages: vec![],
-            last_updated_at: None,
+            unread_count: 0,
             max_triggers_unread: None,
-            max_triggers_highlight: None,
             read_marker: None,
-            chathistory_references: None,
-            last_seen: HashMap::new(),
-            pending_reactions: HashMap::new(),
-            pending_redactions: HashMap::new(),
             show_in_sidebar: false,
-            flushing_messages: vec![],
-            flushing_reactions: HashMap::new(),
-            flushing_redactions: HashMap::new(),
         }
     }
 
-    pub fn update_partial(&mut self, metadata: Metadata) {
-        if let Self::Partial {
-            max_triggers_unread,
-            max_triggers_highlight,
-            read_marker,
-            chathistory_references,
-            ..
-        } = self
-        {
-            *read_marker = (*read_marker).max(metadata.read_marker);
-            *max_triggers_unread =
-                (*max_triggers_unread).max(metadata.last_triggers_unread);
-            *max_triggers_highlight =
-                (*max_triggers_highlight).max(metadata.last_triggers_highlight);
-            *chathistory_references = chathistory_references
-                .clone()
-                .max(metadata.chathistory_references);
+    pub fn unread_count(&self) -> usize {
+        match self {
+            History::Partial { unread_count, .. }
+            | History::Full { unread_count, .. } => *unread_count,
+        }
+    }
+
+    fn mark_unread(&mut self) {
+        match self {
+            History::Partial {
+                unread_count,
+                show_in_sidebar,
+                ..
+            } => {
+                *unread_count += 1;
+                *show_in_sidebar = true;
+            }
+            History::Full { unread_count, .. } => {
+                *unread_count += 1;
+            }
         }
     }
 
     fn has_unread(&self) -> bool {
+        if self.unread_count() > 0 {
+            return true;
+        }
+
         match self {
             History::Partial {
                 max_triggers_unread,
@@ -556,584 +179,83 @@ impl History {
         }
     }
 
-    fn has_highlight(&self) -> bool {
+    fn add_message(&mut self, message: Message) {
+        let triggers_unread = message.triggers_unread();
+
         match self {
             History::Partial {
-                max_triggers_highlight,
-                read_marker,
+                pending_messages,
+                unread_count,
+                max_triggers_unread,
+                show_in_sidebar,
                 ..
             } => {
-                // Read marker is prior to last known message which triggers highlight
-                if let Some(read_marker) = read_marker {
-                    max_triggers_highlight
-                        .is_some_and(|max| read_marker.date_time() < max)
+                if matches!(message.direction, message::Direction::Sent)
+                    || (triggers_unread
+                        && Some(message.server_time) > *max_triggers_unread)
+                {
+                    *show_in_sidebar = true;
                 }
-                // Default state == highlight if theres messages that trigger indicator
-                else {
-                    max_triggers_highlight.is_some()
+
+                if triggers_unread {
+                    *unread_count += 1;
+                    *max_triggers_unread =
+                        (*max_triggers_unread).max(Some(message.server_time));
                 }
+
+                insert_message(pending_messages, message);
+
+                truncate_messages(pending_messages);
             }
             History::Full {
                 messages,
-                read_marker,
+                unread_count,
                 ..
             } => {
-                let latest = metadata::latest_triggers_highlight(messages);
-
-                if let Some(read_marker) = read_marker {
-                    latest
-                        .is_some_and(|latest| read_marker.date_time() < latest)
-                } else {
-                    latest.is_some()
+                if insert_message(messages, message) && triggers_unread {
+                    *unread_count += 1;
                 }
+
+                truncate_messages(messages);
             }
         }
     }
 
-    fn add_message(
-        &mut self,
-        message: Message,
-        labeled_response_context: Option<LabeledResponseContext>,
-    ) -> Option<ReadMarker> {
-        if let History::Partial {
-            show_in_sidebar,
-            max_triggers_unread,
+    fn make_partial(&mut self) {
+        if let History::Full {
+            kind,
+            messages,
+            unread_count,
+            read_marker,
             ..
         } = self
-            && (matches!(message.direction, message::Direction::Sent)
-                || ((message.triggers_unread()
-                    || (message.is_echo && !message.deduplicate))
-                    && Some(message.server_time) > *max_triggers_unread))
         {
-            *show_in_sidebar = true;
-        }
-
-        if message.triggers_unread()
-            && let History::Partial {
-                max_triggers_unread,
-                ..
-            } = self
-        {
-            *max_triggers_unread =
-                (*max_triggers_unread).max(Some(message.server_time));
-        }
-
-        if message.triggers_highlight()
-            && !message.blocked
-            && let History::Partial {
-                max_triggers_highlight,
-                ..
-            } = self
-        {
-            *max_triggers_highlight =
-                (*max_triggers_highlight).max(Some(message.server_time));
-        }
-
-        match self {
-            History::Partial {
-                last_updated_at, ..
-            }
-            | History::Full {
-                last_updated_at, ..
-            } => {
-                *last_updated_at = Some(Instant::now());
-            }
-        }
-
-        if matches!(
-            self,
-            History::Partial {
-                kind: Kind::ChannelMonitor,
-                ..
-            }
-        ) {
-            return None;
-        }
-
-        match self {
-            History::Partial { last_seen, .. }
-            | History::Full { last_seen, .. } => {
-                update_last_seen(last_seen, &message);
-            }
-        }
-
-        match self {
-            History::Partial {
-                pending_messages, ..
-            } => {
-                pending_messages.push((message, labeled_response_context));
-
-                None
-            }
-            History::Full { messages, .. } => {
-                insert_message(messages, message, labeled_response_context)
-            }
-        }
-    }
-
-    pub fn find_reply_target(
-        &self,
-        id: &message::Id,
-        server_time: &DateTime<Utc>,
-    ) -> Option<&Message> {
-        match self {
-            History::Partial {
-                pending_messages, ..
-            } => pending_messages
-                .iter()
-                .find(|(m, _)| m.id.as_deref() == Some(id))
-                .map(|(m, _)| m),
-            History::Full { messages, .. } => {
-                find_reply_target(messages, id, server_time)
-            }
-        }
-    }
-
-    pub fn find_reply_target_mut(
-        &mut self,
-        id: &message::Id,
-        server_time: &DateTime<Utc>,
-    ) -> Option<&mut Message> {
-        match self {
-            History::Partial {
-                pending_messages, ..
-            } => pending_messages
-                .iter_mut()
-                .find(|(m, _)| m.id.as_deref() == Some(id))
-                .map(|(m, _)| m),
-            History::Full { messages, .. } => {
-                find_reply_target_mut(messages, id, server_time)
-            }
-        }
-    }
-
-    pub(crate) fn is_our_message(
-        &self,
-        id: &message::Id,
-        server_time: &DateTime<Utc>,
-    ) -> bool {
-        self.find_reply_target(id, server_time)
-            .is_some_and(|msg| msg.direction == Direction::Sent || msg.is_echo)
-    }
-
-    fn remove_message(
-        &mut self,
-        server_time: DateTime<Utc>,
-        hash: message::Hash,
-    ) -> Option<Message> {
-        match self {
-            History::Partial {
-                pending_messages, ..
-            } => pending_messages
-                .iter()
-                .position(|(message, _)| message.hash == hash)
-                .map(|index| {
-                    let (message, _) = pending_messages.remove(index);
-                    message
-                }),
-            History::Full { messages, .. } => {
-                if messages.is_empty() {
-                    return None;
-                }
-
-                let fuzz_seconds = chrono::Duration::seconds(1);
-
-                let start = server_time - fuzz_seconds;
-                let end = server_time + fuzz_seconds;
-
-                let start_index = match messages
-                    .binary_search_by(|stored| stored.server_time.cmp(&start))
-                {
-                    Ok(match_index) => match_index,
-                    Err(sorted_insert_index) => sorted_insert_index,
-                };
-                let end_index = match messages
-                    .binary_search_by(|stored| stored.server_time.cmp(&end))
-                {
-                    Ok(match_index) => match_index,
-                    Err(sorted_insert_index) => sorted_insert_index,
-                };
-
-                messages[start_index..end_index]
-                    .iter()
-                    .position(|message| message.hash == hash)
-                    .map(|slice_index| {
-                        messages.remove(start_index + slice_index)
-                    })
-            }
-        }
-    }
-
-    // Find the first message in the condensation, then return all messages in
-    // the condensation
-    fn get_expansion_messages(
-        &mut self,
-        server_time: DateTime<Utc>,
-        hash: message::Hash,
-        config: &config::buffer::Condensation,
-    ) -> Vec<&mut Message> {
-        match self {
-            History::Partial { .. } => (),
-            History::Full { messages, .. } => {
-                if messages.is_empty() {
-                    return vec![];
-                }
-
-                let fuzz_seconds = chrono::Duration::seconds(1);
-
-                let start = server_time - fuzz_seconds;
-                let end = server_time + fuzz_seconds;
-
-                let start_index = match messages
-                    .binary_search_by(|stored| stored.server_time.cmp(&start))
-                {
-                    Ok(match_index) => match_index,
-                    Err(sorted_insert_index) => sorted_insert_index,
-                };
-                let end_index = match messages
-                    .binary_search_by(|stored| stored.server_time.cmp(&end))
-                {
-                    Ok(match_index) => match_index,
-                    Err(sorted_insert_index) => sorted_insert_index,
-                };
-
-                if let Some(index) = messages[start_index..end_index]
-                    .iter()
-                    .enumerate()
-                    .find_map(|(slice_index, message)| {
-                        (message.hash == hash)
-                            .then_some(start_index + slice_index)
-                    })
-                {
-                    if messages[index].redaction.is_some() {
-                        return vec![&mut messages[index]];
-                    } else if let Some(first_index) = messages[..=index]
-                        .iter()
-                        .rev()
-                        .position(|message| message.condensed.is_some())
-                        .map(|position| index - position)
-                    {
-                        return messages[first_index..]
-                            .iter_mut()
-                            .filter(|message| !message.blocked)
-                            .scan(true, |is_first_message, message| {
-                                if *is_first_message {
-                                    *is_first_message = false;
-                                    Some(message)
-                                } else {
-                                    (message.can_condense(config)
-                                        && message.condensed.is_none())
-                                    .then_some(message)
-                                }
-                            })
-                            .collect();
-                    }
-                }
-            }
-        }
-
-        vec![]
-    }
-
-    // If now is None then history will be flushed regardless of time
-    // since last received
-    fn flush(
-        &mut self,
-        now: Option<Instant>,
-        seed: Option<Seed>,
-    ) -> Option<BoxFuture<'static, Result<Vec<EchoEvent>, Error>>> {
-        match self {
-            History::Partial {
-                kind,
-                pending_messages,
-                last_updated_at,
-                read_marker,
-                max_triggers_unread,
-                max_triggers_highlight,
-                chathistory_references,
-                pending_reactions,
-                pending_redactions,
-                flushing_messages,
-                flushing_reactions,
-                flushing_redactions,
-                ..
-            } => {
-                if let Some(last_received) = *last_updated_at
-                    && (now.is_none_or(|now| {
-                        now.duration_since(last_received)
-                            >= FLUSH_AFTER_LAST_RECEIVED
-                    }) || pending_messages.len() > FLUSH_COUNT)
-                    && flushing_messages.is_empty()
-                    && flushing_reactions.is_empty()
-                    && flushing_redactions.is_empty()
-                {
-                    let kind = kind.clone();
-                    let read_marker = *read_marker;
-                    let max_triggers_unread = *max_triggers_unread;
-                    let max_triggers_highlight = *max_triggers_highlight;
-
-                    *last_updated_at = None;
-
-                    if matches!(kind, Kind::ChannelMonitor) {
-                        return Some(
-                            async move {
-                                metadata::update(
-                                    &kind,
-                                    read_marker,
-                                    max_triggers_unread,
-                                    max_triggers_highlight,
-                                    None,
-                                )
-                                .await
-                                .map(|()| Vec::<EchoEvent>::new())
-                            }
-                            .boxed(),
-                        );
-                    }
-
-                    let pending_messages = std::mem::take(pending_messages);
-                    *flushing_messages = pending_messages.clone();
-                    let chathistory_references = chathistory_references.clone();
-                    let pending_reactions = std::mem::take(pending_reactions);
-                    *flushing_reactions = pending_reactions.clone();
-                    let pending_redactions = std::mem::take(pending_redactions);
-                    *flushing_redactions = pending_redactions.clone();
-
-                    return Some(
-                        async move {
-                            append(
-                                &kind,
-                                seed,
-                                pending_messages,
-                                read_marker,
-                                max_triggers_unread,
-                                max_triggers_highlight,
-                                chathistory_references,
-                                pending_reactions,
-                                pending_redactions,
-                            )
-                            .await
-                        }
-                        .boxed(),
-                    );
-                }
-
-                None
-            }
-            History::Full {
-                kind,
-                messages,
-                last_updated_at,
-                read_marker,
-                chathistory_references,
-                last_flushed_at,
-                ..
-            } => {
-                if let Some(last_received) = *last_updated_at
-                    && (now.is_none_or(|now| {
-                        now.duration_since(last_received)
-                            >= FLUSH_AFTER_LAST_RECEIVED
-                    }) || messages.len().saturating_sub(*last_flushed_at)
-                        > FLUSH_COUNT)
-                    && !messages.is_empty()
-                {
-                    let kind = kind.clone();
-                    let read_marker = *read_marker;
-
-                    *last_updated_at = None;
-
-                    if matches!(kind, Kind::ChannelMonitor) {
-                        let max_triggers_unread =
-                            metadata::latest_triggers_unread(messages);
-                        let max_triggers_highlight =
-                            metadata::latest_triggers_highlight(messages);
-
-                        return Some(
-                            async move {
-                                metadata::update(
-                                    &kind,
-                                    read_marker,
-                                    max_triggers_unread,
-                                    max_triggers_highlight,
-                                    None,
-                                )
-                                .await
-                                .map(|()| Vec::<EchoEvent>::new())
-                            }
-                            .boxed(),
-                        );
-                    }
-
-                    let chathistory_references = chathistory_references.clone();
-
-                    truncate_messages(messages);
-
-                    let messages = messages.clone();
-
-                    return Some(
-                        async move {
-                            overwrite(
-                                &kind,
-                                &messages,
-                                read_marker,
-                                chathistory_references,
-                            )
-                            .await
-                            .map(|()| vec![])
-                        }
-                        .boxed(),
-                    );
-                }
-
-                None
-            }
-        }
-    }
-
-    fn make_partial(
-        &mut self,
-    ) -> Option<BoxFuture<'static, Result<(), Error>>> {
-        match self {
-            History::Partial { .. } => None,
-            History::Full {
-                kind,
-                messages,
-                read_marker,
-                chathistory_references,
-                last_seen,
-                ..
-            } => {
-                let kind = kind.clone();
-                let read_marker = *read_marker;
-                let max_triggers_unread =
-                    metadata::latest_triggers_unread(messages);
-                let max_triggers_highlight =
-                    metadata::latest_triggers_highlight(messages);
-
-                if matches!(kind, Kind::ChannelMonitor) {
-                    *self = Self::Partial {
-                        kind: kind.clone(),
-                        pending_messages: vec![],
-                        last_updated_at: None,
-                        read_marker,
-                        max_triggers_unread,
-                        max_triggers_highlight,
-                        chathistory_references: None,
-                        last_seen: HashMap::new(),
-                        pending_reactions: HashMap::new(),
-                        pending_redactions: HashMap::new(),
-                        show_in_sidebar: true,
-                        flushing_messages: vec![],
-                        flushing_reactions: HashMap::new(),
-                        flushing_redactions: HashMap::new(),
-                    };
-
-                    return Some(
-                        async move {
-                            metadata::update(
-                                &kind,
-                                read_marker,
-                                max_triggers_unread,
-                                max_triggers_highlight,
-                                None,
-                            )
-                            .await
-                        }
-                        .boxed(),
-                    );
-                }
-
-                let last_seen = last_seen.clone();
-                let chathistory_references =
-                    metadata::latest_can_reference(messages)
-                        .max(chathistory_references.clone());
-
-                let full_history = std::mem::replace(
-                    self,
-                    Self::Partial {
-                        kind,
-                        pending_messages: vec![],
-                        last_updated_at: None,
-                        read_marker,
-                        max_triggers_unread,
-                        max_triggers_highlight,
-                        chathistory_references: chathistory_references.clone(),
-                        last_seen,
-                        pending_reactions: HashMap::new(),
-                        pending_redactions: HashMap::new(),
-                        show_in_sidebar: true,
-                        flushing_messages: vec![],
-                        flushing_reactions: HashMap::new(),
-                        flushing_redactions: HashMap::new(),
-                    },
-                );
-
-                match full_history {
-                    History::Partial { .. } => None,
-                    History::Full { kind, messages, .. } => Some(
-                        async move {
-                            overwrite(
-                                &kind,
-                                &messages,
-                                read_marker,
-                                chathistory_references,
-                            )
-                            .await
-                        }
-                        .boxed(),
-                    ),
-                }
-            }
-        }
-    }
-
-    async fn close(self, seed: Option<Seed>) -> Result<(), Error> {
-        match self {
-            History::Partial {
-                kind,
-                pending_messages,
-                read_marker,
-                max_triggers_unread,
-                max_triggers_highlight,
-                chathistory_references,
-                pending_reactions,
-                pending_redactions,
-                ..
-            } => append(
-                &kind,
-                seed,
-                pending_messages,
-                read_marker,
-                max_triggers_unread,
-                max_triggers_highlight,
-                chathistory_references,
-                pending_reactions,
-                pending_redactions,
-            )
-            .await
-            .map(|_| ()),
-            History::Full {
-                kind,
-                messages,
-                read_marker,
-                chathistory_references,
-                ..
-            } => {
-                overwrite(&kind, &messages, read_marker, chathistory_references)
-                    .await
-            }
+            *self = Self::Partial {
+                kind: kind.clone(),
+                pending_messages: vec![],
+                unread_count: *unread_count,
+                max_triggers_unread: metadata::latest_triggers_unread(messages),
+                read_marker: *read_marker,
+                show_in_sidebar: true,
+            };
         }
     }
 
     pub fn mark_as_read(&mut self) -> Option<ReadMarker> {
-        let (read_marker, latest) = match self {
+        let (unread_count, read_marker, latest) = match self {
             History::Partial {
+                unread_count,
                 max_triggers_unread,
                 read_marker,
                 ..
-            } => (read_marker, max_triggers_unread.map(ReadMarker::from)),
+            } => (
+                unread_count,
+                read_marker,
+                max_triggers_unread.map(ReadMarker::from),
+            ),
             History::Full {
                 messages,
+                unread_count,
                 read_marker,
                 display_read_marker,
                 ..
@@ -1144,9 +266,11 @@ impl History {
                     *display_read_marker = latest;
                 }
 
-                (read_marker, latest)
+                (unread_count, read_marker, latest)
             }
         };
+
+        *unread_count = 0;
 
         if latest > *read_marker {
             *read_marker = latest;
@@ -1166,139 +290,12 @@ impl History {
                 ..
             } => {
                 if messages.is_empty() {
-                    false
+                    self.unread_count() > 0
                 } else {
-                    *read_marker < ReadMarker::latest(messages)
+                    self.unread_count() > 0
+                        || *read_marker < ReadMarker::latest(messages)
                 }
             }
-        }
-    }
-
-    pub fn first_can_reference(&self) -> Option<&Message> {
-        let can_reference = |message: &Message| {
-            message.can_reference() && !message.is_rerouted()
-        };
-
-        match self {
-            History::Partial {
-                pending_messages, ..
-            } => pending_messages.iter().find_map(|(message, _)| {
-                can_reference(message).then_some(message)
-            }),
-            History::Full { messages, .. } => {
-                messages.iter().find(|message| can_reference(message))
-            }
-        }
-    }
-
-    pub fn last_can_reference_before_or_at(
-        &self,
-        server_time: DateTime<Utc>,
-        allow_at: bool,
-        message_reference_types: &[isupport::MessageReferenceType],
-    ) -> Option<isupport::MessageReference> {
-        let can_reference_before = |message: &Message| {
-            message.can_reference()
-                && !message.is_rerouted()
-                && message.server_time < server_time
-        };
-
-        let mut at_message = None;
-
-        let can_reference_at = |message: &Message| {
-            message.can_reference()
-                && !message.is_rerouted()
-                && message.server_time == server_time
-        };
-
-        let (before_message, chathistory_references) = match self {
-            History::Partial {
-                pending_messages,
-                chathistory_references,
-                ..
-            } => (
-                pending_messages.iter().rev().find_map(|(message, _)| {
-                    if at_message.is_none() && can_reference_at(message) {
-                        at_message = Some(message);
-                    }
-
-                    can_reference_before(message).then_some(message)
-                }),
-                chathistory_references,
-            ),
-            History::Full {
-                messages,
-                chathistory_references,
-                ..
-            } => (
-                messages.iter().rev().find(|message| {
-                    if at_message.is_none() && can_reference_at(message) {
-                        at_message = Some(message);
-                    }
-
-                    can_reference_before(message)
-                }),
-                chathistory_references,
-            ),
-        };
-
-        // If a reference before server_time exists, then return that reference.
-        if let Some(message_references) =
-            before_message.map(Message::references).max(
-                if chathistory_references.as_ref().is_some_and(
-                    |chathistory_references| {
-                        chathistory_references.timestamp < server_time
-                    },
-                ) {
-                    chathistory_references.clone()
-                } else {
-                    None
-                },
-            )
-        {
-            message_references.message_reference(message_reference_types)
-        // Else, if a reference at server_time is allowed, exists, and timestamp
-        // references are supported, then return a timestamp reference at
-        // server_time.
-        } else if allow_at
-            && message_reference_types
-                .contains(&isupport::MessageReferenceType::Timestamp)
-            && (at_message.is_some()
-                || chathistory_references.as_ref().is_some_and(
-                    |chathistory_references| {
-                        chathistory_references.timestamp == server_time
-                    },
-                ))
-        {
-            Some(isupport::MessageReference::Timestamp(server_time))
-        } else {
-            None
-        }
-    }
-
-    pub fn update_chathistory_references(
-        &mut self,
-        chathistory_references: MessageReferences,
-    ) {
-        let (stored, last_updated_at) = match self {
-            History::Partial {
-                chathistory_references: stored_chathistory_references,
-                last_updated_at,
-                ..
-            } => (stored_chathistory_references, last_updated_at),
-            History::Full {
-                chathistory_references: stored_chathistory_references,
-                last_updated_at,
-                ..
-            } => (stored_chathistory_references, last_updated_at),
-        };
-
-        if stored
-            .as_ref()
-            .is_none_or(|stored| chathistory_references > *stored)
-        {
-            *stored = Some(chathistory_references);
-            *last_updated_at = Some(Instant::now());
         }
     }
 
@@ -1356,308 +353,57 @@ impl History {
     }
 
     pub fn hide_preview(&mut self, message: message::Hash, url: url::Url) {
-        if let Self::Full {
-            messages,
-            last_updated_at,
-            ..
-        } = self
+        if let Self::Full { messages, .. } = self
             && let Some(message) =
                 messages.iter_mut().find(|m| m.hash == message)
         {
             message.hidden_urls.insert(url);
-
-            *last_updated_at = Some(Instant::now());
         }
     }
 
     pub fn show_preview(&mut self, message: message::Hash, url: &url::Url) {
-        if let Self::Full {
-            messages,
-            last_updated_at,
-            ..
-        } = self
+        if let Self::Full { messages, .. } = self
             && let Some(message) =
                 messages.iter_mut().find(|m| m.hash == message)
         {
             message.hidden_urls.remove(url);
-
-            *last_updated_at = Some(Instant::now());
-        }
-    }
-
-    pub fn add_reaction(
-        &mut self,
-        reaction: reaction::Context,
-        notification_enabled: bool,
-        labeled_response_context: Option<LabeledResponseContext>,
-    ) -> Option<ReactionToEcho> {
-        match self {
-            History::Partial {
-                pending_messages,
-                last_updated_at,
-                pending_reactions,
-                ..
-            } => {
-                if let Some(message) =
-                    pending_messages.iter_mut().rev().find_map(|(m, _)| {
-                        (m.id.as_deref() == Some(&*reaction.in_reply_to))
-                            .then_some(m)
-                    })
-                {
-                    let message_text = if message.is_echo
-                        && message.direction == Direction::Received
-                    {
-                        Some(message.text().to_string())
-                    } else {
-                        None
-                    };
-
-                    message.reactions.push(reaction.inner.clone());
-
-                    if let Some(message_text) = message_text
-                        && notification_enabled
-                    {
-                        return Some(ReactionToEcho {
-                            reaction,
-                            message_text,
-                        });
-                    } else {
-                        return None;
-                    }
-                } else {
-                    let pending = pending_reactions
-                        .entry(reaction.in_reply_to)
-                        .or_insert(reaction::Pending::default());
-
-                    pending.reactions.push(reaction::PendingReaction {
-                        reaction: reaction.inner,
-                        is_echo: reaction.is_echo,
-                        deduplicate: reaction.deduplicate,
-                        labeled_response_context,
-                        notification_enabled,
-                    });
-                }
-
-                *last_updated_at = Some(Instant::now());
-            }
-            History::Full {
-                messages,
-                last_updated_at,
-                ..
-            } => {
-                let message = find_reply_target_mut(
-                    messages,
-                    &reaction.in_reply_to,
-                    &reaction.inner.server_time,
-                )?;
-                message.reactions.push(reaction.inner.clone());
-
-                *last_updated_at = Some(Instant::now());
-
-                if message.is_echo
-                    && message.direction == Direction::Received
-                    && notification_enabled
-                {
-                    return Some(ReactionToEcho {
-                        reaction,
-                        message_text: message.text().to_string(),
-                    });
-                } else {
-                    return None;
-                };
-            }
-        }
-        None
-    }
-
-    pub fn redact_message(
-        &mut self,
-        id: message::Id,
-        redaction: Redaction,
-        server_time: DateTime<Utc>,
-        display_redacted: bool,
-    ) {
-        match self {
-            History::Partial {
-                pending_messages,
-                last_updated_at,
-                pending_redactions,
-                ..
-            } => {
-                if let Some(message) =
-                    pending_messages.iter_mut().rev().find_map(|(m, _)| {
-                        (m.id.as_deref() == Some(&*id)).then_some(m)
-                    })
-                {
-                    message.redaction = Some(redaction);
-                } else {
-                    let pending = pending_redactions.entry(id).or_insert(
-                        redaction::Pending::new(redaction, server_time),
-                    );
-
-                    pending.server_time =
-                        (pending.server_time).min(server_time);
-                }
-
-                *last_updated_at = Some(Instant::now());
-            }
-            History::Full {
-                messages,
-                last_updated_at,
-                ..
-            } => {
-                let Some(position) =
-                    position_reply_target(messages, &id, &server_time)
-                else {
-                    return;
-                };
-
-                messages[position].redaction = Some(redaction);
-
-                if !display_redacted {
-                    messages[position].blocked = true;
-                }
-
-                let updated_reply = messages[position].as_reply_preview();
-                for message in messages.iter_mut() {
-                    if message.reply_to.as_deref() == Some(&*id) {
-                        message.reply_preview = Some(updated_reply.clone());
-                    }
-                }
-
-                *last_updated_at = Some(Instant::now());
-            }
-        }
-    }
-
-    pub fn last_seen(&self) -> HashMap<Nick, DateTime<Utc>> {
-        match self {
-            History::Partial { last_seen, .. }
-            | History::Full { last_seen, .. } => last_seen.clone(),
-        }
-    }
-
-    pub fn renormalize_messages(&mut self, seed: Seed) {
-        match self {
-            History::Full { messages, .. } => {
-                renormalize_messages(messages.iter_mut(), seed);
-            }
-            History::Partial {
-                pending_messages, ..
-            } => renormalize_messages(
-                pending_messages.iter_mut().map(|(message, _)| message),
-                seed,
-            ),
         }
     }
 }
 
-/// Insert the incoming message into the provided vector, sorted
-/// on server time
-///
-/// Deduplication is only checked +/- 1 second around the server time
-/// of the incoming message. Either message IDs match, or server times
-/// have an exact match + target & content.
-///
-/// A non-None return value indicates whether a message sent from / this client
-/// was replaced by an echo (and the replacement's server_time corresponds to
-/// the ReadMarker)
-pub fn insert_message(
-    messages: &mut Vec<Message>,
-    message: Message,
-    labeled_response_context: Option<LabeledResponseContext>,
-) -> Option<ReadMarker> {
+/// Inserts `message` into `messages` sorted by `server_time`, unless a
+/// message within a [`FUZZ_SECONDS`] window with the same direction, same
+/// source, and equal content already exists — the only defense when a
+/// `get_messages` snapshot races live events. Returns whether the message
+/// was inserted.
+pub fn insert_message(messages: &mut Vec<Message>, message: Message) -> bool {
     if messages.is_empty() {
         messages.push(message);
 
-        return None;
+        return true;
     }
 
-    let message_is_unlabeled_echo =
-        matches!(message.direction, message::Direction::Received)
-            && message.is_echo
-            && labeled_response_context.is_none();
+    let fuzz = chrono::Duration::seconds(FUZZ_SECONDS);
+    let start = message.server_time - fuzz;
+    let end = message.server_time + fuzz;
 
-    let fuzz_seconds = if message_is_unlabeled_echo {
-        chrono::Duration::seconds(300)
-    } else {
-        chrono::Duration::seconds(1)
-    };
-
-    let mut read_marker = None;
-
-    if let Some(labeled_response_context) = &labeled_response_context {
-        let start = labeled_response_context.server_time - fuzz_seconds;
-        let end = labeled_response_context.server_time + fuzz_seconds;
-
-        let start_index = match messages
-            .binary_search_by(|stored| stored.server_time.cmp(&start))
-        {
-            Ok(match_index) => match_index,
-            Err(sorted_insert_index) => sorted_insert_index,
-        };
-        let end_index = match messages
-            .binary_search_by(|stored| stored.server_time.cmp(&end))
-        {
-            Ok(match_index) => match_index,
-            Err(sorted_insert_index) => sorted_insert_index,
-        };
-
-        if let Some(index) = messages[start_index..end_index]
-            .iter()
-            .enumerate()
-            .find_map(|(slice_index, stored)| {
-                (stored.id.as_ref().is_some_and(|id| {
-                    *id == labeled_response_context.label_as_id
-                }) && stored.target == message.target)
-                    .then_some(start_index + slice_index)
-            })
-        {
-            messages.remove(index);
-
-            read_marker = Some(ReadMarker::from(&message));
-        }
-    }
-
-    let start = message.server_time - fuzz_seconds;
-    let end = message.server_time + fuzz_seconds;
-
-    let start_index = match messages
+    let start_index = messages
         .binary_search_by(|stored| stored.server_time.cmp(&start))
-    {
-        Ok(match_index) => match_index,
-        Err(sorted_insert_index) => sorted_insert_index,
-    };
-    let end_index = match messages
+        .unwrap_or_else(|sorted_insert_index| sorted_insert_index);
+    let end_index = messages
         .binary_search_by(|stored| stored.server_time.cmp(&end))
-    {
-        Ok(match_index) => match_index,
-        Err(sorted_insert_index) => sorted_insert_index,
-    };
+        .unwrap_or_else(|sorted_insert_index| sorted_insert_index);
 
     let mut insert_at = start_index;
-    let mut replace_at = None;
 
     for (current_index, stored) in
         (start_index..).zip(messages[start_index..end_index].iter())
     {
-        if replace_at.is_none() && labeled_response_context.is_none() {
-            let use_echo_cmp =
-                matches!(stored.direction, message::Direction::Sent)
-                    && message_is_unlabeled_echo;
-
-            let check_for_matching_content = (stored.id.is_none()
-                || message.id.is_none())
-                && ((message.deduplicate
-                    && stored.server_time == message.server_time)
-                    || use_echo_cmp);
-
-            if (message.id.is_some() && stored.id == message.id)
-                || (check_for_matching_content
-                    && has_matching_content(stored, &message, use_echo_cmp))
-            {
-                replace_at = Some(current_index);
-            }
+        if stored.direction == message.direction
+            && stored.target.source() == message.target.source()
+            && stored.content == message.content
+        {
+            return false;
         }
 
         if message.server_time >= stored.server_time {
@@ -1665,209 +411,9 @@ pub fn insert_message(
         }
     }
 
-    if let Some(index) = replace_at {
-        if messages[index].server_time == message.server_time {
-            if message.deduplicate
-                && has_matching_content(&messages[index], &message, false)
-            {
-                // Perform a minimal update if this is a message from
-                // chathistory (or ZNC playback) and has the same raw content,
-                // since the newly received message will have been parsed
-                // without historical state.
-                if messages[index].id.is_none() {
-                    messages[index].id = message.id;
-                }
-                messages[index].direction = message::Direction::Received;
-                messages[index].command = None;
-                messages[index].received_at = message.received_at;
-            } else {
-                messages[index] = Message {
-                    id: message.id.or(messages[index].id.clone()),
-                    ..message
-                };
-            }
-        } else {
-            if message_is_unlabeled_echo {
-                read_marker = Some(ReadMarker::from(&message));
-            }
+    messages.insert(insert_at, message);
 
-            match insert_at.cmp(&index) {
-                Ordering::Less => {
-                    messages.remove(index);
-                    messages.insert(insert_at, message);
-                }
-                Ordering::Equal => messages[index] = message,
-                Ordering::Greater => {
-                    messages.insert(insert_at, message);
-                    messages.remove(index);
-                }
-            }
-        }
-    } else {
-        messages.insert(insert_at, message);
-    }
-
-    read_marker
-}
-
-/// The content of JOIN, PART, and QUIT messages may be dependent on how
-/// the user attributes are resolved.  Match those messages based on Nick
-/// alone (covered by comparing target components) to avoid false negatives.
-fn has_matching_content(
-    message: &Message,
-    other: &Message,
-    use_echo_cmp: bool,
-) -> bool {
-    if message.target == other.target {
-        if let message::Source::Server(Some(source)) = message.target.source() {
-            match source.kind() {
-                message::source::server::Kind::Join
-                | message::source::server::Kind::Part
-                | message::source::server::Kind::Quit => {
-                    return true;
-                }
-                message::source::server::Kind::JoinTopic
-                | message::source::server::Kind::RequestTopic
-                | message::source::server::Kind::ChangeHost
-                | message::source::server::Kind::ChangeNick
-                | message::source::server::Kind::ChangeMode
-                | message::source::server::Kind::ChangeTopic
-                | message::source::server::Kind::MonitoredOnline
-                | message::source::server::Kind::MonitoredOffline
-                | message::source::server::Kind::StandardReply(_)
-                | message::source::server::Kind::WAllOps
-                | message::source::server::Kind::Kick
-                | message::source::server::Kind::Away
-                | message::source::server::Kind::Invite => (),
-            }
-        }
-
-        if use_echo_cmp {
-            matches!(message.content.echo_cmp(&other.content), Ordering::Equal)
-        } else {
-            message.content == other.content
-        }
-    } else {
-        false
-    }
-}
-
-pub fn insert_reaction(
-    reactions: &mut Vec<Reaction>,
-    reaction: Reaction,
-    is_echo: bool,
-    deduplicate: bool,
-    labeled_response_context: Option<LabeledResponseContext>,
-) {
-    if reactions.is_empty() {
-        reactions.push(reaction);
-
-        return;
-    }
-
-    if let Some(labeled_response_context) = &labeled_response_context {
-        if let Some(index) = reactions.iter().position(|reaction| {
-            reaction
-                .id
-                .as_ref()
-                .is_some_and(|id| *id == labeled_response_context.label_as_id)
-        }) {
-            reactions.remove(index);
-        }
-
-        reactions.push(reaction);
-    } else if let Some(index) = reactions.iter().position(|stored| {
-        (stored.id.is_some() && stored.id == reaction.id)
-            || (deduplicate
-                && (stored.server_time == reaction.server_time || is_echo)
-                && stored.sender == reaction.sender
-                && stored.text == reaction.text
-                && stored.unreact == reaction.unreact)
-    }) {
-        reactions[index] = reaction;
-    } else {
-        reactions.push(reaction);
-    }
-}
-
-pub fn update_last_seen(
-    last_seen: &mut HashMap<Nick, DateTime<Utc>>,
-    message: &Message,
-) {
-    if let Source::User(user) = message.target.source() {
-        let nickname = user.nickname().to_owned();
-
-        if let Some(date_time) = last_seen.get_mut(&nickname) {
-            if message.server_time > *date_time {
-                *date_time = message.server_time;
-            }
-        } else {
-            last_seen.insert(nickname, message.server_time);
-        }
-    }
-}
-
-pub fn get_last_seen(messages: &[Message]) -> HashMap<Nick, DateTime<Utc>> {
-    let mut last_seen = HashMap::new();
-
-    messages.iter().for_each(|message| {
-        update_last_seen(&mut last_seen, message);
-    });
-
-    last_seen
-}
-
-pub fn find_reply_target<'a>(
-    messages: &'a [Message],
-    id: &message::Id,
-    server_time: &DateTime<Utc>,
-) -> Option<&'a Message> {
-    position_reply_target(messages, id, server_time)
-        .and_then(|position| messages.get(position))
-}
-
-pub fn find_reply_target_mut<'a>(
-    messages: &'a mut [Message],
-    id: &message::Id,
-    server_time: &DateTime<Utc>,
-) -> Option<&'a mut Message> {
-    position_reply_target(messages, id, server_time)
-        .and_then(|position| messages.get_mut(position))
-}
-
-pub fn position_reply_target(
-    messages: &[Message],
-    id: &message::Id,
-    server_time: &DateTime<Utc>,
-) -> Option<usize> {
-    if messages.is_empty() {
-        return None;
-    }
-
-    let start = *server_time + chrono::Duration::seconds(1);
-
-    let start_index = match messages
-        .binary_search_by(|stored| stored.server_time.cmp(&start))
-    {
-        Ok(match_index) => match_index,
-        Err(sorted_insert_index) => sorted_insert_index,
-    };
-
-    // Look for the message at/before the earliest server_time for a react, then
-    // check for the unlikely scenario where the message where the message's
-    // server_time is after a react
-    messages
-        .iter()
-        .take(start_index)
-        .rev()
-        .position(|m| m.id.as_deref() == Some(id))
-        .map(|position| start_index - 1 - position)
-        .or(messages
-            .iter()
-            .skip(start_index)
-            .rev()
-            .position(|m| m.id.as_deref() == Some(id))
-            .map(|position| messages.len() - 1 - position))
+    true
 }
 
 #[derive(Debug)]
@@ -1880,12 +426,111 @@ pub struct View<'a> {
     pub cleared: bool,
 }
 
-#[derive(Debug, thiserror::Error)]
-pub enum Error {
-    #[error(transparent)]
-    Compression(#[from] compression::Error),
-    #[error(transparent)]
-    Io(#[from] io::Error),
-    #[error(transparent)]
-    SerdeJson(#[from] serde_json::Error),
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::message::StatusKind;
+
+    fn received(convo: &str, sender: &str, text: &str, ms: i64) -> Message {
+        Message::received(
+            ConvoId::from(convo),
+            Some(crate::Address::from(sender)),
+            text.to_string(),
+            ms,
+        )
+    }
+
+    #[test]
+    fn insert_message_dedupes_within_fuzz_window() {
+        let mut messages = vec![];
+
+        assert!(insert_message(
+            &mut messages,
+            received("c1", "peer", "hello", 10_000)
+        ));
+        // Same source + content within 1s -> duplicate (snapshot racing live)
+        assert!(!insert_message(
+            &mut messages,
+            received("c1", "peer", "hello", 10_400)
+        ));
+        // Outside the window -> genuinely repeated message
+        assert!(insert_message(
+            &mut messages,
+            received("c1", "peer", "hello", 12_500)
+        ));
+        // Same content, different source -> kept
+        assert!(insert_message(
+            &mut messages,
+            received("c1", "other", "hello", 10_400)
+        ));
+        // Same content + window, different direction -> kept
+        assert!(insert_message(
+            &mut messages,
+            Message::sent(ConvoId::from("c1"), "hello".to_string(), 10_400)
+        ));
+
+        assert_eq!(messages.len(), 4);
+        assert!(
+            messages.is_sorted_by_key(|message| message.server_time),
+            "insert_message must keep messages sorted"
+        );
+    }
+
+    #[test]
+    fn add_message_tracks_unread_in_both_states() {
+        let kind = Kind::Conversation(ConvoId::from("c1"));
+
+        let mut partial = History::partial(kind.clone());
+        partial.add_message(received("c1", "peer", "hi", 10_000));
+        partial.add_message(Message::sent(
+            ConvoId::from("c1"),
+            "reply".to_string(),
+            11_000,
+        ));
+        assert_eq!(partial.unread_count(), 1);
+        assert!(partial.has_unread());
+
+        // A Partial is not a black hole: it holds what it was given until
+        // `load_full` folds the module snapshot in around it
+        let History::Partial {
+            pending_messages, ..
+        } = &partial
+        else {
+            unreachable!("History::partial builds a Partial")
+        };
+        assert_eq!(pending_messages.len(), 2);
+
+        let mut full = History::Full {
+            kind,
+            messages: vec![],
+            unread_count: 0,
+            read_marker: None,
+            display_read_marker: None,
+            cleared: false,
+        };
+        full.add_message(received("c1", "peer", "hi", 10_000));
+        // Duplicate within the fuzz window must not bump the counter
+        full.add_message(received("c1", "peer", "hi", 10_300));
+        full.add_message(Message::status(
+            ConvoId::from("c1"),
+            StatusKind::MemberChange,
+            "member joined".to_string(),
+        ));
+        assert_eq!(full.unread_count(), 1);
+
+        assert!(full.mark_as_read().is_some());
+        assert_eq!(full.unread_count(), 0);
+        assert!(!full.has_unread());
+    }
+
+    #[test]
+    fn mark_unread_bumps_without_messages() {
+        let mut history =
+            History::partial(Kind::Conversation(ConvoId::from("c1")));
+        assert!(!history.has_unread());
+
+        history.mark_unread();
+        assert_eq!(history.unread_count(), 1);
+        assert!(history.has_unread());
+    }
 }

@@ -1,29 +1,19 @@
 use std::borrow::Cow;
-use std::num::NonZeroU16;
 use std::str::FromStr;
 
-use fancy_regex::Regex;
 use idna::uts46::{AsciiDenyList, Hyphens, Uts46};
 use percent_encoding::percent_decode_str;
 use unicode_security::confusable_detection::skeleton;
 use unicode_security::{RestrictionLevel, RestrictionLevelDetection};
 
 use crate::appearance::theme;
-use crate::config::server::{Muteable, default_port};
-use crate::server::ServerName;
-use crate::{config, isupport};
 
+/// Routable app URLs. IRC connection routing (`irc://`…) is gone; theme
+/// deep links keep the historical `halloy` scheme so shared themes and
+/// the theme website keep working.
 #[derive(Debug, Clone)]
 pub enum Url {
-    ServerConnect {
-        url: String,
-        server: ServerName,
-        config: config::Server,
-    },
-    Theme {
-        url: String,
-        styles: theme::Styles,
-    },
+    Theme { url: String, styles: theme::Styles },
     Unknown(String),
 }
 
@@ -33,9 +23,7 @@ impl std::fmt::Display for Url {
             f,
             "{}",
             match self {
-                Url::ServerConnect { url, .. }
-                | Url::Theme { url, .. }
-                | Url::Unknown(url) => url,
+                Url::Theme { url, .. } | Url::Unknown(url) => url,
             }
         )
     }
@@ -64,17 +52,7 @@ impl FromStr for Url {
     fn from_str(s: &str) -> Result<Self, Self::Err> {
         let url = s.parse::<url::Url>().map_err(|_| ())?;
 
-        if [
-            "irc",
-            "irc+insecure",
-            "ircs",
-            "halloy",
-            "ws",
-            "ws+insecure",
-            "wss",
-        ]
-        .contains(&url.scheme())
-        {
+        if ["halloy", "frigicom"].contains(&url.scheme()) {
             Ok(parse(url.clone()).unwrap_or(Url::Unknown(url.to_string())))
         } else {
             Err(())
@@ -84,18 +62,7 @@ impl FromStr for Url {
 
 fn parse(url: url::Url) -> Result<Url, Error> {
     match url.scheme().to_lowercase().as_str() {
-        "irc" | "irc+insecure" | "ircs" | "ws" | "ws+insecure" | "wss" => {
-            let config = parse_server_config(&url).ok_or(Error::ParseServer)?;
-            let server = generate_server_name(config.server.as_str());
-            let url = url.into();
-
-            Ok(Url::ServerConnect {
-                url,
-                server: server.into(),
-                config,
-            })
-        }
-        "halloy" if url.path() == "/theme" => {
+        "halloy" | "frigicom" if url.path() == "/theme" => {
             let (_, encoded) = url
                 .query_pairs()
                 .find(|(key, _)| key == "e")
@@ -112,104 +79,10 @@ fn parse(url: url::Url) -> Result<Url, Error> {
     }
 }
 
-fn generate_server_name(host: &str) -> &str {
-    let pattern = Regex::new(r"irc\.([^.]+)").unwrap();
-
-    if let Ok(Some(captures)) = pattern.captures(host)
-        && let Some(matched) = captures.get(1)
-    {
-        return matched.as_str();
-    }
-
-    host
-}
-
-fn parse_server_config(url: &url::Url) -> Option<config::Server> {
-    let nickname = config::random_nickname();
-
-    // Match on the host so IPv6 literals are stored without the square
-    // brackets that `url::Host::to_string()` would include.
-    let server = match url.host()? {
-        url::Host::Ipv6(address) => address.to_string(),
-        host => host.to_string(),
-    };
-    let port = url.port();
-    let use_tls = match url.scheme().to_lowercase().as_str() {
-        "irc" | "irc+insecure" | "ws" | "ws+insecure" => false,
-        "ircs" | "wss" => true,
-        _ => return None,
-    };
-    let use_websocket = match url.scheme().to_lowercase().as_str() {
-        "irc" | "irc+insecure" | "ircs" => false,
-        "ws" | "ws+insecure" | "wss" => true,
-        _ => return None,
-    };
-    let channels = {
-        let default_chantype =
-            isupport::DEFAULT_CHANTYPES.first().copied().unwrap_or('#');
-
-        let normalize_channel = |channel: &str| -> Option<String> {
-            let channel = percent_decode_str(channel).decode_utf8_lossy();
-
-            if channel.is_empty() {
-                return None;
-            }
-
-            // URL parsing runs before we know the server's CHANTYPES, so fall
-            // back to the default chantype set and prepend its first prefix
-            // for bare targets.
-            if channel.starts_with(isupport::DEFAULT_CHANTYPES) {
-                Some(channel.into_owned())
-            } else {
-                Some(format!("{default_chantype}{channel}"))
-            }
-        };
-
-        let mut channels = url.fragment().map_or(vec![], |fragment| {
-            // Fragment starts with #. We consider them as channels.
-            // Eg: [...]/#channel1,#channel2
-            fragment
-                .split(',')
-                .filter_map(normalize_channel)
-                .collect::<Vec<_>>()
-        });
-
-        if !url.path().is_empty() {
-            // We also consider path as channels separated by ','.
-            // Eg: [...]/channel1,channel2
-            channels.extend(
-                url.path()[1..]
-                    .split(',')
-                    .filter_map(normalize_channel)
-                    .collect::<Vec<_>>(),
-            );
-        }
-
-        channels
-            .into_iter()
-            .map(Muteable::default_with_name)
-            .collect()
-    };
-
-    Some(config::Server::new(
-        server,
-        match port {
-            Some(port) => NonZeroU16::new(port),
-            None => Some(default_port(use_tls, use_websocket)),
-        },
-        nickname,
-        channels,
-        use_tls,
-        use_websocket,
-    ))
-}
-
 #[derive(Debug, thiserror::Error)]
 pub enum Error {
     #[error(transparent)]
     ParseUrl(#[from] url::ParseError),
-    #[error("can't convert url to a valid server")]
-    ParseServer,
     #[error("unknown route")]
     Unknown,
     #[error("missing query pair")]
@@ -229,7 +102,7 @@ pub enum Error {
 ///
 /// See https://unicode.org/reports/tr46/ and https://www.unicode.org/reports/tr39/ for
 /// motivations. https://chromium.googlesource.com/chromium/src/+/main/docs/idn.md
-/// is not a bad read either - though note that IRC clients have very different threat
+/// is not a bad read either - though note that chat clients have very different threat
 /// models than browsers.
 ///
 pub fn display(u: &url::Url) -> Cow<'_, str> {
@@ -263,145 +136,16 @@ pub fn display(u: &url::Url) -> Cow<'_, str> {
 mod tests {
     use super::*;
 
-    #[track_caller]
-    fn assert_server_connect(
-        input: &str,
-        expected_server_name: &str,
-        expected_host: &str,
-        expected_port: Option<NonZeroU16>,
-        expected_channels: &[&str],
-        expected_use_tls: bool,
-        expected_use_websocket: bool,
-    ) {
-        let url = Url::from_str(input).unwrap();
-
-        let Url::ServerConnect { server, config, .. } = url else {
-            panic!("expected server connect URL");
-        };
-
-        assert_eq!(&*server, expected_server_name);
-        assert_eq!(config.server, expected_host);
-        assert_eq!(config.port, expected_port);
-        assert_eq!(config.use_tls, expected_use_tls);
-        assert_eq!(config.use_websocket, expected_use_websocket);
-        assert_eq!(
-            config.channels,
-            expected_channels
-                .iter()
-                .map(ToString::to_string)
-                .map(Muteable::default_with_name)
-                .collect::<Vec<_>>()
-        );
-    }
-
-    #[track_caller]
-    fn assert_eq_as_unmuted_channels(
-        channels: Vec<Muteable>,
-        channel_names: &[&str],
-    ) {
-        assert_eq!(
-            channels,
-            channel_names
-                .iter()
-                .map(ToString::to_string)
-                .map(Muteable::default_with_name)
-                .collect::<Vec<_>>()
-        );
+    #[test]
+    fn rejects_non_app_schemes() {
+        assert!(Url::from_str("https://example.com").is_err());
+        assert!(Url::from_str("irc://irc.libera.chat/#halloy").is_err());
     }
 
     #[test]
-    fn parses_hostname_without_channels() {
-        assert_server_connect(
-            "irc://irc.libera.chat",
-            "libera",
-            "irc.libera.chat",
-            NonZeroU16::new(6667),
-            &[],
-            false,
-            false,
-        );
-    }
-
-    #[test]
-    fn parses_hostname_with_fragment_channels_and_explicit_tls_port() {
-        assert_server_connect(
-            "ircs://irc.libera.chat:7000/#halloy,#rust",
-            "libera",
-            "irc.libera.chat",
-            NonZeroU16::new(7000),
-            &["#halloy", "#rust"],
-            true,
-            false,
-        );
-    }
-
-    #[test]
-    fn parses_ipv4_host_with_path_channels() {
-        assert_server_connect(
-            "irc://127.0.0.1:6669/channel,%26local,%2Bops,!safe",
-            "127.0.0.1",
-            "127.0.0.1",
-            NonZeroU16::new(6669),
-            &["#channel", "&local", "#+ops", "#!safe"],
-            false,
-            false,
-        );
-    }
-
-    #[test]
-    fn parses_ipv6_host_without_channels() {
-        assert_server_connect(
-            "ircs://[2001:db8::1]",
-            "2001:db8::1",
-            "2001:db8::1",
-            NonZeroU16::new(6697),
-            &[],
-            true,
-            false,
-        );
-    }
-
-    #[test]
-    fn parse_server_config_strips_ipv6_brackets() {
-        let url = url::Url::parse("irc://[2001:db8::1]/channel").unwrap();
-        let config = parse_server_config(&url).unwrap();
-
-        assert_eq!(config.server, "2001:db8::1");
-        assert_eq!(config.port, NonZeroU16::new(6667));
-        assert_eq_as_unmuted_channels(config.channels, &["#channel"]);
-        assert!(!config.use_tls);
-    }
-
-    #[test]
-    fn parse_server_config_decodes_percent_encoded_path_channels() {
-        let url =
-            url::Url::parse("irc://irc.example.org/%23foo%25bar,%26local")
-                .unwrap();
-        let config = parse_server_config(&url).unwrap();
-
-        assert_eq_as_unmuted_channels(config.channels, &["#foo%bar", "&local"]);
-    }
-
-    #[test]
-    fn parse_server_config_decodes_percent_encoded_fragment_channels() {
-        let url =
-            url::Url::parse("irc://irc.example.org/#foo%25bar,%2Bops").unwrap();
-        let config = parse_server_config(&url).unwrap();
-
-        assert_eq_as_unmuted_channels(config.channels, &["#foo%bar", "#+ops"]);
-    }
-
-    #[test]
-    fn parses_channels_with_percent_encoded_special_characters() {
-        assert_server_connect(
-            "irc://irc.example.org/%23ops%5Btest%5D%7Bdev%7D%5Efoo,%23foo%25bar",
-            "example",
-            "irc.example.org",
-            NonZeroU16::new(6667),
-            &["#ops[test]{dev}^foo", "#foo%bar"],
-            false,
-            false,
-        );
+    fn unparsable_theme_route_falls_back_to_unknown() {
+        let url = Url::from_str("halloy:///theme").expect("app scheme parses");
+        assert!(matches!(url, Url::Unknown(_)));
     }
 
     #[test]
@@ -441,31 +185,5 @@ mod tests {
         // CJK characters have no ASCII-confusable prototypes
         let u = url::Url::parse("https://日本語.jp/").unwrap();
         assert_eq!(display(&u), "https://日本語.jp/");
-    }
-
-    #[test]
-    fn parses_wss_with_default_ports() {
-        assert_server_connect(
-            "wss://irc.libera.chat",
-            "libera",
-            "irc.libera.chat",
-            NonZeroU16::new(443),
-            &[],
-            true,
-            true,
-        );
-    }
-
-    #[test]
-    fn parses_websocket_with_default_insecure_port() {
-        assert_server_connect(
-            "ws+insecure://irc.libera.chat",
-            "libera",
-            "irc.libera.chat",
-            NonZeroU16::new(80),
-            &[],
-            false,
-            true,
-        );
     }
 }

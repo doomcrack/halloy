@@ -1,13 +1,7 @@
 use fancy_regex::{Regex, RegexBuilder};
 use serde::{Deserialize, Deserializer};
 
-use crate::config::inclusivities::{
-    Inclusivities, is_source_included, is_target_ref_included,
-};
-use crate::message::Source;
 use crate::serde::deserialize_u64_positive_integer_limit;
-use crate::target::{self, TargetRef};
-use crate::{Server, isupport};
 
 #[derive(Debug, Clone, Deserialize)]
 #[serde(default)]
@@ -230,8 +224,6 @@ pub enum HideUrlCondition {
 #[derive(Debug, Clone, Deserialize)]
 #[serde(default)]
 pub struct Card {
-    pub exclude: Option<Inclusivities>,
-    pub include: Option<Inclusivities>,
     pub hide_url: HideUrlCondition,
     pub show_image: bool,
     pub round_image_corners: bool,
@@ -250,8 +242,6 @@ pub struct Card {
 impl Default for Card {
     fn default() -> Self {
         Self {
-            exclude: None,
-            include: None,
             hide_url: HideUrlCondition::Never,
             show_image: true,
             round_image_corners: true,
@@ -273,46 +263,10 @@ pub enum CardImageAction {
     Preview,
 }
 
-impl Card {
-    pub fn visible(
-        &self,
-        target_ref: TargetRef,
-        server: &Server,
-        casemapping: isupport::CaseMap,
-    ) -> Visibility {
-        Visibility::for_target_ref(
-            self.include.as_ref(),
-            self.exclude.as_ref(),
-            target_ref,
-            server,
-            casemapping,
-        )
-    }
-
-    pub fn visible_for_source(
-        &self,
-        source: &Source,
-        channel: Option<&target::Channel>,
-        server: Option<&Server>,
-        casemapping: isupport::CaseMap,
-    ) -> bool {
-        is_source_included(
-            self.include.as_ref(),
-            self.exclude.as_ref(),
-            source,
-            channel,
-            server,
-            casemapping,
-        )
-    }
-}
-
 #[derive(Debug, Clone, Deserialize)]
 #[serde(default)]
 pub struct Image {
     pub action: ImageAction,
-    pub exclude: Option<Inclusivities>,
-    pub include: Option<Inclusivities>,
     pub hide_url: HideUrlCondition,
     pub round_corners: bool,
     /// Maximum width of the image in pixels
@@ -325,8 +279,6 @@ impl Default for Image {
     fn default() -> Self {
         Self {
             action: ImageAction::default(),
-            exclude: None,
-            include: None,
             hide_url: HideUrlCondition::default(),
             round_corners: true,
             max_width: 550.0,
@@ -341,40 +293,6 @@ pub enum ImageAction {
     OpenUrl,
     #[default]
     Preview,
-}
-
-impl Image {
-    pub fn visible(
-        &self,
-        target_ref: TargetRef,
-        server: &Server,
-        casemapping: isupport::CaseMap,
-    ) -> Visibility {
-        Visibility::for_target_ref(
-            self.include.as_ref(),
-            self.exclude.as_ref(),
-            target_ref,
-            server,
-            casemapping,
-        )
-    }
-
-    pub fn visible_for_source(
-        &self,
-        source: &Source,
-        channel: Option<&target::Channel>,
-        server: Option<&Server>,
-        casemapping: isupport::CaseMap,
-    ) -> bool {
-        is_source_included(
-            self.include.as_ref(),
-            self.exclude.as_ref(),
-            source,
-            channel,
-            server,
-            casemapping,
-        )
-    }
 }
 
 pub fn deserialize_trim_interval<'de, D>(
@@ -410,63 +328,6 @@ where
             } else {
                 Ok(integer)
             }
-        }
-    }
-}
-
-#[derive(Debug, Clone, Copy)]
-pub enum Visibility {
-    All,
-    BySource,
-    None,
-}
-
-impl Visibility {
-    pub fn for_target_ref(
-        include: Option<&Inclusivities>,
-        exclude: Option<&Inclusivities>,
-        target_ref: TargetRef,
-        server: &Server,
-        casemapping: isupport::CaseMap,
-    ) -> Visibility {
-        if is_target_ref_included(
-            include,
-            Some(&Inclusivities::all()),
-            None,
-            target_ref,
-            server,
-            casemapping,
-        ) {
-            Visibility::All
-        } else if !is_target_ref_included(
-            None,
-            exclude,
-            None,
-            target_ref,
-            server,
-            casemapping,
-        ) {
-            if include.is_some_and(|include| {
-                include.has_user_or_server_message_conditions(
-                    target_ref,
-                    server,
-                    casemapping,
-                )
-            }) {
-                Visibility::BySource
-            } else {
-                Visibility::None
-            }
-        } else if exclude.is_some_and(|exclude| {
-            exclude.has_user_or_server_message_conditions(
-                target_ref,
-                server,
-                casemapping,
-            )
-        }) {
-            Visibility::BySource
-        } else {
-            Visibility::All
         }
     }
 }

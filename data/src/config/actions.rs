@@ -7,22 +7,18 @@ use crate::dashboard::{BufferAction, BufferFocusedAction};
 pub struct Actions {
     pub sidebar: Sidebar,
     pub buffer: Buffer,
-    pub nicklist: Nicklist,
+    #[serde(alias = "nicklist")]
+    pub member_list: MemberList,
     pub notification: Notification,
 }
 
 #[derive(Debug, Clone, Deserialize)]
 #[serde(default)]
 pub struct Buffer {
-    pub click_channel_name: ChannelClickAction,
-    pub click_highlight: ChannelClickAction,
-    pub click_channel_discovery: ChannelClickAction,
     #[serde(alias = "click_nickname")]
-    pub click_username: NicknameClickAction,
-    pub join_channel: BufferAction,
+    pub click_username: UsernameClickAction,
     #[serde(alias = "local")]
     pub open_internal: BufferAction,
-    pub message_channel: BufferAction,
     pub message_user: BufferAction,
     pub only_contract_expanded_message: bool,
     pub click_image_url: ImageClickAction,
@@ -31,13 +27,8 @@ pub struct Buffer {
 impl Default for Buffer {
     fn default() -> Self {
         Self {
-            click_channel_name: ChannelClickAction::default(),
-            click_highlight: ChannelClickAction::default(),
-            click_channel_discovery: ChannelClickAction::default(),
-            click_username: NicknameClickAction::default(),
-            join_channel: BufferAction::default(),
+            click_username: UsernameClickAction::default(),
             open_internal: BufferAction::default(),
-            message_channel: BufferAction::default(),
             message_user: BufferAction::default(),
             only_contract_expanded_message: true,
             click_image_url: ImageClickAction::default(),
@@ -49,33 +40,33 @@ impl Default for Buffer {
 #[serde(default)]
 pub struct Sidebar {
     pub buffer: BufferAction,
-    pub channel: Option<BufferAction>,
-    pub query: Option<BufferAction>,
     pub focused_buffer: Option<BufferFocusedAction>,
     pub cycle: CycleAction,
 }
 
 #[derive(Debug, Default, Clone, Deserialize)]
 #[serde(default)]
-pub struct Nicklist {
+pub struct MemberList {
     #[serde(alias = "click_nickname")]
-    pub click_username: Option<NicknameClickAction>,
+    pub click_username: Option<UsernameClickAction>,
 }
 
+/// What clicking a sender/member does: open a DM buffer, insert the
+/// address into the composer, or nothing.
 #[derive(Debug, Copy, Clone)]
-pub enum NicknameClickAction {
-    OpenQuery(BufferAction),
-    InsertNickname,
+pub enum UsernameClickAction {
+    OpenDirect(BufferAction),
+    InsertAddress,
     Noop,
 }
 
-impl Default for NicknameClickAction {
+impl Default for UsernameClickAction {
     fn default() -> Self {
-        Self::OpenQuery(BufferAction::default())
+        Self::OpenDirect(BufferAction::default())
     }
 }
 
-impl<'de> Deserialize<'de> for NicknameClickAction {
+impl<'de> Deserialize<'de> for UsernameClickAction {
     fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
     where
         D: Deserializer<'de>,
@@ -83,8 +74,10 @@ impl<'de> Deserialize<'de> for NicknameClickAction {
         #[derive(Deserialize)]
         #[serde(rename_all = "kebab-case")]
         enum ClickAction {
-            OpenQuery(BufferAction),
-            InsertNickname,
+            #[serde(alias = "open-query")]
+            OpenDirect(BufferAction),
+            #[serde(alias = "insert-nickname")]
+            InsertAddress,
             #[serde(alias = "no-action")]
             Noop,
         }
@@ -98,74 +91,17 @@ impl<'de> Deserialize<'de> for NicknameClickAction {
 
         match Action::deserialize(deserializer)? {
             Action::ClickAction(click_action) => match click_action {
-                ClickAction::OpenQuery(buffer_action) => {
-                    Ok(NicknameClickAction::OpenQuery(buffer_action))
+                ClickAction::OpenDirect(buffer_action) => {
+                    Ok(UsernameClickAction::OpenDirect(buffer_action))
                 }
-                ClickAction::InsertNickname => {
-                    Ok(NicknameClickAction::InsertNickname)
+                ClickAction::InsertAddress => {
+                    Ok(UsernameClickAction::InsertAddress)
                 }
-                ClickAction::Noop => Ok(NicknameClickAction::Noop),
+                ClickAction::Noop => Ok(UsernameClickAction::Noop),
             },
             Action::BufferAction(buffer_action) => {
-                Ok(NicknameClickAction::OpenQuery(buffer_action))
+                Ok(UsernameClickAction::OpenDirect(buffer_action))
             }
-        }
-    }
-}
-
-#[derive(Debug, Copy, Clone)]
-pub enum ChannelClickAction {
-    OpenChannel(BufferAction),
-    Noop,
-}
-
-impl Default for ChannelClickAction {
-    fn default() -> Self {
-        Self::OpenChannel(BufferAction::default())
-    }
-}
-
-impl<'de> Deserialize<'de> for ChannelClickAction {
-    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
-    where
-        D: Deserializer<'de>,
-    {
-        #[derive(Deserialize)]
-        #[serde(rename_all = "kebab-case")]
-        enum ClickAction {
-            OpenChannel(BufferAction),
-            #[serde(alias = "no-action")]
-            Noop,
-        }
-
-        #[derive(Deserialize)]
-        #[serde(untagged)]
-        enum Action {
-            ClickAction(ClickAction),
-            BufferAction(BufferAction),
-        }
-
-        match Action::deserialize(deserializer)? {
-            Action::ClickAction(click_action) => match click_action {
-                ClickAction::OpenChannel(buffer_action) => {
-                    Ok(ChannelClickAction::OpenChannel(buffer_action))
-                }
-                ClickAction::Noop => Ok(ChannelClickAction::Noop),
-            },
-            Action::BufferAction(buffer_action) => {
-                Ok(ChannelClickAction::OpenChannel(buffer_action))
-            }
-        }
-    }
-}
-
-impl ChannelClickAction {
-    pub fn buffer_action(&self) -> Option<BufferAction> {
-        match self {
-            ChannelClickAction::OpenChannel(buffer_action) => {
-                Some(*buffer_action)
-            }
-            ChannelClickAction::Noop => None,
         }
     }
 }

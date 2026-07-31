@@ -11,11 +11,25 @@ use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use thiserror::Error;
 use tokio::fs;
 
-use crate::config::buffer;
-
 const DEFAULT_THEME_NAME: &str = "Ferra";
 const DEFAULT_THEME_CONTENT: &str =
     include_str!("../../../assets/themes/ferra.toml");
+
+/// Number of avatar color ramps (QML `kAvatarRampCount` parity). The FNV
+/// ramp index from `address::avatar_ramp` selects one of these.
+pub const AVATAR_RAMP_COUNT: u32 = 5;
+
+/// Hue distance between the two stops of a derived avatar gradient.
+const AVATAR_HUE_SPREAD: f32 = 40.0;
+
+/// Ink for initials/glyphs on avatar gradients (QML `avatarInk` parity);
+/// derived gradients clamp lightness so this stays readable.
+const AVATAR_INK: Color = Color {
+    r: 0.0,
+    g: 0.0,
+    b: 0.0,
+    a: 0.74,
+};
 
 static DEFAULT_STYLES: LazyLock<Styles> = LazyLock::new(|| {
     toml::from_str(DEFAULT_THEME_CONTENT).expect("parse default theme")
@@ -59,6 +73,8 @@ pub struct Styles {
     pub buttons: Buttons,
     #[serde(default)]
     pub formatting: Formatting,
+    #[serde(default)]
+    pub avatars: Avatars,
 }
 
 impl Default for Styles {
@@ -302,6 +318,97 @@ pub struct Formatting {
     pub grey: Option<Color>,
     #[serde(with = "color_serde_maybe")]
     pub lightgrey: Option<Color>,
+}
+
+/// Optional avatar gradient overrides. Unset stops fall back to pairs
+/// derived from the theme palette, so every existing theme keeps working
+/// without new keys.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, Default)]
+#[serde(default)]
+pub struct Avatars {
+    pub ramp1: GradientPair,
+    pub ramp2: GradientPair,
+    pub ramp3: GradientPair,
+    pub ramp4: GradientPair,
+    pub ramp5: GradientPair,
+    /// This account's own avatar; the "brand" ramp (QML `selfAvatarRamp`).
+    pub self_ramp: GradientPair,
+    /// Ink for initials/glyphs drawn on the gradients.
+    #[serde(with = "color_serde_maybe")]
+    pub ink: Option<Color>,
+}
+
+impl Avatars {
+    fn ramp(&self, index: u32) -> GradientPair {
+        match index % AVATAR_RAMP_COUNT {
+            0 => self.ramp1,
+            1 => self.ramp2,
+            2 => self.ramp3,
+            3 => self.ramp4,
+            _ => self.ramp5,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, Default)]
+#[serde(default)]
+pub struct GradientPair {
+    #[serde(with = "color_serde_maybe")]
+    pub start: Option<Color>,
+    #[serde(with = "color_serde_maybe")]
+    pub end: Option<Color>,
+}
+
+/// The gradient pair for a hashed avatar ramp; theme overrides win, the
+/// rest is derived from the palette.
+pub fn avatar_ramp_colors(styles: &Styles, index: u32) -> (Color, Color) {
+    let pair = styles.avatars.ramp(index);
+    let (start, end) = derived_avatar_pair(styles, Some(index));
+
+    (pair.start.unwrap_or(start), pair.end.unwrap_or(end))
+}
+
+/// The gradient pair for this account's own avatar.
+pub fn avatar_self_colors(styles: &Styles) -> (Color, Color) {
+    let pair = styles.avatars.self_ramp;
+    let (start, end) = derived_avatar_pair(styles, None);
+
+    (pair.start.unwrap_or(start), pair.end.unwrap_or(end))
+}
+
+/// Ink for what sits on an avatar gradient.
+pub fn avatar_ink(styles: &Styles) -> Color {
+    styles.avatars.ink.unwrap_or(AVATAR_INK)
+}
+
+/// Derives a gradient pair from the theme palette, mirroring how nick
+/// colors derive from the nickname color: it supplies saturation and
+/// lightness, the hue is deterministically randomized per ramp (`None`
+/// keeps the palette hue — the self/brand ramp), and lightness is clamped
+/// so the dark ink stays readable on every theme.
+fn derived_avatar_pair(styles: &Styles, ramp: Option<u32>) -> (Color, Color) {
+    let base = styles.buffer.nickname.color;
+    let mut hsl = to_hsl(base);
+    hsl.saturation = hsl.saturation.clamp(0.35, 0.9);
+    hsl.lightness = hsl.lightness.clamp(0.6, 0.8);
+
+    if let Some(ramp) = ramp {
+        hsl.hue =
+            to_hsl(randomize_color(base, &format!("avatar-ramp-{ramp}"))).hue;
+    }
+
+    let start = from_hsl(Okhsl::new(
+        hsl.hue,
+        hsl.saturation,
+        (hsl.lightness + 0.08).min(0.88),
+    ));
+    let end = from_hsl(Okhsl::new(
+        hsl.hue + AVATAR_HUE_SPREAD,
+        hsl.saturation,
+        hsl.lightness,
+    ));
+
+    (start, end)
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -588,49 +695,6 @@ pub fn nickname_color(
     }
 }
 
-pub fn nickname_alpha(
-    color: Color,
-    is_away: Option<buffer::Away>,
-    background_color: Color,
-) -> Color {
-    if let Some(buffer::Away::Dimmed(dimmed)) = is_away {
-        dimmed.transform_color(color, background_color)
-    } else {
-        color
-    }
-}
-
-pub fn adapt_nickname_color(
-    original_color: Color,
-    theme_color: Color,
-    background_color: Color,
-    restrict_saturation: bool,
-) -> Color {
-    let original_hsl = to_hsl(original_color);
-
-    let theme_hsl = to_hsl(theme_color);
-
-    let adapted_color = from_hsl(Okhsl::new(
-        original_hsl.hue,
-        if restrict_saturation {
-            original_hsl.saturation.min(theme_hsl.saturation)
-        } else {
-            original_hsl.saturation
-        },
-        theme_hsl.lightness,
-    ));
-
-    if adapted_color.is_readable_on(background_color) {
-        adapted_color
-    } else {
-        from_hsl(Okhsl::new(
-            original_hsl.hue,
-            theme_hsl.saturation,
-            theme_hsl.lightness,
-        ))
-    }
-}
-
 pub fn to_hsl(color: Color) -> Okhsl {
     let mut hsl = Okhsl::from_color(to_rgb(color));
     if hsl.saturation.is_nan() {
@@ -732,7 +796,7 @@ mod binary {
     use iced_core::Color;
     use strum::{IntoEnumIterator, VariantArray};
 
-    use super::{Buffer, Buttons, Formatting, General, Styles, Text};
+    use super::{Avatars, Buffer, Buttons, Formatting, General, Styles, Text};
 
     pub fn encode(styles: &Styles) -> Vec<u8> {
         let mut bytes = Vec::with_capacity(Tag::VARIANTS.len() * (1 + 4));
@@ -754,6 +818,7 @@ mod binary {
             buffer: Buffer::default(),
             buttons: Buttons::default(),
             formatting: Formatting::default(),
+            avatars: Avatars::default(),
         };
 
         for chunk in bytes.chunks(5) {
@@ -847,6 +912,19 @@ mod binary {
         BufferServerMessagesRequestTopic = 57,
         ButtonsPrimaryBorderActive = 58,
         ButtonsSecondaryBorderActive = 59,
+        AvatarsRamp1Start = 60,
+        AvatarsRamp1End = 61,
+        AvatarsRamp2Start = 62,
+        AvatarsRamp2End = 63,
+        AvatarsRamp3Start = 64,
+        AvatarsRamp3End = 65,
+        AvatarsRamp4Start = 66,
+        AvatarsRamp4End = 67,
+        AvatarsRamp5Start = 68,
+        AvatarsRamp5End = 69,
+        AvatarsSelfStart = 70,
+        AvatarsSelfEnd = 71,
+        AvatarsInk = 72,
     }
 
     impl Tag {
@@ -974,6 +1052,19 @@ mod binary {
                 Tag::BufferServerMessagesChangeTopic => {
                     styles.buffer.server_messages.change_topic.color?
                 }
+                Tag::AvatarsRamp1Start => styles.avatars.ramp1.start?,
+                Tag::AvatarsRamp1End => styles.avatars.ramp1.end?,
+                Tag::AvatarsRamp2Start => styles.avatars.ramp2.start?,
+                Tag::AvatarsRamp2End => styles.avatars.ramp2.end?,
+                Tag::AvatarsRamp3Start => styles.avatars.ramp3.start?,
+                Tag::AvatarsRamp3End => styles.avatars.ramp3.end?,
+                Tag::AvatarsRamp4Start => styles.avatars.ramp4.start?,
+                Tag::AvatarsRamp4End => styles.avatars.ramp4.end?,
+                Tag::AvatarsRamp5Start => styles.avatars.ramp5.start?,
+                Tag::AvatarsRamp5End => styles.avatars.ramp5.end?,
+                Tag::AvatarsSelfStart => styles.avatars.self_ramp.start?,
+                Tag::AvatarsSelfEnd => styles.avatars.self_ramp.end?,
+                Tag::AvatarsInk => styles.avatars.ink?,
             };
 
             Some(color.into_rgba8())
@@ -1130,6 +1221,33 @@ mod binary {
                     styles.buffer.server_messages.change_topic.color =
                         Some(color);
                 }
+                Tag::AvatarsRamp1Start => {
+                    styles.avatars.ramp1.start = Some(color);
+                }
+                Tag::AvatarsRamp1End => styles.avatars.ramp1.end = Some(color),
+                Tag::AvatarsRamp2Start => {
+                    styles.avatars.ramp2.start = Some(color);
+                }
+                Tag::AvatarsRamp2End => styles.avatars.ramp2.end = Some(color),
+                Tag::AvatarsRamp3Start => {
+                    styles.avatars.ramp3.start = Some(color);
+                }
+                Tag::AvatarsRamp3End => styles.avatars.ramp3.end = Some(color),
+                Tag::AvatarsRamp4Start => {
+                    styles.avatars.ramp4.start = Some(color);
+                }
+                Tag::AvatarsRamp4End => styles.avatars.ramp4.end = Some(color),
+                Tag::AvatarsRamp5Start => {
+                    styles.avatars.ramp5.start = Some(color);
+                }
+                Tag::AvatarsRamp5End => styles.avatars.ramp5.end = Some(color),
+                Tag::AvatarsSelfStart => {
+                    styles.avatars.self_ramp.start = Some(color);
+                }
+                Tag::AvatarsSelfEnd => {
+                    styles.avatars.self_ramp.end = Some(color);
+                }
+                Tag::AvatarsInk => styles.avatars.ink = Some(color),
             }
         }
     }

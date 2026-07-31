@@ -335,10 +335,10 @@ mod tests {
         let tests = [
             ("~", dirs_next::home_dir().expect("expected valid home dir")),
             (
-                "~/.config/halloy/",
+                "~/.config/frigicom/",
                 dirs_next::home_dir()
                     .expect("expected valid home dir")
-                    .join(".config/halloy"),
+                    .join(".config/frigicom"),
             ),
         ];
         for (tilde_str, directory) in tests {

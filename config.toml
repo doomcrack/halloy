@@ -1,9 +1,28 @@
-# Halloy config.
+# Frigicom config.
 #
-# For a complete list of available options,
-# please visit https://halloy.chat/configuration.html
+# Frigicom talks to the Logos network through a private logoscore
+# daemon; the [logos] section controls how that backend is started.
+# Every setting is documented under docs/configuration/ in the repository.
 
-[servers.liberachat]
-nickname = "__NICKNAME__"
-server = "irc.libera.chat"
-channels = ["#halloy"]
+[logos]
+delivery_preset = "logos.dev"
+
+# Where the daemon and its modules come from. Unset, each is looked up in
+# turn: the LOGOSCORE_BIN / LOGOS_MODULES_DIR environment variables (what
+# the nix dev shell exports), then the copies a packaged build ships beside
+# the executable (`logos/bin/logoscore` and `logos/modules`, or the same
+# under `Contents/Resources` on macOS), then PATH — for the binary only.
+# Outside the dev shell and outside a packaged build, set them here.
+# daemon_path = "/path/to/bin/logoscore"
+# modules_dir = "/path/to/modules-live"
+
+# The private logoscore instance (daemon config, tokens, module state).
+# Defaults to `<data dir>/logos`.
+# instance_dir = "/path/to/instance"
+
+# installation_name = "my laptop"
+
+# Drive the UI off a scripted in-process mock instead of a real daemon.
+# mock = true
+
+# theme = "ferra"

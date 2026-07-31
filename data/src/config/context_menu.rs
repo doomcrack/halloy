@@ -1,19 +1,9 @@
 use serde::Deserialize;
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Default, Deserialize)]
 #[serde(default)]
 pub struct ContextMenu {
     pub padding: Padding,
-    pub show_user_metadata: bool,
-}
-
-impl Default for ContextMenu {
-    fn default() -> Self {
-        Self {
-            padding: Padding::default(),
-            show_user_metadata: true,
-        }
-    }
 }
 
 #[derive(Debug, Copy, Clone, Deserialize)]

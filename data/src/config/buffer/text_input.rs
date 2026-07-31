@@ -1,6 +1,5 @@
 use serde::Deserialize;
 
-use crate::config::buffer::AccessLevelFormat;
 use crate::serde::deserialize_usize_positive_integer;
 
 #[derive(Debug, Clone, Deserialize)]
@@ -59,20 +58,16 @@ pub enum Visibility {
     Always,
 }
 
+/// Whether the composer shows your own identity label beside the input.
 #[derive(Debug, Clone, Deserialize)]
 #[serde(default)]
 pub struct Nickname {
     pub enabled: bool,
-    #[serde(alias = "show_access_level")]
-    pub show_access_levels: AccessLevelFormat,
 }
 
 impl Default for Nickname {
     fn default() -> Self {
-        Self {
-            enabled: true,
-            show_access_levels: AccessLevelFormat::default(),
-        }
+        Self { enabled: true }
     }
 }
 

@@ -5,9 +5,6 @@ use std::path::{Path, PathBuf};
 use std::{str, string};
 
 use iced_core::font;
-use indexmap::IndexMap;
-use rand::prelude::*;
-use rand_chacha::ChaCha8Rng;
 use serde::{Deserialize, Deserializer};
 use thiserror::Error;
 use tokio_stream::StreamExt;
@@ -15,56 +12,39 @@ use tokio_stream::wrappers::ReadDirStream;
 
 pub use self::actions::Actions;
 pub use self::buffer::Buffer;
-pub use self::channel_monitor::ChannelMonitor;
 pub use self::context_menu::ContextMenu;
-pub use self::ctcp::Ctcp;
 pub use self::display::Display;
-pub use self::file_transfer::FileTransfer;
-pub use self::filehost::Filehost;
-pub use self::highlights::Highlights;
 pub use self::keys::Keyboard;
+pub use self::logos::Logos;
 pub use self::logs::Logs;
 pub use self::notification::Notifications;
 pub use self::pane::Pane;
 pub use self::platform_specific::PlatformSpecific;
 pub use self::preview::Preview;
-pub use self::proxy::Proxy;
 pub use self::runtime::Runtime;
-pub use self::server::Server;
 pub use self::sidebar::Sidebar;
 pub use self::window::Window;
 use crate::appearance::theme::Styles;
 use crate::appearance::{self, Appearance};
 use crate::audio::{self};
-use crate::config::metadata::Metadata;
 use crate::serde::{
     deserialize_f32_positive_float_maybe, deserialize_u8_positive_integer_maybe,
 };
-use crate::server::{ConfigMap as ServerMap, ServerName};
 use crate::shortcut::{Commands, KeyBind};
 use crate::{Theme, environment};
 
 pub mod actions;
 pub mod buffer;
-pub mod channel_monitor;
 pub mod context_menu;
-pub mod ctcp;
 pub mod display;
-pub mod file_transfer;
-pub mod filehost;
-pub mod highlights;
-pub mod inclusivities;
-pub mod keyring;
 pub mod keys;
+pub mod logos;
 pub mod logs;
-pub mod metadata;
 pub mod notification;
 pub mod pane;
 pub mod platform_specific;
 pub mod preview;
-pub mod proxy;
 pub mod runtime;
-pub mod server;
 pub mod sidebar;
 pub mod window;
 
@@ -75,30 +55,23 @@ const DEFAULT_THEME_NAME: &str = "ferra";
 pub struct Config {
     pub appearance: Appearance,
     pub context_menu: ContextMenu,
-    pub servers: ServerMap,
-    pub proxy: Option<Proxy>,
+    pub logos: Logos,
     pub font: Font,
     pub scale_factor: ScaleFactor,
     pub buffer: Buffer,
-    pub channel_monitor: ChannelMonitor,
     pub pane: Pane,
     pub sidebar: Sidebar,
     pub keyboard: Keyboard,
     pub notifications: Notifications,
-    pub file_transfer: FileTransfer,
-    pub filehost: Filehost,
     pub tooltips: Tooltips,
     pub window: Window,
     pub preview: Preview,
-    pub highlights: Highlights,
     pub actions: Actions,
-    pub ctcp: Ctcp,
     pub display: Display,
     pub logs: Logs,
     pub platform_specific: PlatformSpecific,
     pub runtime: Runtime,
     pub check_for_update_on_launch: bool,
-    pub metadata: Metadata,
 }
 
 impl Default for Config {
@@ -106,30 +79,23 @@ impl Default for Config {
         Self {
             appearance: Appearance::default(),
             context_menu: ContextMenu::default(),
-            servers: ServerMap::default(),
-            proxy: None,
+            logos: Logos::default(),
             font: Font::default(),
             scale_factor: ScaleFactor::default(),
             buffer: Buffer::default(),
-            channel_monitor: ChannelMonitor::default(),
             pane: Pane::default(),
             sidebar: Sidebar::default(),
             keyboard: Keyboard::default(),
             notifications: Notifications::default(),
-            file_transfer: FileTransfer::default(),
-            filehost: Filehost::default(),
             tooltips: Tooltips::default(),
             window: Window::default(),
             preview: Preview::default(),
-            highlights: Highlights::default(),
             actions: Actions::default(),
-            ctcp: Ctcp::default(),
             display: Display::default(),
             logs: Logs::default(),
             platform_specific: PlatformSpecific::default(),
             runtime: Runtime::default(),
             check_for_update_on_launch: true,
-            metadata: Metadata::default(),
         }
     }
 }
@@ -467,62 +433,48 @@ impl Config {
         #[serde(default)]
         pub struct Configuration {
             pub theme: ThemeKeys,
-            pub servers: IndexMap<ServerName, Server>,
+            pub logos: Logos,
             pub context_menu: ContextMenu,
-            pub proxy: Option<Proxy>,
             pub font: Font,
             pub scale_factor: ScaleFactor,
             pub buffer: Buffer,
-            pub channel_monitor: ChannelMonitor,
             pub pane: Pane,
             pub sidebar: Sidebar,
             pub keyboard: Keyboard,
             pub notifications: Notifications,
-            pub file_transfer: FileTransfer,
-            pub filehost: Filehost,
             pub tooltips: Tooltips,
             pub window: Window,
             pub preview: Preview,
-            pub highlights: Highlights,
             pub actions: Actions,
-            pub ctcp: Ctcp,
             pub display: Display,
             pub logs: Logs,
             pub platform_specific: PlatformSpecific,
             pub runtime: Runtime,
             pub check_for_update_on_launch: bool,
-            pub metadata: Metadata,
         }
 
         impl Default for Configuration {
             fn default() -> Self {
                 Self {
                     theme: ThemeKeys::default(),
-                    servers: IndexMap::<ServerName, Server>::default(),
+                    logos: Logos::default(),
                     context_menu: ContextMenu::default(),
-                    proxy: None,
                     font: Font::default(),
                     scale_factor: ScaleFactor::default(),
                     buffer: Buffer::default(),
-                    channel_monitor: ChannelMonitor::default(),
                     pane: Pane::default(),
                     sidebar: Sidebar::default(),
                     keyboard: Keyboard::default(),
                     notifications: Notifications::default(),
-                    file_transfer: FileTransfer::default(),
-                    filehost: Filehost::default(),
                     tooltips: Tooltips::default(),
                     window: Window::default(),
                     preview: Preview::default(),
-                    highlights: Highlights::default(),
                     actions: Actions::default(),
-                    ctcp: Ctcp::default(),
                     display: Display::default(),
                     logs: Logs::default(),
                     platform_specific: PlatformSpecific::default(),
                     runtime: Runtime::default(),
                     check_for_update_on_launch: true,
-                    metadata: Metadata::default(),
                 }
             }
         }
@@ -540,54 +492,30 @@ impl Config {
 
         let Configuration {
             theme,
-            servers,
+            logos,
             context_menu,
             font,
-            proxy,
             scale_factor,
             buffer,
-            channel_monitor,
             sidebar,
             keyboard,
             notifications,
-            file_transfer,
-            filehost,
             tooltips,
             window,
             preview,
             pane,
-            highlights,
             actions,
-            ctcp,
             display,
             logs,
             platform_specific,
             runtime,
             check_for_update_on_launch,
-            metadata,
         } = serde_ignored::deserialize(config, |ignored| {
             log::warn!("[config.toml] Ignoring unknown setting: {ignored}");
         })
         .map_err(|e| Error::Parse(ParseError::new(&content, &e)))?;
 
         keyboard.validate()?;
-
-        let mut proxy = proxy;
-        if let Some(proxy) = &mut proxy {
-            proxy
-                .set_password(
-                    keyring::proxy_password_key,
-                    "global proxy configuration",
-                )
-                .await?;
-        }
-
-        let servers = ServerMap::new(
-            servers,
-            sidebar.order_channels_by,
-            buffer.typing.clone(),
-        )
-        .await?;
 
         let appearance = Self::load_appearance(theme.keys())
             .await
@@ -596,30 +524,23 @@ impl Config {
         Ok(Config {
             appearance,
             context_menu,
-            servers,
+            logos,
             font,
-            proxy,
             scale_factor,
             buffer,
-            channel_monitor,
             sidebar,
             keyboard,
             notifications,
-            file_transfer,
-            filehost,
             tooltips,
             window,
             preview,
             pane,
-            highlights,
             actions,
-            ctcp,
             display,
             logs,
             platform_specific,
             runtime,
             check_for_update_on_launch,
-            metadata,
         })
     }
 
@@ -653,7 +574,7 @@ impl Config {
         let mut all = vec![];
         let mut first_theme = Theme::default();
         let mut second_theme = theme_keys.1.clone().map(|_| Theme::default());
-        let mut has_halloy_theme = false;
+        let mut has_default_theme = false;
 
         let mut stream =
             ReadDirStream::new(fs::read_dir(Self::themes_dir()).await?);
@@ -679,14 +600,14 @@ impl Config {
                 }
 
                 if file_name.to_lowercase() == DEFAULT_THEME_NAME {
-                    has_halloy_theme = true;
+                    has_default_theme = true;
                 }
 
                 all.push(theme);
             }
         }
 
-        if !has_halloy_theme {
+        if !has_default_theme {
             all.push(Theme::default());
         }
 
@@ -736,18 +657,13 @@ impl Config {
             return;
         }
 
-        // Generate a unique nick
-        let rand_nick = random_nickname();
-
-        // Replace placeholder nick with unique nick
-        let config_string =
-            CONFIG_TEMPLATE.replace("__NICKNAME__", rand_nick.as_str());
-        let config_bytes = config_string.as_bytes();
-
         // Create configuration path.
         let config_path = Self::config_dir().join("config.toml");
 
-        let _ = create_owned_file(config_path.as_path(), config_bytes);
+        let _ = create_owned_file(
+            config_path.as_path(),
+            CONFIG_TEMPLATE.as_bytes(),
+        );
     }
 }
 
@@ -783,47 +699,6 @@ fn create_owned_file(path: &Path, contents: &[u8]) -> std::io::Result<()> {
     file.write_all(contents)
 }
 
-#[cfg(unix)]
-pub fn check_sensitive_file_permissions(
-    server: &str,
-    path: &Path,
-    label: &str,
-) {
-    use std::os::unix::fs::PermissionsExt;
-    if let Ok(meta) = std::fs::metadata(path) {
-        let mode = meta.permissions().mode();
-        if mode & 0o077 != 0 {
-            log::warn!(
-                "[{}] {} {} has permissions 0{:o}; consider restricting to 0600",
-                server,
-                label,
-                path.display(),
-                mode & 0o777,
-            );
-        }
-    }
-}
-
-#[cfg(not(unix))]
-pub fn check_sensitive_file_permissions(
-    _server: &str,
-    _path: &Path,
-    _label: &str,
-) {
-}
-
-pub fn random_nickname() -> String {
-    let mut rng = ChaCha8Rng::from_rng(&mut rand::rng());
-    random_nickname_with_seed(&mut rng)
-}
-
-pub fn random_nickname_with_seed<R: Rng>(rng: &mut R) -> String {
-    let rand_digit: u16 = rng.random_range(1000..=9999);
-    let rand_nick = format!("halloy{rand_digit}");
-
-    rand_nick
-}
-
 #[derive(Debug, Clone)]
 pub struct ParseError {
     /// Short description of the problem, e.g. `invalid basic string`.
@@ -854,8 +729,6 @@ impl ParseError {
 pub enum Error {
     #[error("config could not be read: {0}")]
     LoadConfigFile(String),
-    #[error("command could not be run: {0}")]
-    ExecutePasswordCommand(String),
     #[error("{0}")]
     Io(String),
     #[error("{}", .0.details)]
@@ -866,40 +739,8 @@ pub enum Error {
     StringUtf8Error(#[from] string::FromUtf8Error),
     #[error(transparent)]
     LoadSounds(#[from] audio::LoadError),
-    #[error(
-        "Only one of password, password_file, password_command and password_keyring can be set."
-    )]
-    DuplicatePassword,
-    #[error(
-        "Only one of nick_password, nick_password_file, nick_password_command and nick_password_keyring can be set."
-    )]
-    DuplicateNickPassword,
-    #[error(
-        "Only one of channel_keys and channel_keys_keyring can be set for channel `{channel}` on server `{server}`."
-    )]
-    DuplicateChannelKey { server: String, channel: String },
-    #[error(
-        "Only one of password and password_keyring can be set for {label} in {context}."
-    )]
-    DuplicateProxyPassword { label: String, context: String },
-    #[error(
-        "Only one of password, password_file, password_command and password_keyring can be set for {label} in {context}."
-    )]
-    DuplicateSaslPassword { label: String, context: String },
-    #[error(
-        "{label} must be set for {context}; configure one of password, password_file, password_command or password_keyring."
-    )]
-    MissingSaslPassword { label: String, context: String },
     #[error("Keybind \"{}\" is assigned to multiple actions: {}", keybind.as_config_string(), actions.as_config_string())]
     KeyBindConflict { keybind: KeyBind, actions: Commands },
-    #[error("{label} keyring entry `{key}` is missing for {context}.")]
-    MissingKeyringPasswordEntry {
-        label: String,
-        context: String,
-        key: String,
-    },
-    #[error("could not access keyring entry `{key}`: {error}")]
-    Keyring { key: String, error: String },
     #[error("Config does not exist")]
     ConfigMissing,
 }

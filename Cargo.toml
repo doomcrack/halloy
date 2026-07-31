@@ -10,7 +10,6 @@ edition.workspace = true
 [features]
 default = ["iosevka-font"]
 iosevka-font = []
-tor = ["data/tor"]
 
 [workspace]
 members = [
@@ -227,6 +226,3 @@ extend-ignore-identifiers-re = [
     "TehPeGaSuS",
     "0ther0ne",
 ]
-
-[workspace.metadata.typos.files]
-extend-exclude = ["data/tests/message/*.json"]

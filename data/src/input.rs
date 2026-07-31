@@ -1,502 +1,91 @@
 use std::collections::HashMap;
-use std::path::PathBuf;
 
-use chrono::{DateTime, Utc};
-use irc::proto;
-use irc::proto::format;
-use nom::character::complete::char;
-use nom::combinator::{cut, map, rest, verify};
-use nom::multi::{many_m_n, many0_count, many1_count};
-use nom::{Finish, IResult, Parser};
-
-use crate::capabilities::{Capabilities, MultilineBatchKind};
-use crate::config::buffer::text_input::AutoFormat;
-use crate::features::Features;
-use crate::history::reroute::RerouteRules;
-use crate::message::formatting;
-use crate::target::Target;
-use crate::user::{ChannelUsers, NickRef};
-use crate::{
-    Command, Config, Message, Server, User, buffer, command, environment,
-    isupport, message,
-};
+use crate::conversation::ConvoId;
+use crate::{Command, command};
 
 const INPUT_HISTORY_LENGTH: usize = 100;
 
-pub fn parse(
-    buffer: buffer::Upstream,
-    auto_format: AutoFormat,
-    input: &str,
-    code_fence: Option<&CodeFence>,
-    our_nickname: Option<NickRef>,
-    in_channel: Option<bool>,
-    is_connected: bool,
-    isupport: &HashMap<isupport::Kind, isupport::Parameter>,
-    capabilities: &Capabilities,
-    features: &Features,
-    filehost_url: Option<&str>,
-    relay_bytes: usize,
-    config: &Config,
-) -> Result<Parsed, Error> {
-    let content = if let Some(open_code_fence) = code_fence {
-        if let Some(close_code_fence) = parse_code_fence(input)
-            .finish()
-            .ok()
-            .map(|(_, code_fence)| code_fence)
-            && close_code_fence.backticks >= open_code_fence.backticks
-            && close_code_fence.info.is_none()
-        {
-            return Ok(Parsed::CodeFence(close_code_fence));
-        }
-
-        Content::Text(format!(
-            "\u{11}{}\u{11}",
-            remove_indent(input, open_code_fence)
-                .finish()
-                .ok()
-                .map_or(input, |(_, unindented)| unindented)
-        ))
-    } else {
-        match auto_format {
-            AutoFormat::Disabled | AutoFormat::ForceDisabled => (),
-            AutoFormat::Markdown | AutoFormat::All => {
-                if let Some(open_code_fence) = parse_code_fence(input)
-                    .finish()
-                    .ok()
-                    .map(|(_, code_fence)| code_fence)
-                {
-                    return Ok(Parsed::CodeFence(open_code_fence));
-                }
-            }
-        }
-
-        match command::parse(
-            input,
-            Some(&buffer),
-            our_nickname,
-            auto_format,
-            is_connected,
-            isupport,
-            capabilities,
-            features,
-            filehost_url,
-            config,
-        ) {
-            Ok(Command::Internal(command)) => {
-                if is_connected {
-                    if matches!(command, command::Internal::Reconnect) {
-                        return Err(Error::Command(command::Error::Connected));
-                    } else {
-                        return Ok(Parsed::Internal(command));
-                    }
-                } else if matches!(
-                    command,
-                    command::Internal::Reconnect
-                        | command::Internal::Connect(_)
-                        | command::Internal::Exec(_)
-                ) {
-                    return Ok(Parsed::Internal(command));
-                } else {
-                    return Err(Error::Command(command::Error::Disconnected));
-                }
-            }
-            // Auto-formatting for commands is done in command parsing, so that
-            // plain/format commands can be parsed directly as their
-            // corresponding IRC command.
-            Ok(Command::Irc(command, warning)) => {
-                Content::Command(command, warning)
-            }
-            Err(command::Error::MissingSlash) => {
-                let text = match auto_format {
-                    AutoFormat::Disabled | AutoFormat::ForceDisabled => {
-                        input.to_string()
-                    }
-                    AutoFormat::Markdown => formatting::encode(input, true),
-                    AutoFormat::All => formatting::encode(input, false),
-                };
-
-                Content::Text(text)
-            }
-            Err(command::Error::HasDoubleSlash) => {
-                let text = input
-                    .strip_prefix('/')
-                    .map_or(input.to_string(), ToString::to_string);
-
-                let text = match auto_format {
-                    AutoFormat::Disabled | AutoFormat::ForceDisabled => text,
-                    AutoFormat::Markdown => formatting::encode(&text, true),
-                    AutoFormat::All => formatting::encode(&text, false),
-                };
-
-                Content::Text(text)
-            }
-            Err(error) => return Err(Error::Command(error)),
-        }
-    };
-
-    let is_command = matches!(content, Content::Command(..));
-
-    let parsed = Parsed::Input(Input { buffer, content });
-
-    if let Some(multiline_limits) = capabilities.multiline_limits()
-        && let Some((text, _)) = parsed
-            .multiline_content(isupport::get_casemapping_or_default(isupport))
-    {
-        if text.len() > multiline_limits.max_bytes {
-            return Err(Error::ExceedsByteLimit {
-                bytes: text.len(),
-                bytes_limit: multiline_limits.max_bytes,
-            });
-        }
-    } else if let Parsed::Input(Input { buffer, content }) = &parsed
-        && let Some(message_bytes) = content
-            .proto(buffer)
-            .map(|message| format::message(message).len())
-    {
-        let message_bytes = match &content {
-            Content::Text(_)
-            | Content::Command(command::Irc::Msg(_, _), _)
-            | Content::Command(command::Irc::Me(_, _), _)
-            | Content::Command(command::Irc::Notice(_, _), _) => {
-                message_bytes + relay_bytes
-            }
-            Content::Command(_, _) => message_bytes,
-        };
-
-        if message_bytes > format::BYTE_LIMIT {
-            return Err(Error::ExceedsByteLimit {
-                bytes: message_bytes,
-                bytes_limit: format::BYTE_LIMIT,
-            });
-        }
+/// Parses composer input: a slash command or plain text. The only
+/// validation is non-emptiness — no byte limits, no multiline batching,
+/// no wire encoding (the module takes plain text).
+pub fn parse(input: &str) -> Result<Parsed, Error> {
+    if input.trim().is_empty() {
+        return Err(Error::Empty);
     }
 
-    if !is_connected {
-        return Err(Error::Command(command::Error::Disconnected));
-    } else if in_channel.is_some_and(|in_channel| !in_channel && !is_command) {
-        return Err(Error::Command(command::Error::NotInChannel));
+    match command::parse(input) {
+        Ok(command) => Ok(Parsed::Command(command)),
+        Err(command::Error::MissingSlash) => {
+            Ok(Parsed::Text(input.to_string()))
+        }
+        Err(command::Error::HasDoubleSlash) => Ok(Parsed::Text(
+            input.strip_prefix('/').unwrap_or(input).to_string(),
+        )),
+        Err(error) => Err(Error::Command(error)),
     }
-
-    Ok(parsed)
 }
 
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Parsed {
-    Input(Input),
-    Internal(command::Internal),
-    CodeFence(CodeFence),
-}
-
-impl Parsed {
-    pub fn code_fence(&self) -> Option<&CodeFence> {
-        match &self {
-            Parsed::Input(_) | Parsed::Internal(_) => None,
-            Parsed::CodeFence(code_fence) => Some(code_fence),
-        }
-    }
-
-    pub fn multiline_batch_kind(
-        &self,
-        casemapping: isupport::CaseMap,
-    ) -> Option<MultilineBatchKind> {
-        self.multiline_content(casemapping).map(|(_, kind)| kind)
-    }
-
-    pub fn multiline_content(
-        &self,
-        casemapping: isupport::CaseMap,
-    ) -> Option<(&str, MultilineBatchKind)> {
-        match self {
-            Parsed::Input(input) => match &input.content {
-                Content::Text(text) => {
-                    Some((text.as_str(), MultilineBatchKind::PRIVMSG))
-                }
-                Content::Command(command, _) => match command {
-                    command::Irc::Msg(command_target, text) => {
-                        input.buffer.target().and_then(|buffer_target| {
-                            (buffer_target.as_normalized_str()
-                                == casemapping.normalize(command_target))
-                            .then_some((
-                                text.as_str(),
-                                MultilineBatchKind::PRIVMSG,
-                            ))
-                        })
-                    }
-                    command::Irc::Notice(command_target, text) => {
-                        input.buffer.target().and_then(|buffer_target| {
-                            (buffer_target.as_normalized_str()
-                                == casemapping.normalize(command_target))
-                            .then_some((
-                                text.as_str(),
-                                MultilineBatchKind::NOTICE,
-                            ))
-                        })
-                    }
-                    _ => None,
-                },
-            },
-            Parsed::Internal(_) => None,
-            // Not included in batch, but should not delimit a batch
-            Parsed::CodeFence(_) => Some(("", MultilineBatchKind::PRIVMSG)),
-        }
-    }
-
-    pub fn warning(&self) -> Option<&command::Warning> {
-        match &self {
-            Self::Input(input) => input.warning(),
-            Self::Internal(_) | Self::CodeFence(_) => None,
-        }
-    }
-}
-
-#[derive(Debug, Clone, PartialEq)]
-pub struct Input {
-    pub buffer: buffer::Upstream,
-    content: Content,
-}
-
-impl Input {
-    pub fn from_command(
-        buffer: buffer::Upstream,
-        command: command::Irc,
-    ) -> Self {
-        Self {
-            buffer,
-            content: Content::Command(command, None),
-        }
-    }
-
-    pub fn command(&self) -> Option<&command::Irc> {
-        match &self.content {
-            Content::Text(_) => None,
-            Content::Command(command, _) => Some(command),
-        }
-    }
-
-    pub fn warning(&self) -> Option<&command::Warning> {
-        match &self.content {
-            Content::Text(_) => None,
-            Content::Command(_, warning) => warning.as_ref(),
-        }
-    }
-
-    pub fn server(&self) -> &Server {
-        self.buffer.server()
-    }
-
-    pub fn messages(
-        &self,
-        user: User,
-        channel_users: Option<&ChannelUsers>,
-        server: &Server,
-        chantypes: &[char],
-        statusmsg: &[char],
-        casemapping: isupport::CaseMap,
-        supports_echoes: bool,
-        reroute_rules: &RerouteRules,
-    ) -> Option<Vec<Message>> {
-        self.content.command(&self.buffer).and_then(|command| {
-            command.messages(
-                user,
-                channel_users,
-                server,
-                chantypes,
-                statusmsg,
-                casemapping,
-                supports_echoes,
-                reroute_rules,
-                Some(&self.buffer),
-            )
-        })
-    }
-
-    pub fn targets(
-        &self,
-        chantypes: &[char],
-        statusmsg: &[char],
-        casemapping: isupport::CaseMap,
-    ) -> Option<Vec<Target>> {
-        let command = self.content.command(&self.buffer)?;
-
-        match command {
-            command::Irc::Msg(targets, _)
-            | command::Irc::Notice(targets, _) => Some(
-                targets
-                    .split(',')
-                    .map(|target| {
-                        Target::parse(target, chantypes, statusmsg, casemapping)
-                    })
-                    .collect(),
-            ),
-            command::Irc::Me(target, _) => Some(vec![Target::parse(
-                &target,
-                chantypes,
-                statusmsg,
-                casemapping,
-            )]),
-            _ => None,
-        }
-    }
-
-    pub fn encoded(&self) -> Option<message::Encoded> {
-        self.content.proto(&self.buffer).map(message::Encoded::from)
-    }
-}
-
-#[derive(Debug, Clone, PartialEq)]
-enum Content {
+    Command(Command),
     Text(String),
-    Command(command::Irc, Option<command::Warning>),
-}
-
-impl Content {
-    fn command(&self, buffer: &buffer::Upstream) -> Option<command::Irc> {
-        match self {
-            Self::Text(text) => {
-                let target = buffer.target()?;
-                Some(command::Irc::Msg(target.to_string(), text.clone()))
-            }
-            Self::Command(command, _) => Some(command.clone()),
-        }
-    }
-
-    fn proto(&self, buffer: &buffer::Upstream) -> Option<proto::Message> {
-        self.command(buffer)
-            .and_then(|command| proto::Message::try_from(command).ok())
-    }
-}
-
-#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
-pub struct DraftReply {
-    pub id: message::Id,
-    pub server_time: DateTime<Utc>,
-    pub nick: String,
 }
 
 #[derive(Debug, Clone)]
 pub struct RawInput {
-    pub buffer: buffer::Upstream,
+    pub convo_id: ConvoId,
     pub text: String,
-    pub reply: Option<DraftReply>,
 }
 
+// Draft persistence (drafts.json) is disabled behind the same seam as
+// history: identity is ephemeral upstream, so drafts die with the run.
 #[derive(Debug, Clone, Default)]
 pub struct Storage {
-    sent: HashMap<buffer::Upstream, Vec<String>>,
-    draft_messages: HashMap<buffer::Upstream, String>,
-    draft_reply: HashMap<buffer::Upstream, DraftReply>,
-    cursor_position: HashMap<buffer::Upstream, (usize, usize)>,
+    sent: HashMap<ConvoId, Vec<String>>,
+    draft_messages: HashMap<ConvoId, String>,
+    cursor_position: HashMap<ConvoId, (usize, usize)>,
 }
 
 impl Storage {
-    pub fn get<'a>(&'a self, buffer: &buffer::Upstream) -> Cache<'a> {
+    pub fn get<'a>(&'a self, convo_id: &ConvoId) -> Cache<'a> {
         Cache {
             history: self
                 .sent
-                .get(buffer)
+                .get(convo_id)
                 .map(Vec::as_slice)
                 .unwrap_or_default(),
             draft_message: self
                 .draft_messages
-                .get(buffer)
+                .get(convo_id)
                 .map(AsRef::as_ref)
                 .unwrap_or_default(),
-            draft_reply: self.draft_reply.get(buffer),
-            cursor_position: self.cursor_position.get(buffer),
+            cursor_position: self.cursor_position.get(convo_id),
         }
     }
 
-    pub fn record(&mut self, buffer: &buffer::Upstream, text: String) {
-        self.draft_messages.remove(buffer);
-        self.draft_reply.remove(buffer);
-        let history = self.sent.entry(buffer.clone()).or_default();
+    pub fn record(&mut self, convo_id: &ConvoId, text: String) {
+        self.draft_messages.remove(convo_id);
+        let history = self.sent.entry(convo_id.clone()).or_default();
         history.insert(0, text);
         history.truncate(INPUT_HISTORY_LENGTH);
     }
 
     pub fn store_draft(&mut self, raw_input: RawInput) {
         if raw_input.text.is_empty() {
-            self.draft_messages.remove(&raw_input.buffer);
+            self.draft_messages.remove(&raw_input.convo_id);
         } else {
             self.draft_messages
-                .insert(raw_input.buffer.clone(), raw_input.text);
-        }
-        match raw_input.reply {
-            Some(reply) => {
-                self.draft_reply.insert(raw_input.buffer, reply);
-            }
-            None => {
-                self.draft_reply.remove(&raw_input.buffer);
-            }
+                .insert(raw_input.convo_id, raw_input.text);
         }
     }
 
-    pub fn clone_drafts(&self) -> HashMap<buffer::Upstream, SavedDraft> {
-        self.draft_messages
-            .iter()
-            .map(|(buffer, text)| {
-                (
-                    buffer.clone(),
-                    SavedDraft {
-                        text: text.clone(),
-                        reply: self.draft_reply.get(buffer).cloned(),
-                    },
-                )
-            })
-            .collect()
-    }
-
-    pub fn load_drafts_into(
+    pub fn store_cursor_position(
         &mut self,
-        drafts: HashMap<buffer::Upstream, SavedDraft>,
+        convo_id: &ConvoId,
+        position: (usize, usize),
     ) {
-        for (buffer, saved) in drafts {
-            if !saved.text.is_empty() {
-                self.draft_messages.insert(buffer.clone(), saved.text);
-            }
-            if let Some(reply) = saved.reply {
-                self.draft_reply.insert(buffer, reply);
-            }
-        }
+        self.cursor_position.insert(convo_id.clone(), position);
     }
-}
-
-fn draft_path() -> PathBuf {
-    environment::data_dir().join("drafts.json")
-}
-
-#[derive(serde::Serialize, serde::Deserialize)]
-pub struct SavedDraft {
-    pub text: String,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub reply: Option<DraftReply>,
-}
-
-pub async fn save_drafts(drafts: HashMap<buffer::Upstream, SavedDraft>) {
-    if drafts.is_empty() {
-        let _ = tokio::fs::remove_file(draft_path()).await;
-        return;
-    }
-    let pairs: Vec<(buffer::Upstream, SavedDraft)> =
-        drafts.into_iter().collect();
-    match serde_json::to_vec(&pairs) {
-        Ok(bytes) => {
-            if let Err(e) = tokio::fs::write(draft_path(), bytes).await {
-                log::warn!("failed to save input drafts: {e}");
-            }
-        }
-        Err(e) => log::warn!("failed to serialize input drafts: {e}"),
-    }
-}
-
-pub fn load_drafts_sync() -> HashMap<buffer::Upstream, SavedDraft> {
-    let Ok(bytes) = std::fs::read(draft_path()) else {
-        return HashMap::new();
-    };
-    serde_json::from_slice::<Vec<(buffer::Upstream, SavedDraft)>>(&bytes)
-        .unwrap_or_default()
-        .into_iter()
-        .collect()
 }
 
 /// Cached values for a buffers input
@@ -504,243 +93,54 @@ pub fn load_drafts_sync() -> HashMap<buffer::Upstream, SavedDraft> {
 pub struct Cache<'a> {
     pub history: &'a [String],
     pub draft_message: &'a str,
-    pub draft_reply: Option<&'a DraftReply>,
     pub cursor_position: Option<&'a (usize, usize)>,
 }
 
-#[derive(Debug, Clone, PartialEq)]
-pub struct CodeFence {
-    indent: usize,
-    backticks: usize,
-    info: Option<String>,
-}
-
-fn parse_code_fence(input: &str) -> IResult<&str, CodeFence> {
-    cut(map(
-        (parse_indent, parse_backticks, parse_info),
-        |(indent, backticks, info)| {
-            let info = info.trim();
-            CodeFence {
-                indent,
-                backticks,
-                info: (!info.is_empty()).then_some(info.to_string()),
-            }
-        },
-    ))
-    .parse(input)
-}
-
-fn parse_indent(input: &str) -> IResult<&str, usize> {
-    verify(many0_count(char(' ')), |indent: &usize| *indent <= 3).parse(input)
-}
-
-fn parse_backticks(input: &str) -> IResult<&str, usize> {
-    verify(many1_count(char('`')), |backticks: &usize| *backticks >= 3)
-        .parse(input)
-}
-
-fn parse_info(input: &str) -> IResult<&str, &str> {
-    verify(rest, |info: &str| !info.contains('`')).parse(input)
-}
-
-fn remove_indent<'a>(
-    input: &'a str,
-    code_fence: &CodeFence,
-) -> IResult<&'a str, &'a str> {
-    map(
-        (many_m_n(0, code_fence.indent, char(' ')), rest),
-        |(_, unindented)| unindented,
-    )
-    .parse(input)
-}
-
-#[derive(Debug, Clone, PartialEq, thiserror::Error)]
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 pub enum Error {
-    #[error(
-        "message exceeds maximum encoded length ({}/{} bytes)",
-        bytes,
-        bytes_limit
-    )]
-    ExceedsByteLimit { bytes: usize, bytes_limit: usize },
+    #[error("input is empty")]
+    Empty,
     #[error(transparent)]
     Command(#[from] command::Error),
 }
 
 #[cfg(test)]
-mod test {
-    use crate::capabilities::Capabilities;
-    use crate::config::buffer::text_input::AutoFormat;
-    use crate::input::{CodeFence, Content, Input, Parsed, parse};
-    use crate::user::Nick;
-    use crate::{Config, Server, buffer, command, features, isupport, target};
+mod tests {
+    use super::*;
 
     #[test]
-    fn parsing() {
-        let config = Config::default();
-        let isupport = &isupport::DEFAULT;
-        let mut capabilities = Capabilities::default();
-        capabilities.acknowledge(
-            [String::from("draft/multiline=max-bytes=4096,max-lines=24")]
-                .into_iter(),
+    fn parses_text_commands_and_escapes() {
+        assert_eq!(
+            parse("hello there"),
+            Ok(Parsed::Text("hello there".to_string()))
         );
-        let features = &features::DEFAULT;
+        assert_eq!(
+            parse("/dm deadbeef"),
+            Ok(Parsed::Command(Command::Dm(Some("deadbeef".to_string()))))
+        );
+        assert_eq!(
+            parse("//not a command"),
+            Ok(Parsed::Text("/not a command".to_string()))
+        );
+        assert_eq!(parse(""), Err(Error::Empty));
+        assert_eq!(parse("   "), Err(Error::Empty));
+        assert!(matches!(parse("/bogus"), Err(Error::Command(_))));
+    }
 
-        let nick = Nick::from_str(
-            "tester",
-            isupport::get_casemapping_or_default(isupport),
-        );
-        let buffer = buffer::Upstream::Channel(
-            Server {
-                name: "Libera".into(),
-                network: None,
-            },
-            target::Channel::from_str(
-                "##chat",
-                isupport::get_chantypes_or_default(isupport),
-                isupport::get_casemapping_or_default(isupport),
-            ),
-        );
-        let tests = [
-            (
-                (
-                    AutoFormat::Disabled,
-                    "``` no autoformat ``` _at_ **all**",
-                    None,
-                ),
-                Ok(Parsed::Input(Input {
-                    buffer: buffer.clone(),
-                    content: Content::Text(String::from(
-                        "``` no autoformat ``` _at_ **all**",
-                    )),
-                })),
-            ),
-            (
-                (AutoFormat::Markdown, "```toml", None),
-                Ok(Parsed::CodeFence(CodeFence {
-                    indent: 0,
-                    backticks: 3,
-                    info: Some(String::from("toml")),
-                })),
-            ),
-            (
-                (
-                    AutoFormat::Markdown,
-                    "```toml",
-                    Some(&CodeFence {
-                        indent: 0,
-                        backticks: 3,
-                        info: Some(String::from("toml")),
-                    }),
-                ),
-                Ok(Parsed::Input(Input {
-                    buffer: buffer.clone(),
-                    content: Content::Text(String::from("\u{11}```toml\u{11}")),
-                })),
-            ),
-            (
-                (
-                    AutoFormat::Markdown,
-                    "  ```",
-                    Some(&CodeFence {
-                        indent: 0,
-                        backticks: 3,
-                        info: Some(String::from("toml")),
-                    }),
-                ),
-                Ok(Parsed::CodeFence(CodeFence {
-                    indent: 2,
-                    backticks: 3,
-                    info: None,
-                })),
-            ),
-            (
-                (
-                    AutoFormat::Markdown,
-                    "`````",
-                    Some(&CodeFence {
-                        indent: 0,
-                        backticks: 3,
-                        info: Some(String::from("toml")),
-                    }),
-                ),
-                Ok(Parsed::CodeFence(CodeFence {
-                    indent: 0,
-                    backticks: 5,
-                    info: None,
-                })),
-            ),
-            (
-                (
-                    AutoFormat::Markdown,
-                    "    key_bindings = \"emacs\"",
-                    Some(&CodeFence {
-                        indent: 2,
-                        backticks: 3,
-                        info: None,
-                    }),
-                ),
-                Ok(Parsed::Input(Input {
-                    buffer: buffer.clone(),
-                    content: Content::Text(String::from(
-                        "\u{11}  key_bindings = \"emacs\"\u{11}",
-                    )),
-                })),
-            ),
-            (
-                (
-                    AutoFormat::Markdown,
-                    "  key_bindings = \"emacs\"",
-                    Some(&CodeFence {
-                        indent: 3,
-                        backticks: 3,
-                        info: None,
-                    }),
-                ),
-                Ok(Parsed::Input(Input {
-                    buffer: buffer.clone(),
-                    content: Content::Text(String::from(
-                        "\u{11}key_bindings = \"emacs\"\u{11}",
-                    )),
-                })),
-            ),
-            (
-                (
-                    AutoFormat::Markdown,
-                    "/me thinks in _italics_ and **bold**",
-                    None,
-                ),
-                Ok(Parsed::Input(Input {
-                    buffer: buffer.clone(),
-                    content: Content::Command(
-                        command::Irc::Me(
-                            String::from("##chat"),
-                            String::from(
-                                "thinks in \u{1d}italics\u{1d} and \u{2}bold\u{2}",
-                            ),
-                        ),
-                        None,
-                    ),
-                })),
-            ),
-        ];
-        for ((auto_format, input, code_fence), expected) in tests {
-            let parsed = parse(
-                buffer.clone(),
-                auto_format,
-                input,
-                code_fence,
-                Some(nick.as_nickref()),
-                Some(true),
-                true,
-                isupport,
-                &capabilities,
-                features,
-                None,
-                128,
-                &config,
-            );
+    #[test]
+    fn storage_drafts_and_history() {
+        let mut storage = Storage::default();
+        let convo = ConvoId::from("c1");
 
-            assert_eq!(parsed, expected);
-        }
+        storage.store_draft(RawInput {
+            convo_id: convo.clone(),
+            text: "draft text".to_string(),
+        });
+        assert_eq!(storage.get(&convo).draft_message, "draft text");
+
+        storage.record(&convo, "draft text".to_string());
+        let cache = storage.get(&convo);
+        assert_eq!(cache.draft_message, "");
+        assert_eq!(cache.history, ["draft text".to_string()]);
     }
 }
