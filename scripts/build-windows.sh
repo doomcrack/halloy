@@ -4,7 +4,7 @@ set -euo pipefail
 # Deprecated for now.
 # We should later use it for portable version of Halloy.
 
-EXE_NAME="halloy.exe"
+EXE_NAME="frigicom.exe"
 TARGET="x86_64-pc-windows-msvc"
 HALLOY_VERSION=$(grep -q '\..*\.' VERSION && cat VERSION || echo "$(cat VERSION).0")
 PROFILE="packaging"

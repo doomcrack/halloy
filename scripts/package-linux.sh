@@ -1,7 +1,7 @@
 #!/bin/bash
 
 ARCH="x86_64"
-TARGET="halloy"
+TARGET="frigicom"
 VERSION=$(cat VERSION)
 NIGHTLY=$(cat NIGHTLY)
 PROFILE="packaging"

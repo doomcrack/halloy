@@ -1,11 +1,11 @@
 [Desktop Entry]
-Name=Halloy
-Comment=IRC client written in Rust
+Name=Frigicom
+Comment=Logos chat client written in Rust
 Type=Application
-Keywords=IRC;IM;Chat;
-Categories=Network;IRCClient;
-Exec=halloy %U
+Keywords=Logos;IM;Chat;
+Categories=Network;InstantMessaging;
+Exec=frigicom %U
 Icon=org.squidowl.halloy
-StartupWMClass=org.squidowl.halloy
-MimeType=x-scheme-handler/irc;x-scheme-handler/ircs;x-scheme-handler/halloy;
+StartupWMClass=org.logos.frigicom
+MimeType=x-scheme-handler/frigicom;x-scheme-handler/halloy;
 Terminal=false

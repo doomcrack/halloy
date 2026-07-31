@@ -79,7 +79,7 @@ jobs:
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: windows-unsigned-executable
-          path: target/packaging/halloy.exe
+          path: target/packaging/frigicom.exe
           if-no-files-found: error
           retention-days: 1
 
@@ -101,13 +101,13 @@ jobs:
         if: matrix.target.target == 'windows'
         shell: bash
         run: |
-          signed_executable="$(find target/signpath-signed-executable -type f -iname 'halloy.exe' -print -quit)"
+          signed_executable="$(find target/signpath-signed-executable -type f -iname 'frigicom.exe' -print -quit)"
           if [ -z "$signed_executable" ]; then
-            echo "Could not find signed halloy.exe in target/signpath-signed-executable" >&2
+            echo "Could not find signed frigicom.exe in target/signpath-signed-executable" >&2
             exit 1
           fi
 
-          cp -fp "$signed_executable" target/packaging/halloy.exe
+          cp -fp "$signed_executable" target/packaging/frigicom.exe
 
       - name: Delete unsigned Windows executable artifact
         if: matrix.target.target == 'windows'

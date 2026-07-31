@@ -1,6 +1,6 @@
 #define AppName "Halloy"
 #define AppPublisher "Squidowl"
-#define AppExeName "halloy.exe"
+#define AppExeName "frigicom.exe"
 #define AppId "{{3ED18662-FB43-4803-A4F9-89BBBC0B6D01}"
 #define AppVersion GetEnv("HALLOY_VERSION")
 #define SourceDir GetEnv("HALLOY_SOURCE_DIR")
@@ -58,8 +58,6 @@ Root: HKCU; Subkey: "Software\Halloy\Capabilities"; ValueType: string; ValueName
 Root: HKCU; Subkey: "Software\Halloy\Capabilities"; ValueType: string; ValueName: "ApplicationName"; ValueData: "Halloy"; Flags: uninsdeletekey
 Root: HKCU; Subkey: "Software\Halloy\Capabilities\DefaultIcon"; ValueType: string; ValueName: ""; ValueData: "{app}\{#AppExeName},1"; Flags: uninsdeletekey
 Root: HKCU; Subkey: "Software\Halloy\Capabilities\URLAssociations"; ValueType: string; ValueName: "halloy"; ValueData: "halloy"; Flags: uninsdeletekey
-Root: HKCU; Subkey: "Software\Halloy\Capabilities\URLAssociations"; ValueType: string; ValueName: "irc"; ValueData: "irc"; Flags: uninsdeletekey
-Root: HKCU; Subkey: "Software\Halloy\Capabilities\URLAssociations"; ValueType: string; ValueName: "ircs"; ValueData: "ircs"; Flags: uninsdeletekey
 Root: HKCU; Subkey: "Software\RegisteredApplications"; ValueType: string; ValueName: "Halloy"; ValueData: "Software\Halloy\Capabilities"; Flags: uninsdeletevalue
 
 Root: HKCU; Subkey: "Software\Classes\halloy"; ValueType: string; ValueName: ""; ValueData: "URL:Halloy"; Flags: uninsdeletekey
@@ -68,20 +66,6 @@ Root: HKCU; Subkey: "Software\Classes\halloy"; ValueType: string; ValueName: "UR
 Root: HKCU; Subkey: "Software\Classes\halloy\DefaultIcon"; ValueType: string; ValueName: ""; ValueData: "{app}\{#AppExeName},1"; Flags: uninsdeletekey
 Root: HKCU; Subkey: "Software\Classes\halloy\shell"; ValueType: string; ValueName: ""; ValueData: "open"; Flags: uninsdeletekey
 Root: HKCU; Subkey: "Software\Classes\halloy\shell\open\command"; ValueType: string; ValueName: ""; ValueData: """{app}\{#AppExeName}"" ""%1"""; Flags: uninsdeletekey
-
-Root: HKCU; Subkey: "Software\Classes\irc"; ValueType: string; ValueName: ""; ValueData: "URL:Internet Relay Chat"; Flags: uninsdeletekey
-Root: HKCU; Subkey: "Software\Classes\irc"; ValueType: string; ValueName: "FriendlyTypeName"; ValueData: "Internet Relay Chat URL"; Flags: uninsdeletekey
-Root: HKCU; Subkey: "Software\Classes\irc"; ValueType: string; ValueName: "URL Protocol"; ValueData: ""; Flags: uninsdeletekey
-Root: HKCU; Subkey: "Software\Classes\irc\DefaultIcon"; ValueType: string; ValueName: ""; ValueData: "{app}\{#AppExeName},1"; Flags: uninsdeletekey
-Root: HKCU; Subkey: "Software\Classes\irc\shell"; ValueType: string; ValueName: ""; ValueData: "open"; Flags: uninsdeletekey
-Root: HKCU; Subkey: "Software\Classes\irc\shell\open\command"; ValueType: string; ValueName: ""; ValueData: """{app}\{#AppExeName}"" ""%1"""; Flags: uninsdeletekey
-
-Root: HKCU; Subkey: "Software\Classes\ircs"; ValueType: string; ValueName: ""; ValueData: "URL:Internet Relay Chat with Privacy"; Flags: uninsdeletekey
-Root: HKCU; Subkey: "Software\Classes\ircs"; ValueType: string; ValueName: "FriendlyTypeName"; ValueData: "Internet Relay Chat with Privacy URL"; Flags: uninsdeletekey
-Root: HKCU; Subkey: "Software\Classes\ircs"; ValueType: string; ValueName: "URL Protocol"; ValueData: ""; Flags: uninsdeletekey
-Root: HKCU; Subkey: "Software\Classes\ircs\DefaultIcon"; ValueType: string; ValueName: ""; ValueData: "{app}\{#AppExeName},1"; Flags: uninsdeletekey
-Root: HKCU; Subkey: "Software\Classes\ircs\shell"; ValueType: string; ValueName: ""; ValueData: "open"; Flags: uninsdeletekey
-Root: HKCU; Subkey: "Software\Classes\ircs\shell\open\command"; ValueType: string; ValueName: ""; ValueData: """{app}\{#AppExeName}"" ""%1"""; Flags: uninsdeletekey
 
 [Run]
 Filename: "{app}\{#AppExeName}"; Description: "{cm:LaunchProgram,{#StringChange(AppName, '&', '&&')}}"; Flags: nowait postinstall skipifsilent

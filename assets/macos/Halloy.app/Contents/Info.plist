@@ -5,13 +5,13 @@
   <key>CFBundleDevelopmentRegion</key>
   <string>en</string>
   <key>CFBundleExecutable</key>
-  <string>halloy</string>
+  <string>frigicom</string>
   <key>CFBundleIdentifier</key>
   <string>org.squidowl.halloy</string>
   <key>CFBundleInfoDictionaryVersion</key>
   <string>6.0</string>
   <key>CFBundleName</key>
-  <string>Halloy</string>
+  <string>Frigicom</string>
   <key>CFBundlePackageType</key>
   <string>APPL</string>
   <key>CFBundleShortVersionString</key>
@@ -31,18 +31,17 @@
   <key>NSSupportsAutomaticGraphicsSwitching</key>
   <true/>
   <key>CFBundleDisplayName</key>
-  <string>Halloy</string>
+  <string>Frigicom</string>
   <key>NSRequiresAquaSystemAppearance</key>
   <string>NO</string>
   <key>CFBundleURLTypes</key>
   <array>
     <dict>
       <key>CFBundleURLName</key>
-      <string>Halloy</string>
+      <string>Frigicom</string>
       <key>CFBundleURLSchemes</key>
       <array>
-        <string>irc</string>
-        <string>ircs</string>
+        <string>frigicom</string>
         <string>halloy</string>
       </array>
     </dict>

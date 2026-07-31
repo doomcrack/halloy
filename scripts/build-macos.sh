@@ -1,6 +1,6 @@
 #! /usr/bin/env -S bash -e
 
-TARGET="halloy"
+TARGET="frigicom"
 PROFILE="packaging"
 ASSETS_DIR="assets"
 RELEASE_DIR="target/$PROFILE"
