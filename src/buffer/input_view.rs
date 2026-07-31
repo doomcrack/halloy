@@ -1,124 +1,49 @@
 use std::borrow::Cow;
-use std::collections::VecDeque;
-use std::convert;
-use std::sync::Arc;
-use std::time::{Duration, Instant};
 
-use chrono::{DateTime, Utc};
-use data::buffer::{self, Upstream};
-use data::capabilities::{MultilineBatchKind, multiline_concat_lines};
-use data::config::buffer::text_input::{AutoFormat, Autocomplete, KeyBindings};
-use data::dashboard::BufferAction;
-use data::history::filter::FilterChain;
-use data::history::{self, ReadMarker};
-use data::input::{self, CodeFence, RawInput};
-use data::rate_limit::TokenPriority;
-use data::server::Server;
-use data::target::Target;
-use data::user::{ChannelUsers, Nick};
-use data::{Config, User, client, command, message, metadata, shortcut};
-use iced::Length::Fit;
+use data::config::buffer::text_input::KeyBindings;
+use data::conversation::ConvoId;
+use data::input::{self, RawInput};
+use data::{Config, history};
 use iced::advanced::widget::Tree;
 use iced::advanced::{Layout, Shell, mouse};
-use iced::keyboard::{Key, key};
 use iced::widget::text::{Shaping, Wrapping};
-use iced::widget::{
-    self, Space, button, center, column, container, mouse_area, operation, row,
-    rule, text_editor,
-};
-use iced::{Alignment, Length, Task, clipboard, event, keyboard, padding};
-use itertools::Itertools;
-use tokio::time;
-use unicode_segmentation::UnicodeSegmentation;
+use iced::widget::{self, button, column, container, row, text_editor};
+use iced::{Length, Task, clipboard, event, keyboard};
 
-use self::completion::Completion;
-use self::exec::run as execute_shell_command;
+use self::completion::{Arrow, Completion};
 use crate::widget::key_press::is_numpad;
-use crate::widget::user_display::UserDisplay;
 use crate::widget::{
-    Element, Renderer, Text, anchored_overlay, context_menu, decorate,
-    double_pass, reply_preview_content, text, text_editor_key_bindings,
-    tooltip,
+    Element, Renderer, Text, anchored_overlay, context_menu, decorate, text,
+    text_editor_key_bindings,
 };
 use crate::{Theme, font, theme};
 
 mod completion;
-mod exec;
-
-const TYPING_REFRESH_INTERVAL: Duration = Duration::from_secs(4);
 
 pub enum Event {
-    InputSent {
-        history_task: Task<history::manager::Message>,
-        open_buffers: Vec<(Target, BufferAction)>,
-        was_join_command: bool,
-    },
-    OpenBuffers {
-        server: Server,
-        targets: Vec<(Target, BufferAction)>,
-    },
-    OpenInternalBuffer(buffer::Internal),
-    OpenServer(String),
-    LeaveBuffers {
-        targets: Vec<Target>,
-        reason: Option<String>,
-    },
-    Cleared {
-        history_task: Task<history::manager::Message>,
-    },
-    Reconnect(Server),
-    FilehostUpload {
-        server: Server,
-        target: Option<Target>,
-        file_paths: Vec<std::path::PathBuf>,
-        upload_ids: Vec<u32>,
-        abort_registrations: Vec<futures::future::AbortRegistration>,
-    },
+    /// Plain text submitted with Enter; the dashboard forwards it to the
+    /// backend as `Control::SendMessage`.
+    SendMessage { convo_id: ConvoId, content: String },
+    /// A parsed slash command; the dashboard maps it onto backend controls
+    /// (dm/group/add/nick) or local actions (details/clear).
+    Command(data::Command),
 }
 
 #[derive(Debug, Clone)]
 pub enum Message {
     Action(text_editor::Action),
-    ExecFinished {
-        buffer: Upstream,
-        result: Result<String, String>,
-    },
-    SysInfoReceived(iced::system::Information),
     Send,
     Kill(text_editor_key_bindings::Kill, bool),
-    SelectCompletion(usize),
     Tab(bool),
     Up(bool),
     Down(bool),
     Escape,
-    SendCommand {
-        buffer: Upstream,
-        command: command::Irc,
-    },
-    SendLines {
-        buffer: Upstream,
-        lines: VecDeque<input::Parsed>,
-    },
     Paste,
     SelectAll,
     CopyAll,
     Copy,
     Cut,
-    UploadFile,
-    FilesSelected(Vec<std::path::PathBuf>),
-    FilehostUploadDone {
-        id: u32,
-        url: Option<String>,
-    },
-    UploadAnimTick,
-    CancelUploads,
-    SpinnerHovered(bool),
-    SetDraftReply {
-        msgid: message::Id,
-        server_time: DateTime<Utc>,
-        to_nick: Nick,
-    },
-    ClearDraftReply,
+    CompletionSelected(usize),
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -145,7 +70,6 @@ impl Actions {
 #[derive(Debug, Clone)]
 enum Notice {
     Error(String),
-    Warning(String),
 }
 
 fn kill_binding(
@@ -197,135 +121,109 @@ fn paste_key_binding(
 
 pub fn view<'a>(
     state: &'a State,
-    our_user: Option<&User>,
-    channel_users: Option<&'a ChannelUsers>,
-    server: &'a Server,
-    registry: &'a dyn metadata::Registry,
+    can_act: bool,
     config: &'a Config,
     theme: &'a Theme,
-    filehost_url: Option<&'a str>,
 ) -> Element<'a, Message> {
-    const INPUT_ROW_SPACING: u32 = 4;
-
-    let style = if let Some(notice) = &state.notice {
-        match notice {
-            Notice::Warning(_) => theme::text_editor::warning,
-            Notice::Error(_) => theme::text_editor::error,
-        }
+    let style = if state.notice.is_some() {
+        theme::text_editor::error
     } else {
         theme::text_editor::primary
     };
 
-    let text_input = text_editor(&state.input_content)
+    let placeholder = if can_act {
+        "Send message..."
+    } else {
+        "Waiting for connection..."
+    };
+
+    let mut text_input = text_editor(&state.input_content)
         .id(state.input_id.clone())
-        .placeholder("Send message...")
+        .placeholder(placeholder)
         .padding([2, 4])
         .wrapping(Wrapping::WordOrGlyph)
         .height(Length::Shrink)
         .line_height(theme::line_height(&config.font))
-        .style(style)
-        .on_action(Message::Action)
-        .key_binding(move |key_press| {
-            if !matches!(
-                key_press.status,
-                iced::widget::text_editor::Status::Focused { .. }
-            ) {
-                return None;
-            }
+        .style(style);
 
-            // Try emacs bindings first if enabled
-            if matches!(
-                config.buffer.text_input.key_bindings,
-                KeyBindings::Emacs
-            ) && let Some(binding) =
-                text_editor_key_bindings::emacs(&key_press, kill_binding)
-            {
-                return Some(binding);
-            }
-
-            // Platform specific key bindings
-            if let Some(binding) = platform_specific_key_bindings(
-                key_press.clone(),
-                state.input_content.selection().as_deref(),
-            ) {
-                return Some(binding);
-            }
-
-            // Handling for numpad keys: treat a numpad enter the same as
-            // a normal enter; treat numpad keys as character keys when
-            // numlock is on (i.e. text.is_some())
-            let key = if key_press.physical_key
-                == iced::keyboard::key::Physical::Code(
-                    iced::keyboard::key::Code::NumpadEnter,
+    if can_act {
+        text_input = text_input.on_action(Message::Action).key_binding(
+            move |key_press| {
+                if !matches!(
+                    key_press.status,
+                    iced::widget::text_editor::Status::Focused { .. }
                 ) {
-                Cow::Owned(iced::keyboard::Key::Named(
-                    iced::keyboard::key::Named::Enter,
-                ))
-            } else if is_numpad(&key_press.physical_key)
-                && let Some(text) = &key_press.text
-            {
-                Cow::Owned(keyboard::Key::Character(text.clone()))
-            } else {
-                Cow::Borrowed(&key_press.key)
-            };
-
-            match *key {
-                // New line
-                iced::keyboard::Key::Named(
-                    iced::keyboard::key::Named::Enter,
-                ) if key_press.modifiers.shift() => {
-                    (state.input_content.line_count()
-                        < config.buffer.text_input.max_lines)
-                        .then_some(text_editor::Binding::Enter)
+                    return None;
                 }
-                //
-                // Send
-                iced::keyboard::Key::Named(
-                    iced::keyboard::key::Named::Enter,
-                ) => Some(text_editor::Binding::Custom(Message::Send)),
-                // Tab
-                iced::keyboard::Key::Named(iced::keyboard::key::Named::Tab) => {
-                    Some(text_editor::Binding::Custom(Message::Tab(
+
+                // Try emacs bindings first if enabled
+                if matches!(
+                    config.buffer.text_input.key_bindings,
+                    KeyBindings::Emacs
+                ) && let Some(binding) =
+                    text_editor_key_bindings::emacs(&key_press, kill_binding)
+                {
+                    return Some(binding);
+                }
+
+                // Platform specific key bindings
+                if let Some(binding) = platform_specific_key_bindings(
+                    key_press.clone(),
+                    state.input_content.selection().as_deref(),
+                ) {
+                    return Some(binding);
+                }
+
+                // Handling for numpad keys: treat a numpad enter the same as
+                // a normal enter; treat numpad keys as character keys when
+                // numlock is on (i.e. text.is_some())
+                let key = if key_press.physical_key
+                    == iced::keyboard::key::Physical::Code(
+                        iced::keyboard::key::Code::NumpadEnter,
+                    ) {
+                    Cow::Owned(iced::keyboard::Key::Named(
+                        iced::keyboard::key::Named::Enter,
+                    ))
+                } else if is_numpad(&key_press.physical_key)
+                    && let Some(text) = &key_press.text
+                {
+                    Cow::Owned(keyboard::Key::Character(text.clone()))
+                } else {
+                    Cow::Borrowed(&key_press.key)
+                };
+
+                match *key {
+                    // Send
+                    iced::keyboard::Key::Named(
+                        iced::keyboard::key::Named::Enter,
+                    ) => Some(text_editor::Binding::Custom(Message::Send)),
+                    // Tab
+                    iced::keyboard::Key::Named(
+                        iced::keyboard::key::Named::Tab,
+                    ) => Some(text_editor::Binding::Custom(Message::Tab(
                         key_press.modifiers.shift(),
-                    )))
+                    ))),
+                    // Up
+                    iced::keyboard::Key::Named(
+                        iced::keyboard::key::Named::ArrowUp,
+                    ) => Some(text_editor::Binding::Custom(Message::Up(
+                        key_press.modifiers.shift(),
+                    ))),
+                    // Down
+                    iced::keyboard::Key::Named(
+                        iced::keyboard::key::Named::ArrowDown,
+                    ) => Some(text_editor::Binding::Custom(Message::Down(
+                        key_press.modifiers.shift(),
+                    ))),
+                    // Escape
+                    iced::keyboard::Key::Named(
+                        iced::keyboard::key::Named::Escape,
+                    ) => Some(text_editor::Binding::Custom(Message::Escape)),
+                    _ => text_editor::Binding::from_key_press(key_press),
                 }
-                // Up
-                iced::keyboard::Key::Named(
-                    iced::keyboard::key::Named::ArrowUp,
-                ) => {
-                    let cursor_position = state.input_content.cursor().position;
-
-                    if cursor_position.line == 0 {
-                        Some(text_editor::Binding::Custom(Message::Up(
-                            key_press.modifiers.shift(),
-                        )))
-                    } else {
-                        text_editor::Binding::from_key_press(key_press)
-                    }
-                }
-                // Down
-                iced::keyboard::Key::Named(
-                    iced::keyboard::key::Named::ArrowDown,
-                ) => {
-                    let cursor_position = state.input_content.cursor().position;
-
-                    if cursor_position.line
-                        == state.input_content.line_count().saturating_sub(1)
-                    {
-                        Some(text_editor::Binding::Custom(Message::Down(
-                            key_press.modifiers.shift(),
-                        )))
-                    } else {
-                        text_editor::Binding::from_key_press(key_press)
-                    }
-                }
-                // Escape
-                iced::keyboard::Key::Named(
-                    iced::keyboard::key::Named::Escape,
-                ) => Some(text_editor::Binding::Custom(Message::Escape)),
-                _ => text_editor::Binding::from_key_press(key_press),
-            }
-        });
+            },
+        );
+    }
 
     let text_input = decorate(text_input).update(
         move |_state: &mut State,
@@ -387,12 +285,12 @@ pub fn view<'a>(
             match menu {
                 Actions::Cut => context_button(
                     text("Cut"),
-                    Some(shortcut::cut()),
+                    Some(data::shortcut::cut()),
                     state.input_content.selection().map(|_| Message::Cut),
                 ),
                 Actions::Copy => context_button(
                     text("Copy"),
-                    Some(shortcut::copy()),
+                    Some(data::shortcut::copy()),
                     state.input_content.selection().map(|_| Message::Copy),
                 ),
                 Actions::CopyAll => context_button(
@@ -406,7 +304,7 @@ pub fn view<'a>(
                 ),
                 Actions::SelectAll => context_button(
                     text("Select All"),
-                    Some(shortcut::select_all()),
+                    Some(data::shortcut::select_all()),
                     if !state.input_content.text().is_empty() {
                         Some(Message::SelectAll)
                     } else {
@@ -415,7 +313,7 @@ pub fn view<'a>(
                 ),
                 Actions::Paste => context_button(
                     text("Paste"),
-                    Some(shortcut::paste()),
+                    Some(data::shortcut::paste()),
                     Some(Message::Paste),
                 ),
             }
@@ -423,257 +321,39 @@ pub fn view<'a>(
     )
     .into();
 
-    let maybe_upload_spinner: Option<crate::widget::Element<'a, Message>> =
-        (filehost_url.is_some() && state.uploading > 0).then(|| {
-            let icon: crate::widget::Element<'a, Message> =
-                if state.spinner_hovered {
-                    crate::icon::cancel()
-                        .size(15)
-                        .style(theme::text::error)
-                        .into()
-                } else {
-                    let t = state.upload_anim * std::f32::consts::TAU;
-                    let spinner = crate::icon::spinner(t + 0.4 * t.sin());
-                    if state.uploading > 1 {
-                        row![spinner, text(state.uploading).size(12)]
-                            .align_y(iced::Alignment::Center)
-                            .spacing(2)
-                            .into()
-                    } else {
-                        spinner.into()
-                    }
-                };
-            let width = if state.uploading > 1 { 28 } else { 23 };
-            tooltip(
-                mouse_area(
-                    button(center(icon))
-                        .padding(4)
-                        .width(width)
-                        .height(23)
-                        .style(|theme, status| {
-                            let mut style =
-                                theme::button::secondary(theme, status, false);
-                            if status != iced::widget::button::Status::Hovered {
-                                style.background = None;
-                            }
-                            style
-                        })
-                        .on_press(Message::CancelUploads),
-                )
-                .on_enter(Message::SpinnerHovered(true))
-                .on_exit(Message::SpinnerHovered(false)),
-                Some("Cancel uploads"),
-                tooltip::Position::Top,
-                theme,
-            )
-        });
-
-    let maybe_upload_button =
-        (filehost_url.is_some() && config.filehost.button()).then(|| {
-            tooltip(
-                button(center(crate::icon::plus().size(15)))
-                    .padding(4)
-                    .width(23)
-                    .height(23)
-                    .style(|theme, status| {
-                        theme::button::secondary(theme, status, false)
-                    })
-                    .on_press(Message::UploadFile),
-                config.tooltips.show_for_buttons().then_some("Upload file"),
-                tooltip::Position::Top,
-                theme,
-            )
-        });
-
-    let maybe_reply_bar = state.reply_preview.as_ref().map(|reply_preview| {
-        reply_bar(reply_preview, channel_users, registry, config, theme)
-    });
-
     let input_row = container(
-        row![]
-            .extend(maybe_our_user(our_user, registry, config, theme))
-            .push(wrapped_input)
-            .extend(maybe_upload_spinner.into_iter().chain(maybe_upload_button))
-            .spacing(INPUT_ROW_SPACING)
+        row![wrapped_input]
+            .spacing(4)
             .height(Length::Shrink)
-            .align_y(Alignment::Center),
-    )
-    .height(
-        Fit.max(
-            (7.55 * theme::resolve_line_height(&config.font).ceil()).ceil(),
-        ),
+            .align_y(iced::Alignment::Center),
     )
     .padding(8);
 
     let styled_input =
         container(input_row).style(theme::container::buffer_text_input);
 
-    let input_column = column![
-        if let Some(bar) = maybe_reply_bar {
-            bar
-        } else {
-            row![].into()
-        },
-        styled_input
-    ]
-    .spacing(0);
+    let notice = state
+        .notice
+        .as_ref()
+        .map(|notice| notice_view(notice, theme));
 
-    let content = column![input_column].spacing(4).padding(padding::top(4));
+    let base = column![notice, styled_input]
+        .spacing(4)
+        .padding(iced::padding::top(4));
 
-    if config.tooltips.show_for_autocomplete() {
-        let overlay = || -> Element<'a, Message> {
-            let cursor = state.input_content.cursor();
+    let overlay = state
+        .completion
+        .view(config, theme, Message::CompletionSelected)
+        .unwrap_or_else(|| row![].into());
 
-            column![
-                state.completion.view(
-                    state.input_content.text().as_str(),
-                    cursor.position.column,
-                    cursor.selection.is_some(),
-                    server,
-                    config,
-                    theme,
-                    Message::SelectCompletion,
-                ),
-                state
-                    .notice
-                    .as_ref()
-                    .map(|notice| notice_view(notice, theme)),
-            ]
-            .padding([0, 8])
-            .spacing(4)
-            .into()
-        };
-
-        let overlay = double_pass(
-            row![]
-                .extend(maybe_our_user(our_user, registry, config, theme))
-                .push(overlay())
-                .spacing(INPUT_ROW_SPACING),
-            row![Space::new().width(Length::Fill), overlay()],
-        );
-
-        anchored_overlay(
-            content,
-            overlay,
-            anchored_overlay::Anchor::AboveTop,
-            4.0,
-        )
-    } else {
-        // Wrap in column so iced can track content properly
-        column![content].into()
-    }
+    anchored_overlay(base, overlay, anchored_overlay::Anchor::AboveTop, 4.0)
 }
 
-fn maybe_our_user<'a>(
-    our_user: Option<&User>,
-    registry: &'a dyn metadata::Registry,
-    config: &'a Config,
-    theme: &'a Theme,
-) -> impl IntoIterator<Item = Element<'a, Message>> {
-    if config.buffer.text_input.nickname.enabled {
-        our_user
-            .map(|user| {
-                let user_display = UserDisplay::new(
-                    user,
-                    config.buffer.text_input.nickname.show_access_levels,
-                    config.buffer.nickname.show_bot_icon,
-                    false,
-                    registry,
-                    &config.display.nickname,
-                    None,
-                    config.display.truncation_character,
-                    None,
-                    true,
-                );
-
-                vec![
-                    container(user_display.into_element(
-                        user,
-                        user.is_away(),
-                        false,
-                        None,
-                        None,
-                        false,
-                        false,
-                        theme,
-                        config,
-                    ))
-                    .padding(padding::right(4))
-                    .into(),
-                    rule::vertical(1.0).into(),
-                ]
-            })
-            .unwrap_or_default()
-    } else {
-        vec![]
-    }
-    .into_iter()
-}
-fn reply_bar<'a>(
-    reply_preview: &'a message::ReplyPreview,
-    channel_users: Option<&'a ChannelUsers>,
-    registry: &'a dyn metadata::Registry,
-    config: &'a Config,
-    theme: &'a Theme,
-) -> crate::widget::Element<'a, Message> {
-    let font_size = config.font.size.map_or(theme::TEXT_SIZE, f32::from) * 0.85;
-
-    let reply_preview = reply_preview_content(
-        Some(reply_preview),
-        false,
-        false,
-        font_size,
-        channel_users,
-        registry,
-        config,
-        theme,
-    );
-
-    container(
-        row![
-            crate::icon::reply().style(theme::text::primary),
-            row![
-                text("Replying to ")
-                    .style(theme::text::primary)
-                    .size(font_size),
-                reply_preview
-            ]
-            .width(Length::Fill),
-            tooltip(
-                button(center(crate::icon::cancel()))
-                    .on_press(Message::ClearDraftReply)
-                    .width(20)
-                    .height(20)
-                    .style(|theme, status| {
-                        theme::button::secondary(theme, status, false)
-                    })
-                    .padding(5),
-                Some(format!(
-                    "Remove reply ({})",
-                    shortcut::KeyBind::from((
-                        Key::Named(key::Named::Escape),
-                        keyboard::Modifiers::default()
-                    ))
-                )),
-                widget::tooltip::Position::Top,
-                theme,
-            )
-        ]
-        .spacing(6)
-        .align_y(Alignment::Center),
-    )
-    .padding([2, 8])
-    .into()
-}
-
-fn notice_view<'a, 'b, Message: 'a>(
+fn notice_view<'a, Message: 'a>(
     notice: &'a Notice,
     theme: &'a Theme,
 ) -> Element<'a, Message> {
     container(match notice {
-        Notice::Warning(notice_string) => text(notice_string)
-            .style(theme::text::warning)
-            .font_maybe(theme::font_style::warning(theme).map(font::get)),
         Notice::Error(notice_string) => text(notice_string)
             .style(theme::text::error)
             .font_maybe(theme::font_style::error(theme).map(font::get)),
@@ -687,18 +367,9 @@ fn notice_view<'a, 'b, Message: 'a>(
 pub struct State {
     input_id: widget::Id,
     input_content: text_editor::Content,
-    parsed: Vec<Result<input::Parsed, input::Error>>,
     notice: Option<Notice>,
-    completion: Completion,
     selected_history: Option<usize>,
-    last_typing_at: Option<Instant>,
-    uploading: usize,
-    next_upload_id: u32,
-    upload_anim: f32,
-    spinner_hovered: bool,
-    upload_abort_handles: Vec<futures::future::AbortHandle>,
-    draft_reply: Option<input::DraftReply>,
-    reply_preview: Option<message::ReplyPreview>,
+    completion: Completion,
 }
 
 impl Default for State {
@@ -706,30 +377,15 @@ impl Default for State {
         Self {
             input_id: widget::Id::unique(),
             input_content: text_editor::Content::new(),
-            parsed: Vec::new(),
             notice: None,
-            completion: Completion::default(),
             selected_history: None,
-            last_typing_at: None,
-            uploading: 0,
-            next_upload_id: 0,
-            upload_anim: 0.0,
-            spinner_hovered: false,
-            upload_abort_handles: Vec::new(),
-            draft_reply: None,
-            reply_preview: None,
+            completion: Completion::default(),
         }
     }
 }
 
 impl State {
-    pub fn new(
-        cache: input::Cache<'_>,
-        buffer: &buffer::Upstream,
-        clients: &client::Map,
-        history: &history::Manager,
-        config: &Config,
-    ) -> Self {
+    pub fn new(cache: input::Cache<'_>) -> Self {
         let mut input_content = if cache.draft_message.is_empty() {
             text_editor::Content::new()
         } else {
@@ -740,342 +396,125 @@ impl State {
             text_editor::Motion::DocumentEnd,
         ));
 
-        let mut state = Self {
+        Self {
             input_content,
-            draft_reply: cache.draft_reply.cloned(),
             ..Self::default()
-        };
-
-        state.process_completion_and_notice(buffer, clients, history, config);
-
-        state
-    }
-
-    pub fn draft_reply(&self) -> Option<&input::DraftReply> {
-        self.draft_reply.as_ref()
-    }
-
-    pub fn set_reply_preview(&mut self, reply_preview: message::ReplyPreview) {
-        self.reply_preview = Some(reply_preview);
+        }
     }
 
     pub fn update(
         &mut self,
         message: Message,
-        buffer: &buffer::Upstream,
-        clients: &mut client::Map,
+        convo_id: &ConvoId,
         history: &mut history::Manager,
         config: &Config,
     ) -> (Task<Message>, Option<Event>) {
-        let current_target = buffer.target();
-
         match message {
-            Message::ExecFinished { buffer, result } => match result {
-                Ok(output) => {
-                    let parsed = input::parse(
-                        buffer.clone(),
-                        AutoFormat::Disabled,
-                        output.as_str(),
-                        None,
-                        clients.nickname(buffer.server()),
-                        buffer.channel().map(|target| {
-                            clients
-                                .get_channels(buffer.server())
-                                .any(|channel| target == channel)
-                        }),
-                        clients.get_server_is_connected(buffer.server()),
-                        clients.get_isupport_ref(buffer.server()),
-                        clients.get_capabilities_ref(buffer.server()),
-                        clients.get_features_ref(buffer.server()),
-                        clients.get_filehost(buffer.server()),
-                        clients.get_relay_bytes(buffer.server()),
+            Message::Action(action) => {
+                let is_edit = action.is_edit();
+
+                self.input_content.perform(action);
+
+                if is_edit {
+                    self.notice = None;
+                    self.selected_history = None;
+
+                    let input = self.input_content.text();
+                    let (cursor_position, cursor_is_selection) = self.cursor();
+
+                    self.completion.process(
+                        &input,
+                        cursor_position,
+                        cursor_is_selection,
                         config,
                     );
 
-                    match parsed {
-                        Ok(input::Parsed::Internal(
-                            command::Internal::Exec(_),
-                        )) => {
-                            self.notice = Some(Notice::Error(String::from(
-                                "exec output cannot invoke /exec",
-                            )));
-
-                            (Task::none(), None)
-                        }
-                        Ok(parsed) => self.send_input_line(
-                            parsed, &buffer, clients, history, config,
-                        ),
-                        Err(error) => {
-                            self.notice =
-                                Some(Notice::Error(error.to_string()));
-                            (Task::none(), None)
+                    if let Some(actions) =
+                        self.completion.complete_emoji(&input, cursor_position)
+                    {
+                        for action in actions {
+                            self.input_content.perform(action);
                         }
                     }
-                }
-                Err(error) => {
-                    self.notice = Some(Notice::Error(error));
-                    (Task::none(), None)
-                }
-            },
-            Message::SysInfoReceived(info) => {
-                let sysinfo_config = &config.buffer.commands.sysinfo;
 
-                let sysinfo_parts = [
-                    // OS
-                    sysinfo_config.os.then(|| {
-                        info.system_version.as_deref().map_or_else(
-                            || "OS: Unknown".to_string(),
-                            |version| {
-                                if let Some(kernel) = &info.system_kernel {
-                                    format!("OS: {version} ({kernel})")
-                                } else {
-                                    format!("OS: {version}")
-                                }
-                            },
-                        )
-                    }),
-                    // CPU
-                    sysinfo_config
-                        .cpu
-                        .then(|| format!("CPU: {}", info.cpu_brand.trim())),
-                    // Memory
-                    sysinfo_config.memory.then(|| {
-                        let total_gb = (info.memory_total as f64
-                            / (1024.0 * 1024.0 * 1024.0))
-                            .ceil()
-                            as u64;
-                        format!("MEM: {total_gb} GB")
-                    }),
-                    // GPU
-                    sysinfo_config.gpu.then(|| {
-                        format!(
-                            "GPU: {} ({})",
-                            info.graphics_adapter.trim(),
-                            info.graphics_backend.trim()
-                        )
-                    }),
-                    // Uptime
-                    sysinfo_config
-                        .uptime
-                        .then(|| {
-                            uptime_lib::get().ok().map(|uptime| {
-                                let mut formatter = timeago::Formatter::new();
-                                formatter.num_items(4);
-                                format!("UP: {}", formatter.convert(uptime))
-                            })
-                        })
-                        .flatten(),
-                ]
-                .into_iter()
-                .flatten()
-                .collect::<Vec<_>>();
+                    history.record_draft(RawInput {
+                        convo_id: convo_id.clone(),
+                        text: self.input_content.text(),
+                    });
+                }
 
-                // If no sysinfo is enabled, don't send anything
-                if sysinfo_parts.is_empty() {
+                (Task::none(), None)
+            }
+            Message::Send => {
+                // Enter with an open picker completes instead of sending.
+                if let Some(entry) = self.completion.select(config) {
+                    self.apply_completion(&entry, convo_id, history);
+
                     return (Task::none(), None);
                 }
 
-                let message = sysinfo_parts.join(" ");
-
-                if let Ok(parsed) = input::parse(
-                    buffer.clone(),
-                    AutoFormat::Disabled,
-                    message.as_str(),
-                    None,
-                    clients.nickname(buffer.server()),
-                    buffer.channel().map(|target| {
-                        clients
-                            .get_channels(buffer.server())
-                            .any(|channel| target == channel)
-                    }),
-                    clients.get_server_is_connected(buffer.server()),
-                    clients.get_isupport_ref(buffer.server()),
-                    clients.get_capabilities_ref(buffer.server()),
-                    clients.get_features_ref(buffer.server()),
-                    clients.get_filehost(buffer.server()),
-                    clients.get_relay_bytes(buffer.server()),
-                    config,
-                ) {
-                    self.send_input_line(
-                        parsed, buffer, clients, history, config,
-                    )
-                } else {
-                    (Task::none(), None)
-                }
-            }
-            Message::Send => {
-                let cursor_position = self.input_content.cursor().position;
-
-                // Reset notice
                 self.notice = None;
-                // Reset selected history
                 self.selected_history = None;
 
-                if let Some(entry) = self.completion.select(config)
-                    && let Some(line) = self
-                        .input_content
-                        .line(cursor_position.line)
-                        .map(|line| line.text)
-                {
-                    let chantypes = clients
-                        .get_server_chantypes_or_default(buffer.server());
-                    let actions = entry.complete_input(
-                        &line,
-                        cursor_position.column,
-                        chantypes,
-                        config,
-                    );
+                let raw_input = self.input_content.text();
 
-                    self.on_completion(buffer, history, actions, true)
-                // IRCv3 draft/multiline forbids messages consisting
-                // entirely of blank lines, so we will take that as an
-                // IRC norm and require the same
-                } else if !self.input_content.text().trim().is_empty() {
-                    // If there is an error in the input then display the error
-                    // for the current line (if it has an error) or the first
-                    // line with an error, then ignore send.
+                match input::parse(&raw_input) {
+                    Ok(input::Parsed::Text(content)) => {
+                        self.completion.reset();
+                        history
+                            .record_input_history(convo_id, raw_input.clone());
+                        self.input_content = text_editor::Content::new();
+                        history.record_draft(RawInput {
+                            convo_id: convo_id.clone(),
+                            text: String::new(),
+                        });
 
-                    self.parse_lines(buffer, clients, config);
-
-                    if let Some(Err(error)) =
-                        self.parsed.get(cursor_position.line)
-                    {
-                        self.notice = Some(Notice::Error(error.to_string()));
-
-                        return (Task::none(), None);
-                    } else if let Some((position, line, error)) =
-                        self.parsed.iter().enumerate().find_map(
-                            |(position, parsed)| {
-                                if let Err(error) = parsed
-                                    && let Some(line) = self
-                                        .input_content
-                                        .line(position)
-                                        .map(|line| line.text)
-                                {
-                                    Some((position, line, error))
-                                } else {
-                                    None
-                                }
-                            },
+                        (
+                            Task::none(),
+                            Some(Event::SendMessage {
+                                convo_id: convo_id.clone(),
+                                content,
+                            }),
                         )
-                    {
-                        const MAX_SNIPPET_LEN: usize = 64;
-
-                        let line_snippet =
-                            if UnicodeSegmentation::graphemes(&*line, true)
-                                .count()
-                                <= MAX_SNIPPET_LEN
-                            {
-                                line
-                            } else {
-                                let mut line_snippet =
-                                    UnicodeSegmentation::graphemes(
-                                        &*line, true,
-                                    )
-                                    .take(MAX_SNIPPET_LEN)
-                                    .collect::<String>();
-                                line_snippet.push('…');
-
-                                Cow::Owned(line_snippet)
-                            };
-
-                        self.notice = Some(Notice::Error(format!(
-                            "error on line {}: {line_snippet}\
-                           \n{error}",
-                            position + 1
-                        )));
-
-                        return (Task::none(), None);
                     }
+                    Ok(input::Parsed::Command(command)) => {
+                        self.completion.reset();
+                        history
+                            .record_input_history(convo_id, raw_input.clone());
+                        self.input_content = text_editor::Content::new();
+                        history.record_draft(RawInput {
+                            convo_id: convo_id.clone(),
+                            text: String::new(),
+                        });
 
-                    self.completion.reset();
-
-                    history.record_input_history(
-                        buffer,
-                        self.input_content.text().clone(),
-                    );
-                    self.input_content = text_editor::Content::new();
-                    self.reset_typing();
-
-                    let lines = self
-                        .parsed
-                        .drain(..)
-                        .filter_map(Result::ok)
-                        .filter(|parsed| parsed.code_fence().is_none())
-                        .collect();
-
-                    self.send_input_lines(
-                        lines, buffer, clients, history, config,
-                    )
-                } else {
-                    (Task::none(), None)
+                        (Task::none(), Some(Event::Command(command)))
+                    }
+                    Err(input::Error::Empty) => (Task::none(), None),
+                    Err(error) => {
+                        self.notice = Some(Notice::Error(error.to_string()));
+                        (Task::none(), None)
+                    }
                 }
             }
             Message::Tab(reverse) => {
-                let cursor_position = self.input_content.cursor().position;
-
-                if let Some(entry) = self.completion.tab(reverse, config)
-                    && let Some(line) = self
-                        .input_content
-                        .line(cursor_position.line)
-                        .map(|line| line.text)
-                {
-                    let chantypes = clients
-                        .get_server_chantypes_or_default(buffer.server());
-                    let actions = entry.complete_input(
-                        &line,
-                        cursor_position.column,
-                        chantypes,
-                        config,
-                    );
-
-                    let result =
-                        self.on_completion(buffer, history, actions, true);
-
-                    // If there is only one tab candidate process the completion immediately.
-                    if self
-                        .completion
-                        .tab_candidate_count()
-                        .is_some_and(|count| count == 1)
-                    {
-                        self.process_completion_and_notice(
-                            buffer, clients, history, config,
-                        );
-                    }
-                    result
-                } else {
-                    (Task::none(), None)
+                if let Some(entry) = self.completion.tab(reverse, config) {
+                    self.apply_completion(&entry, convo_id, history);
                 }
+
+                (Task::none(), None)
             }
-            Message::SelectCompletion(index) => {
-                let input = self.input_content.text();
-                let cursor_position =
-                    self.input_content.cursor().position.column;
-
+            Message::CompletionSelected(index) => {
                 if let Some(entry) = self.completion.select_at(index, config) {
-                    let chantypes = clients
-                        .get_server_chantypes_or_default(buffer.server());
-                    let actions = entry.complete_input(
-                        input.as_str(),
-                        cursor_position,
-                        chantypes,
-                        config,
-                    );
-
-                    let result =
-                        self.on_completion(buffer, history, actions, true);
-                    self.process_completion_and_notice(
-                        buffer, clients, history, config,
-                    );
-                    result
-                } else {
-                    (Task::none(), None)
+                    self.apply_completion(&entry, convo_id, history);
                 }
+
+                (self.focus(), None)
             }
             Message::Up(shift) => {
-                // If holding shift, the user presumably wants to adjust the
-                // selection bounds and not navigate history/picker (which do
-                // not utilize shift)
+                if !shift && self.completion.arrow(Arrow::Up) {
+                    return (Task::none(), None);
+                }
+
                 if shift {
                     self.input_content.perform(text_editor::Action::Select(
                         text_editor::Motion::DocumentStart,
@@ -1084,13 +523,7 @@ impl State {
                     return (Task::none(), None);
                 }
 
-                if self.completion.arrow(completion::Arrow::Up) {
-                    return (Task::none(), None);
-                }
-
-                let cache = history.input(buffer);
-
-                self.completion.reset();
+                let cache = history.input(convo_id);
 
                 if !cache.history.is_empty() {
                     if let Some(index) = self.selected_history.as_mut() {
@@ -1115,21 +548,20 @@ impl State {
                         .unwrap()
                         .clone();
 
-                    self.on_history_navigation(
-                        buffer, clients, history, config, &new_input, false,
-                    )
+                    self.replace_input(&new_input);
                 } else {
                     self.input_content.perform(text_editor::Action::Move(
                         text_editor::Motion::DocumentStart,
                     ));
-
-                    (Task::none(), None)
                 }
+
+                (Task::none(), None)
             }
             Message::Down(shift) => {
-                // If holding shift, the user presumably wants to adjust the
-                // selection bounds and not navigate history/picker (which do
-                // not utilize shift)
+                if !shift && self.completion.arrow(Arrow::Down) {
+                    return (Task::none(), None);
+                }
+
                 if shift {
                     self.input_content.perform(text_editor::Action::Select(
                         text_editor::Motion::DocumentEnd,
@@ -1138,13 +570,7 @@ impl State {
                     return (Task::none(), None);
                 }
 
-                if self.completion.arrow(completion::Arrow::Down) {
-                    return (Task::none(), None);
-                }
-
-                let cache = history.input(buffer);
-
-                self.completion.reset();
+                let cache = history.input(convo_id);
 
                 if let Some(index) = self.selected_history.as_mut() {
                     let new_input = if *index == 0 {
@@ -1155,75 +581,35 @@ impl State {
                         cache.history.get(*index).unwrap().clone()
                     };
 
-                    self.on_history_navigation(
-                        buffer, clients, history, config, &new_input, false,
-                    )
+                    self.replace_input(&new_input);
                 } else {
                     self.input_content.perform(text_editor::Action::Move(
                         text_editor::Motion::DocumentEnd,
                     ));
-
-                    (Task::none(), None)
-                }
-            }
-            // Capture escape so that closing context menu or commands/emojis picker
-            // does not defocus input
-            Message::Escape => (Task::none(), None),
-            Message::SendCommand { buffer, command } => {
-                let input = data::Input::from_command(buffer.clone(), command)
-                    .encoded();
-
-                // Send command.
-                if let Some(input) = input {
-                    clients.send(&buffer, input, TokenPriority::User);
                 }
 
                 (Task::none(), None)
             }
-            Message::SendLines {
-                buffer: send_buffer,
-                lines,
-            } => self.send_input_lines(
-                lines,
-                &send_buffer,
-                clients,
-                history,
-                config,
-            ),
+            // Capture escape so that closing a picker or context menu does
+            // not defocus the input
+            Message::Escape => {
+                self.completion.close_picker();
+
+                (Task::none(), None)
+            }
             Message::Paste => {
-                let has_filehost =
-                    clients.get_filehost(buffer.server()).is_some()
-                        && config.filehost.paste();
-
-                let task = if has_filehost {
-                    Task::batch(vec![
-                        clipboard::read(clipboard::Kind::Image)
-                            .map(handle_clipboard_content),
-                        clipboard::read(clipboard::Kind::Files)
-                            .map(handle_clipboard_content),
-                    ])
-                    .collect()
-                    .then(|maybe_tasks| {
-                        let tasks: Vec<_> =
-                            maybe_tasks.into_iter().flatten().collect();
-
-                        if tasks.is_empty() {
-                            clipboard::read(clipboard::Kind::Text).then(
-                                |content| {
-                                    handle_clipboard_content(content)
-                                        .unwrap_or(Task::none())
-                                },
-                            )
-                        } else {
-                            Task::batch(tasks)
-                        }
-                    })
-                } else {
-                    clipboard::read(clipboard::Kind::Text).then(|content| {
-                        handle_clipboard_content(content)
-                            .unwrap_or(Task::none())
-                    })
-                };
+                let task = clipboard::read_text().then(|content| {
+                    content.map_or_else(
+                        |_| Task::none(),
+                        |content| {
+                            Task::done(Message::Action(
+                                text_editor::Action::Edit(
+                                    text_editor::Edit::Paste(content),
+                                ),
+                            ))
+                        },
+                    )
+                });
 
                 Self::close_context_menu(vec![task])
             }
@@ -1261,177 +647,6 @@ impl State {
 
                 Self::close_context_menu(vec![])
             }
-            Message::UploadFile => (
-                Task::perform(
-                    async {
-                        rfd::AsyncFileDialog::new()
-                            .pick_files()
-                            .await
-                            .unwrap_or_default()
-                            .into_iter()
-                            .map(|handle| handle.path().to_path_buf())
-                            .collect()
-                    },
-                    Message::FilesSelected,
-                ),
-                None,
-            ),
-            Message::FilesSelected(file_paths) if !file_paths.is_empty() => {
-                let was_idle = self.uploading == 0;
-                self.uploading += file_paths.len();
-
-                let upload_ids: Vec<u32> = file_paths
-                    .iter()
-                    .map(|_| {
-                        self.next_upload_id += 1;
-                        self.next_upload_id
-                    })
-                    .collect();
-
-                if buffer.target().is_some() {
-                    for &id in &upload_ids {
-                        self.insert_upload_ghost(id);
-                    }
-                    history.record_draft(RawInput {
-                        buffer: buffer.clone(),
-                        text: self.input_content.text(),
-                        reply: self.draft_reply.clone(),
-                    });
-                }
-
-                let (handles, registrations): (Vec<_>, Vec<_>) = file_paths
-                    .iter()
-                    .map(|_| futures::future::AbortHandle::new_pair())
-                    .unzip();
-
-                self.upload_abort_handles.extend(handles);
-
-                let event = Event::FilehostUpload {
-                    server: buffer.server().clone(),
-                    target: buffer.target(),
-                    file_paths,
-                    upload_ids,
-                    abort_registrations: registrations,
-                };
-                let anim = was_idle
-                    .then(Self::schedule_anim_tick)
-                    .unwrap_or_else(Task::none);
-                (anim, Some(event))
-            }
-            Message::FilesSelected(_) => (Task::none(), None),
-            Message::UploadAnimTick => {
-                if self.uploading > 0 {
-                    self.upload_anim =
-                        (self.upload_anim + 0.06).rem_euclid(1.0);
-                    (Self::schedule_anim_tick(), None)
-                } else {
-                    (Task::none(), None)
-                }
-            }
-            Message::CancelUploads => {
-                for handle in self.upload_abort_handles.drain(..) {
-                    handle.abort();
-                }
-                self.uploading = 0;
-                self.next_upload_id = 0;
-                self.spinner_hovered = false;
-                (Task::none(), None)
-            }
-            Message::SpinnerHovered(hovered) => {
-                self.spinner_hovered = hovered;
-                (Task::none(), None)
-            }
-            Message::SetDraftReply {
-                msgid,
-                server_time,
-                to_nick,
-            } => {
-                let is_self_reply = clients
-                    .nickname(buffer.server())
-                    .is_some_and(|own| own == to_nick);
-                let should_insert_nick = config.buffer.reply.insert_nick
-                    && !matches!(buffer, buffer::Upstream::Query(..))
-                    && !is_self_reply;
-                let suffix =
-                    &config.buffer.text_input.autocomplete.completion_suffixes
-                        [0];
-                // Strip old nick prefix if replacing an existing reply
-                if should_insert_nick && let Some(old_reply) = &self.draft_reply
-                {
-                    let old_prefix_str = format!("{}{suffix}", old_reply.nick);
-                    let current_text = self.input_content.text();
-                    if current_text.starts_with(&old_prefix_str) {
-                        let stripped =
-                            current_text[old_prefix_str.len()..].to_string();
-                        let delta = -(old_prefix_str.chars().count() as i64);
-                        let cursor = adjust_cursor(
-                            &self.input_content,
-                            &stripped,
-                            0,
-                            0,
-                            delta,
-                        );
-                        self.input_content =
-                            text_editor::Content::with_text(&stripped);
-                        self.input_content.move_to(cursor);
-                    }
-                }
-
-                self.draft_reply = Some(input::DraftReply {
-                    id: msgid,
-                    server_time,
-                    nick: to_nick.to_string(),
-                });
-
-                if should_insert_nick {
-                    let prefix_str = format!("{to_nick}{suffix}");
-                    let current_text = self.input_content.text();
-                    if !current_text.starts_with(&prefix_str) {
-                        let replaced = format!("{prefix_str}{current_text}");
-                        let delta = prefix_str.chars().count() as i64;
-                        let cursor = adjust_cursor(
-                            &self.input_content,
-                            &replaced,
-                            0,
-                            0,
-                            delta,
-                        );
-                        self.input_content =
-                            text_editor::Content::with_text(&replaced);
-                        self.input_content.move_to(cursor);
-                        history.record_draft(RawInput {
-                            buffer: buffer.clone(),
-                            text: self.input_content.text(),
-                            reply: self.draft_reply.clone(),
-                        });
-                    }
-                }
-
-                (self.focus(), None)
-            }
-            Message::ClearDraftReply => {
-                let _ = self.clear_draft_reply(buffer, history, config);
-
-                (self.focus(), None)
-            }
-            Message::FilehostUploadDone { id, url } => {
-                self.uploading = self.uploading.saturating_sub(1);
-                // ids are sequential per upload batch — resetting when idle
-                if self.uploading == 0 {
-                    self.next_upload_id = 0;
-                }
-
-                let ghost = upload_ghost(id);
-
-                replace_ghost_with_url(&mut self.input_content, ghost, url);
-                history.record_draft(RawInput {
-                    buffer: buffer.clone(),
-                    text: self.input_content.text(),
-                    reply: self.draft_reply.clone(),
-                });
-
-                (Task::none(), None)
-            }
             Message::Kill(kill, save_to_clipboard) => {
                 let task = text_editor_key_bindings::perform_kill(
                     &mut self.input_content,
@@ -1442,1924 +657,80 @@ impl State {
 
                 (task, None)
             }
-            Message::Action(action) => {
-                if let text_editor::Action::Edit(text_editor::Edit::Paste(
-                    clipboard,
-                )) = &action
-                {
-                    let truncated_clipboard = clipboard
-                        .lines()
-                        .take(
-                            config.buffer.text_input.max_lines.saturating_sub(
-                                self.input_content.line_count(),
-                            ) + 1,
-                        )
-                        .join("\n");
-                    let action =
-                        text_editor::Action::Edit(text_editor::Edit::Paste(
-                            std::sync::Arc::new(truncated_clipboard),
-                        ));
-                    self.input_content.perform(action);
-                } else {
-                    self.input_content.perform(action.clone());
-                }
-
-                match &action {
-                    text_editor::Action::Edit(_) => {
-                        self.parse_lines_and_maybe_send_typing_status(
-                            buffer, clients, config,
-                        );
-
-                        let cursor = self.input_content.cursor();
-
-                        self.notice = None;
-                        self.selected_history = None;
-
-                        if let Some(line) = self
-                            .input_content
-                            .line(cursor.position.line)
-                            .map(|line| line.text)
-                        {
-                            let users = buffer.channel().and_then(|channel| {
-                                clients
-                                    .get_channel_users(buffer.server(), channel)
-                            });
-                            let last_seen = history.get_last_seen(buffer);
-                            let filters =
-                                FilterChain::borrow(history.get_filters());
-                            let is_connected = clients
-                                .get_server_is_connected(buffer.server());
-                            let isupport =
-                                clients.get_isupport_ref(buffer.server());
-                            let features =
-                                clients.get_features_ref(buffer.server());
-
-                            self.completion.process(
-                                &line,
-                                cursor.position.column,
-                                cursor.selection.is_some(),
-                                clients.nickname(buffer.server()),
-                                users,
-                                filters,
-                                &last_seen,
-                                clients.get_channels(buffer.server()),
-                                current_target.as_ref(),
-                                buffer.server(),
-                                is_connected,
-                                isupport,
-                                features,
-                                config,
-                            );
-
-                            let actions = self
-                                .completion
-                                .complete_emoji(&line, cursor.position.column);
-
-                            self.set_notice(cursor.position.line);
-
-                            if let Some(actions) = actions {
-                                for action in actions.into_iter() {
-                                    self.input_content.perform(action);
-                                }
-                            }
-                        }
-
-                        self.maybe_send_typing_status(buffer, clients);
-
-                        history.record_draft(RawInput {
-                            buffer: buffer.clone(),
-                            text: self.input_content.text(),
-                            reply: self.draft_reply.clone(),
-                        });
-
-                        (Task::none(), None)
-                    }
-                    text_editor::Action::Move(_)
-                    | text_editor::Action::Click(_)
-                    | text_editor::Action::Drag(_)
-                    | text_editor::Action::Select(_)
-                    | text_editor::Action::SelectWord
-                    | text_editor::Action::SelectLine
-                    | text_editor::Action::SelectAll => {
-                        self.process_completion_and_notice(
-                            buffer, clients, history, config,
-                        );
-
-                        (Task::none(), None)
-                    }
-                    _ => (Task::none(), None),
-                }
-            }
         }
     }
 
-    // TODO: Create a parse_line variant that updates only a single line's
-    // parsed update (and any following lines whose parsed value might change)
-    fn parse_lines(
-        &mut self,
-        buffer: &buffer::Upstream,
-        clients: &mut client::Map,
-        config: &Config,
-    ) {
-        let nickname = clients.nickname(buffer.server());
-        let in_channel = buffer.channel().map(|target| {
-            clients
-                .get_channels(buffer.server())
-                .any(|channel| target == channel)
-        });
-        let mode = buffer.channel().and_then(|target| {
-            clients.get_channel_mode(buffer.server(), target)
-        });
-        let is_connected = clients.get_server_is_connected(buffer.server());
-        let isupport = clients.get_isupport_ref(buffer.server());
-        let capabilities = clients.get_capabilities_ref(buffer.server());
-        let features = clients.get_features_ref(buffer.server());
-        let filehost = clients.get_filehost(buffer.server());
-        let relay_bytes = clients.get_relay_bytes(buffer.server());
-
-        if self.input_content.text().is_empty() {
-            self.parsed = Vec::new();
-            return;
-        }
-
-        let auto_format = if mode.is_some_and(|m| m.contains("c")) {
-            AutoFormat::ForceDisabled
-        } else {
-            config.buffer.text_input.auto_format
-        };
-
-        let text = self.input_content.text();
-
-        self.parsed = input_lines(&text)
-            .scan(None, |open_code_fence: &mut Option<CodeFence>, line| {
-                let line = if line.is_empty()
-                    && !capabilities.contains_multiline_limits()
-                {
-                    // Send a space to emulate an empty line
-                    Cow::Owned(String::from(' '))
-                } else {
-                    Cow::Borrowed(line)
-                };
-
-                let parsed = input::parse(
-                    buffer.clone(),
-                    auto_format,
-                    &line,
-                    open_code_fence.as_ref(),
-                    nickname,
-                    in_channel,
-                    is_connected,
-                    isupport,
-                    capabilities,
-                    features,
-                    filehost,
-                    relay_bytes,
-                    config,
-                );
-
-                if open_code_fence.is_some() {
-                    if parsed
-                        .as_ref()
-                        .ok()
-                        .and_then(|parsed| parsed.code_fence())
-                        .is_some()
-                    {
-                        *open_code_fence = None;
-                    }
-                } else if let Some(code_fence) =
-                    parsed.as_ref().ok().and_then(|parsed| parsed.code_fence())
-                {
-                    *open_code_fence = Some(code_fence.clone());
-                }
-
-                Some(parsed)
-            })
-            .collect();
-    }
-
-    fn insert_upload_ghost(&mut self, id: u32) {
-        // TODO (casper): Can we do better here? What does other programs do?
-        let ghost = upload_ghost(id);
-        let content = self.input_content.text();
-        let cursor_char = line_col_to_char(
-            &self.input_content,
-            self.input_content.cursor().position.line,
-            self.input_content.cursor().position.column,
-        );
-
-        // if the ghost would be inserted directly adjacent to a word,
-        // pad it with a space so it doesn't run into surrounding text.
-        let prefix = if self.input_content.cursor().selection.is_none()
-            && cursor_char > 0
-            && content
-                .chars()
-                .nth(cursor_char - 1)
-                .is_some_and(|c| !c.is_whitespace())
-        {
-            " "
-        } else {
-            ""
-        };
-
-        let suffix = if self.input_content.cursor().selection.is_none()
-            && let Some(ch) = content.chars().nth(cursor_char)
-            && !ch.is_whitespace()
-        {
-            " "
-        } else {
-            ""
-        };
-
-        let insert = format!("{prefix}{ghost}{suffix}");
-
-        self.input_content.perform(text_editor::Action::Edit(
-            text_editor::Edit::Paste(std::sync::Arc::new(insert)),
-        ));
-        reset_undo_history(&mut self.input_content);
-    }
-
-    fn schedule_anim_tick() -> Task<Message> {
-        Task::perform(time::sleep(Duration::from_millis(50)), |()| {
-            Message::UploadAnimTick
-        })
-    }
-
-    fn close_context_menu(
-        tasks: Vec<Task<Message>>,
-    ) -> (Task<Message>, Option<Event>) {
-        (
-            Task::batch(
-                vec![context_menu::close(convert::identity).discard()]
-                    .into_iter()
-                    .chain(tasks)
-                    .collect::<Vec<_>>(),
-            ),
-            None,
-        )
-    }
-
-    fn send_input_lines(
-        &mut self,
-        mut lines: VecDeque<input::Parsed>,
-        buffer: &Upstream,
-        clients: &mut client::Map,
-        history: &mut history::Manager,
-        config: &Config,
-    ) -> (Task<Message>, Option<Event>) {
-        let (send_count, line_count) = if let Some(multiline_limits) =
-            clients.get_multiline_limits(buffer.server())
-            && let Some(target) = buffer.target().as_ref()
-        {
-            let casemapping =
-                clients.get_server_casemapping_or_default(buffer.server());
-
-            let mut multiline_byte_count = 0;
-            let mut multiline_line_count = 0;
-            let mut multiline_batch_kind = None;
-            let mut multiline_concat_bytes = 0;
-
-            let max_lines = if let Some(max_lines) = multiline_limits.max_lines
-            {
-                max_lines.min(lines.len())
-            } else {
-                lines.len()
-            };
-
-            let send_count = lines
-                .iter()
-                .take(max_lines)
-                .position(|line| {
-                    if let Some((text, batch_kind)) =
-                        line.multiline_content(casemapping)
-                    {
-                        if let Some(multiline_batch_kind) = multiline_batch_kind
-                        {
-                            if batch_kind != multiline_batch_kind {
-                                return true;
-                            }
-                        } else {
-                            multiline_batch_kind = Some(batch_kind);
-                            multiline_concat_bytes = multiline_limits
-                                .concat_bytes(
-                                    clients.get_relay_bytes(buffer.server()),
-                                    batch_kind,
-                                    target.as_str(),
-                                );
-                        }
-
-                        multiline_byte_count += text.len();
-
-                        if multiline_byte_count > multiline_limits.max_bytes {
-                            true
-                        } else if let Some(max_lines) =
-                            multiline_limits.max_lines
-                            && multiline_concat_bytes > 0
-                        {
-                            multiline_line_count += multiline_concat_lines(
-                                multiline_concat_bytes,
-                                text,
-                            )
-                            .len();
-
-                            multiline_line_count > max_lines
-                        } else {
-                            false
-                        }
-                    } else {
-                        true
-                    }
-                })
-                .map_or(max_lines, |position| position.max(1));
-
-            (send_count, multiline_line_count)
-        } else {
-            (1, 1)
-        };
-
-        let remaining_lines = lines.split_off(send_count);
-
-        let (send_task, event) = if line_count > 1 {
-            self.send_input_line_batch(lines, buffer, clients, history, config)
-        } else if let Some(line) = lines.pop_front() {
-            self.send_input_line(line, buffer, clients, history, config)
-        } else {
-            return (Task::none(), None);
-        };
-
-        if remaining_lines.is_empty() {
-            return (send_task, event);
-        }
-
-        let delay =
-            Duration::from_millis(config.buffer.text_input.send_line_delay);
-        let next_message = Message::SendLines {
-            buffer: buffer.clone(),
-            lines: remaining_lines,
-        };
-        let next_task = if delay.is_zero() {
-            Task::done(next_message)
-        } else {
-            Task::perform(time::sleep(delay), move |()| next_message)
-        };
-
-        (send_task.chain(next_task), event)
-    }
-
-    fn send_input_line_batch(
-        &mut self,
-        lines: VecDeque<input::Parsed>,
-        buffer: &Upstream,
-        clients: &mut client::Map,
-        history: &mut history::Manager,
-        config: &Config,
-    ) -> (Task<Message>, Option<Event>) {
-        let inputs = lines
-            .into_iter()
-            .filter_map(|parsed| match parsed {
-                input::Parsed::Internal(_) | input::Parsed::CodeFence(_) => {
-                    None
-                }
-                input::Parsed::Input(input) => Some(input),
-            })
-            .collect::<Vec<_>>();
-
-        let encoded = inputs
-            .iter()
-            .filter_map(data::Input::encoded)
-            .collect::<Vec<_>>();
-
-        let labeled_response_context = if let Some(last_encoded) =
-            encoded.last()
-        {
-            let sent_time = last_encoded.server_time_or_now().0;
-
-            let reply_id = self
-                .draft_reply
-                .as_ref()
-                .map(|input::DraftReply { id, .. }| id);
-
-            let labeled_response_context = clients.send_multiline_batch(
-                buffer,
-                encoded,
-                TokenPriority::User,
-                reply_id,
-            );
-
-            let supports_echoes =
-                clients.get_server_supports_echoes(buffer.server());
-
-            // If the server supports echoes, then send MARKREAD on echo only
-            // (not when recording the input)
-            if config.buffer.mark_as_read.on_message_sent && !supports_echoes {
-                let chantypes =
-                    clients.get_server_chantypes_or_default(buffer.server());
-                let statusmsg =
-                    clients.get_server_statusmsg_or_default(buffer.server());
-                let casemapping =
-                    clients.get_server_casemapping_or_default(buffer.server());
-
-                if let Some(input) = inputs.first()
-                    && let Some(targets) =
-                        input.targets(chantypes, statusmsg, casemapping)
-                {
-                    for target in targets {
-                        clients.send_markread(
-                            buffer.server(),
-                            target,
-                            ReadMarker::from(sent_time),
-                            TokenPriority::High,
-                        );
-                    }
-                }
-            }
-
-            labeled_response_context
-        } else {
-            None
-        };
-
-        let mut history_task = Task::none();
-
-        if let Some(nick) = clients.nickname(buffer.server()) {
-            let mut user = nick.to_owned().into();
-            let mut channel_users = None;
-
-            let chantypes =
-                clients.get_server_chantypes_or_default(buffer.server());
-            let statusmsg =
-                clients.get_server_statusmsg_or_default(buffer.server());
-            let casemapping =
-                clients.get_server_casemapping_or_default(buffer.server());
-            let supports_echoes =
-                clients.get_server_supports_echoes(buffer.server());
-
-            // Resolve our attributes if sending this message in a channel
-            if let buffer::Upstream::Channel(server, channel) = &buffer {
-                channel_users = clients.get_channel_users(server, channel);
-
-                if let Some(user_with_attributes) =
-                    clients.resolve_user_attributes(server, channel, &user)
-                {
-                    user = user_with_attributes.clone();
-                }
-            }
-
-            let mut history_tasks = vec![];
-
-            let messages = inputs
-                .into_iter()
-                .filter_map(|input| {
-                    input.messages(
-                        user.clone(),
-                        channel_users,
-                        buffer.server(),
-                        chantypes,
-                        statusmsg,
-                        casemapping,
-                        supports_echoes,
-                        history.get_reroute_rules(),
-                    )
-                })
-                .flatten()
-                .collect::<Vec<_>>();
-
-            if let Some(message) =
-                messages.into_iter().reduce(|mut batch_message, message| {
-                    match (&mut batch_message.content, message.content) {
-                        (
-                            message::Content::Plain(batch_text),
-                            message::Content::Plain(message_text),
-                        ) => {
-                            batch_text.push('\n');
-                            batch_text.push_str(message_text.as_str());
-                        }
-                        (
-                            message::Content::Plain(batch_text),
-                            message::Content::Fragments(message_fragments),
-                        ) => {
-                            batch_text.push('\n');
-                            let mut fragments = vec![message::Fragment::Text(
-                                batch_text.to_string(),
-                            )];
-                            fragments.extend(message_fragments);
-
-                            batch_message.content =
-                                message::Content::Fragments(fragments);
-                        }
-                        (
-                            message::Content::Fragments(batch_fragments),
-                            message::Content::Plain(message_text),
-                        ) => {
-                            batch_fragments.push(message::Fragment::Text(
-                                format!("\n{message_text}"),
-                            ));
-                        }
-                        (
-                            message::Content::Fragments(batch_fragments),
-                            message::Content::Fragments(message_fragments),
-                        ) => {
-                            batch_fragments.push(message::Fragment::Text(
-                                "\n".to_string(),
-                            ));
-                            batch_fragments.extend(message_fragments);
-                        }
-                        (message::Content::Log(_), _)
-                        | (_, message::Content::Log(_)) => (),
-                    }
-
-                    match (&mut batch_message.command, message.command) {
-                        (
-                            Some(command::Irc::Msg(_, batch_text)),
-                            Some(command::Irc::Msg(_, text)),
-                        )
-                        | (
-                            Some(command::Irc::Notice(_, batch_text)),
-                            Some(command::Irc::Notice(_, text)),
-                        ) => {
-                            batch_text.push('\n');
-                            batch_text.push_str(text.as_str());
-                        }
-                        _ => (),
-                    }
-
-                    batch_message
-                })
-            {
-                let mut message = message;
-                if let Some(input::DraftReply { id: reply_id, .. }) =
-                    &self.draft_reply
-                {
-                    message.reply_to = Some(reply_id.clone());
-                }
-                history_tasks.extend(history.record_input_message(
-                    message,
-                    labeled_response_context,
-                    buffer.server(),
-                    casemapping,
-                    config,
-                ));
-            }
-
-            self.reply_preview = None;
-            self.draft_reply = None;
-
-            history_task =
-                Task::batch(history_tasks.into_iter().map(Task::future));
-        }
-
-        (
-            Task::none(),
-            Some(Event::InputSent {
-                history_task,
-                open_buffers: vec![],
-                was_join_command: false,
-            }),
-        )
-    }
-
-    fn send_input_line(
-        &mut self,
-        parsed: input::Parsed,
-        buffer: &buffer::Upstream,
-        clients: &mut client::Map,
-        history: &mut history::Manager,
-        config: &Config,
-    ) -> (Task<Message>, Option<Event>) {
-        let input = match parsed {
-            input::Parsed::Internal(command) => {
-                match command {
-                    command::Internal::OpenBuffers(targets) => {
-                        return (
-                            Task::none(),
-                            Some(Event::OpenBuffers {
-                                server: buffer.server().clone(),
-                                targets: targets
-                                    .into_iter()
-                                    .map(|target| match target {
-                                        Target::Channel(_) => (
-                                            target,
-                                            config
-                                                .actions
-                                                .buffer
-                                                .message_channel,
-                                        ),
-                                        Target::Query(_) => (
-                                            target,
-                                            config.actions.buffer.message_user,
-                                        ),
-                                    })
-                                    .collect(),
-                            }),
-                        );
-                    }
-                    command::Internal::LeaveBuffers(targets, reason) => {
-                        return (
-                            Task::none(),
-                            Some(Event::LeaveBuffers { targets, reason }),
-                        );
-                    }
-                    command::Internal::Detach(channels) => {
-                        return (
-                            Task::none(),
-                            Some(Event::LeaveBuffers {
-                                targets: channels
-                                    .into_iter()
-                                    .map(Target::Channel)
-                                    .collect(),
-                                reason: Some("detach".to_string()),
-                            }),
-                        );
-                    }
-                    command::Internal::Hop(first, rest) => {
-                        let has_channel_argument =
-                            first.as_ref().is_some_and(|s| s.starts_with('#'));
-
-                        // Channel to join, either from first argument or buffer channel
-                        let target_channel = if has_channel_argument {
-                            // Use first argument as channel.
-                            first.clone()
-                        } else {
-                            // If first argument isn't a channel, we use buffer channel
-                            buffer
-                                .channel()
-                                .map(|chan| chan.as_str().to_string())
-                        };
-
-                        // If we don't have a target channel for some reason we return
-                        let Some(target_channel) = target_channel else {
-                            return (Task::none(), None);
-                        };
-
-                        let message = if has_channel_argument {
-                            // If first argument is a channel, we use second argument as message
-                            rest
-                        } else {
-                            // Otherwise we use both arguments
-                            match (first.as_deref(), rest.as_deref()) {
-                                (Some(a), Some(b)) => Some(format!("{a} {b}")),
-                                (Some(a), None) => Some(a.to_string()),
-                                (None, Some(b)) => Some(b.to_string()),
-                                (None, None) => None,
-                            }
-                        };
-
-                        // Part channel. Might not exist if we execute on a query/server.
-                        let part_command =
-                            buffer.channel().and_then(|channel| {
-                                data::Input::from_command(
-                                    buffer.clone(),
-                                    command::Irc::Part(
-                                        channel.as_str().to_string(),
-                                        message,
-                                    ),
-                                )
-                                .encoded()
-                            });
-
-                        // Send part command.
-                        if let Some(part_command) = part_command {
-                            clients.send(
-                                buffer,
-                                part_command,
-                                TokenPriority::User,
-                            );
-                        }
-
-                        // Create a delay task that will execute the join after waiting
-                        let buffer_clone = buffer.clone();
-                        let target_channel_clone = target_channel.clone();
-
-                        let delayed_join_task = Task::perform(
-                            time::sleep(Duration::from_millis(100)),
-                            move |()| Message::SendCommand {
-                                buffer: buffer_clone,
-                                command: command::Irc::Join(
-                                    target_channel_clone,
-                                    None,
-                                ),
-                            },
-                        );
-
-                        let chantypes = clients
-                            .get_server_chantypes_or_default(buffer.server());
-                        let statusmsg = clients
-                            .get_server_statusmsg_or_default(buffer.server());
-                        let casemapping = clients
-                            .get_server_casemapping_or_default(buffer.server());
-
-                        let target = Target::parse(
-                            target_channel.as_str(),
-                            chantypes,
-                            statusmsg,
-                            casemapping,
-                        );
-
-                        let event = has_channel_argument.then_some({
-                            let buffer_action = match buffer {
-                                // If it's a channel, we want to replace it when hopping to a new channel.
-                                Upstream::Channel(..) => {
-                                    BufferAction::ReplacePane
-                                }
-                                // If it's a server or query, we want to follow config for actions.
-                                Upstream::Server(..) | Upstream::Query(..) => {
-                                    config.actions.buffer.message_channel
-                                }
-                            };
-
-                            Event::OpenBuffers {
-                                server: buffer.server().clone(),
-                                targets: vec![(target, buffer_action)],
-                            }
-                        });
-
-                        return (delayed_join_task, event);
-                    }
-                    command::Internal::ChannelDiscovery => {
-                        return (
-                            Task::none(),
-                            Some(Event::OpenInternalBuffer(
-                                buffer::Internal::ChannelDiscovery(Some(
-                                    buffer.server().clone(),
-                                )),
-                            )),
-                        );
-                    }
-                    command::Internal::Delay(_) => {
-                        return (Task::none(), None);
-                    }
-                    command::Internal::ClearBuffer => {
-                        let kind =
-                            history::Kind::from_input_buffer(buffer.clone());
-
-                        let event = history.clear_messages(kind, clients).map(
-                            |history_task| Event::Cleared {
-                                history_task: Task::future(history_task),
-                            },
-                        );
-
-                        return (Task::none(), event);
-                    }
-                    command::Internal::SysInfo => {
-                        return (
-                            iced::system::information()
-                                .map(Message::SysInfoReceived),
-                            None,
-                        );
-                    }
-                    command::Internal::Connect(server) => {
-                        return (Task::none(), Some(Event::OpenServer(server)));
-                    }
-                    command::Internal::Reconnect => {
-                        return (
-                            Task::none(),
-                            Some(Event::Reconnect(buffer.server().clone())),
-                        );
-                    }
-                    command::Internal::Upload(_)
-                        if !config.filehost.enabled =>
-                    {
-                        return (Task::none(), None);
-                    }
-                    command::Internal::Upload(path) => {
-                        let file_path = std::path::PathBuf::from(&path);
-                        if !file_path.exists() {
-                            self.notice = Some(Notice::Error(format!(
-                                "file not found: {path}"
-                            )));
-                            return (Task::none(), None);
-                        }
-                        let (handle, registration) =
-                            futures::future::AbortHandle::new_pair();
-                        self.upload_abort_handles.push(handle);
-                        let was_idle = self.uploading == 0;
-                        self.uploading += 1;
-                        self.next_upload_id += 1;
-                        let id = self.next_upload_id;
-                        if buffer.target().is_some() {
-                            self.insert_upload_ghost(id);
-                            history.record_draft(RawInput {
-                                buffer: buffer.clone(),
-                                text: self.input_content.text(),
-                                reply: self.draft_reply.clone(),
-                            });
-                        }
-                        let anim = was_idle
-                            .then(Self::schedule_anim_tick)
-                            .unwrap_or_else(Task::none);
-                        let event = Event::FilehostUpload {
-                            server: buffer.server().clone(),
-                            target: buffer.target(),
-                            file_paths: vec![file_path],
-                            upload_ids: vec![id],
-                            abort_registrations: vec![registration],
-                        };
-                        return (anim, Some(event));
-                    }
-                    command::Internal::Exec(command) => {
-                        if !config.buffer.commands.exec.enabled {
-                            self.notice = Some(Notice::Error(
-                                input::Error::Command(
-                                    command::Error::CommandNotEnabled {
-                                        command: "exec",
-                                    },
-                                )
-                                .to_string(),
-                            ));
-
-                            return (Task::none(), None);
-                        }
-
-                        let buffer = buffer.clone();
-                        let exec = config.buffer.commands.exec.clone();
-
-                        return (
-                            Task::perform(
-                                execute_shell_command(
-                                    command,
-                                    exec.timeout,
-                                    exec.max_output_bytes,
-                                ),
-                                move |result| Message::ExecFinished {
-                                    buffer,
-                                    result,
-                                },
-                            ),
-                            None,
-                        );
-                    }
-                }
-            }
-            input::Parsed::Input(input) => input,
-            input::Parsed::CodeFence(_) => {
-                return (Task::none(), None);
-            }
-        };
-
-        let labeled_response_context =
-            if let Some(mut encoded) = input.encoded() {
-                let reply_id = self
-                    .draft_reply
-                    .as_ref()
-                    .map(|input::DraftReply { id, .. }| id);
-
-                encoded.set_reply_to(reply_id);
-
-                let sent_time = encoded.server_time_or_now().0;
-
-                let labeled_response_context =
-                    clients.send(buffer, encoded, TokenPriority::User);
-
-                let supports_echoes =
-                    clients.get_server_supports_echoes(buffer.server());
-
-                // If the server supports echoes, then send MARKREAD on echo only
-                // (not when recording the input)
-                if config.buffer.mark_as_read.on_message_sent
-                    && matches!(
-                        input.command(),
-                        Some(command::Irc::Msg(_, _))
-                            | Some(command::Irc::Notice(_, _))
-                    )
-                    && !supports_echoes
-                {
-                    let chantypes = clients
-                        .get_server_chantypes_or_default(buffer.server());
-                    let statusmsg = clients
-                        .get_server_statusmsg_or_default(buffer.server());
-                    let casemapping = clients
-                        .get_server_casemapping_or_default(buffer.server());
-
-                    if let Some(targets) =
-                        input.targets(chantypes, statusmsg, casemapping)
-                    {
-                        for target in targets {
-                            clients.send_markread(
-                                buffer.server(),
-                                target,
-                                ReadMarker::from(sent_time),
-                                TokenPriority::High,
-                            );
-                        }
-                    }
-                }
-
-                labeled_response_context
-            } else {
-                None
-            };
-
-        let mut history_task = Task::none();
-
-        if let Some(nick) = clients.nickname(buffer.server()) {
-            let mut user = nick.to_owned().into();
-            let mut channel_users = None;
-
-            let chantypes =
-                clients.get_server_chantypes_or_default(buffer.server());
-            let statusmsg =
-                clients.get_server_statusmsg_or_default(buffer.server());
-            let casemapping =
-                clients.get_server_casemapping_or_default(buffer.server());
-            let supports_echoes =
-                clients.get_server_supports_echoes(buffer.server());
-
-            // Resolve our attributes if sending this message in a channel
-            if let buffer::Upstream::Channel(server, channel) = &buffer {
-                channel_users = clients.get_channel_users(server, channel);
-
-                if let Some(user_with_attributes) =
-                    clients.resolve_user_attributes(server, channel, &user)
-                {
-                    user = user_with_attributes.clone();
-                }
-            }
-
-            let mut history_tasks = vec![];
-
-            if let Some(messages) = input.messages(
-                user,
-                channel_users,
-                buffer.server(),
-                chantypes,
-                statusmsg,
-                casemapping,
-                supports_echoes,
-                history.get_reroute_rules(),
-            ) {
-                for mut message in messages {
-                    if let Some(input::DraftReply { id: reply_id, .. }) =
-                        &self.draft_reply
-                    {
-                        message.reply_to = Some(reply_id.clone());
-                    }
-                    history_tasks.extend(history.record_input_message(
-                        message,
-                        labeled_response_context.clone(),
-                        buffer.server(),
-                        casemapping,
-                        config,
-                    ));
-                }
-            }
-
-            self.reply_preview = None;
-            self.draft_reply = None;
-
-            history_task =
-                Task::batch(history_tasks.into_iter().map(Task::future));
-        }
-
-        let (open_buffers, was_join_command) =
-            if let Some(command::Irc::Join(targets, _)) = input.command() {
-                let chantypes =
-                    clients.get_server_chantypes_or_default(buffer.server());
-                let statusmsg =
-                    clients.get_server_statusmsg_or_default(buffer.server());
-                let casemapping =
-                    clients.get_server_casemapping_or_default(buffer.server());
-
-                (
-                    targets
-                        .split(',')
-                        .filter_map(|target| {
-                            let target = Target::parse(
-                                target,
-                                chantypes,
-                                statusmsg,
-                                casemapping,
-                            );
-
-                            matches!(target, Target::Channel(_)).then_some((
-                                target,
-                                config.actions.buffer.join_channel,
-                            ))
-                        })
-                        .collect(),
-                    true,
-                )
-            } else {
-                (vec![], false)
-            };
-
-        (
-            Task::none(),
-            Some(Event::InputSent {
-                history_task,
-                open_buffers,
-                was_join_command,
-            }),
-        )
-    }
-
-    pub fn process_completion_and_notice(
-        &mut self,
-        buffer: &buffer::Upstream,
-        clients: &client::Map,
-        history: &history::Manager,
-        config: &Config,
-    ) {
-        let cursor = self.input_content.cursor();
-
-        if let Some(line) = self
-            .input_content
-            .line(cursor.position.line)
-            .map(|line| line.text)
-        {
-            let current_target = buffer.target();
-            let users = buffer.channel().and_then(|channel| {
-                clients.get_channel_users(buffer.server(), channel)
-            });
-            let last_seen = history.get_last_seen(buffer);
-            let filters = FilterChain::borrow(history.filters());
-            let is_connected = clients.get_server_is_connected(buffer.server());
-            let isupport = clients.get_isupport_ref(buffer.server());
-            let features = clients.get_features_ref(buffer.server());
-
-            self.completion.process(
-                &line,
-                cursor.position.column,
-                cursor.selection.is_some(),
-                clients.nickname(buffer.server()),
-                users,
-                filters,
-                &last_seen,
-                clients.get_channels(buffer.server()),
-                current_target.as_ref(),
-                buffer.server(),
-                is_connected,
-                isupport,
-                features,
-                config,
-            );
-
-            // Reset notice state
-            self.notice = None;
-
-            self.set_notice(cursor.position.line);
-        }
-    }
-
-    fn on_completion(
-        &mut self,
-        buffer: &buffer::Upstream,
-        history: &mut history::Manager,
-        actions: Vec<text_editor::Action>,
-        record_draft: bool,
-    ) -> (Task<Message>, Option<Event>) {
-        for action in actions.into_iter() {
-            self.input_content.perform(action);
-        }
-
-        if record_draft {
-            history.record_draft(RawInput {
-                buffer: buffer.clone(),
-                text: self.input_content.text(),
-                reply: self.draft_reply.clone(),
-            });
-        }
-
-        (Task::none(), None)
-    }
-
-    fn on_history_navigation(
-        &mut self,
-        buffer: &buffer::Upstream,
-        clients: &mut client::Map,
-        history: &mut history::Manager,
-        config: &Config,
-        text: &str,
-        record_draft: bool,
-    ) -> (Task<Message>, Option<Event>) {
-        if record_draft {
-            history.record_draft(RawInput {
-                buffer: buffer.clone(),
-                text: text.to_string(),
-                reply: self.draft_reply.clone(),
-            });
-        }
-
-        // update the input content
-        self.input_content = text_editor::Content::with_text(text);
-        // move the cursor to the end of the input
+    fn replace_input(&mut self, new_input: &str) {
+        self.input_content = text_editor::Content::with_text(new_input);
         self.input_content.perform(text_editor::Action::Move(
             text_editor::Motion::DocumentEnd,
         ));
-
-        self.parse_lines_and_maybe_send_typing_status(buffer, clients, config);
-
-        // Cursor movement above does not always trigger an Action::Move
-        self.process_completion_and_notice(buffer, clients, history, config);
-
-        (Task::none(), None)
     }
 
-    pub fn focus(&self) -> Task<Message> {
-        let input_id = self.input_id.clone();
+    /// The caret's byte offset within the full input text, plus whether a
+    /// selection is active.
+    fn cursor(&self) -> (usize, bool) {
+        let cursor = self.input_content.cursor();
 
-        operation::is_focused(input_id.clone()).then(move |is_focused| {
-            if is_focused {
-                Task::none()
-            } else {
-                operation::focus(input_id.clone())
-            }
-        })
+        let position = (0..cursor.position.line)
+            .filter_map(|line| self.input_content.line(line))
+            .map(|line| line.text.len() + 1)
+            .sum::<usize>()
+            + cursor.position.column;
+
+        (position, cursor.selection.is_some())
     }
 
-    pub fn reset(&mut self) {
-        self.notice = None;
-        self.completion = Completion::default();
-        self.selected_history = None;
-    }
-
-    pub fn insert_user(
+    fn apply_completion(
         &mut self,
-        nick: Nick,
-        buffer: buffer::Upstream,
+        entry: &completion::Entry,
+        convo_id: &ConvoId,
         history: &mut history::Manager,
-        autocomplete: &Autocomplete,
     ) {
-        let cursor_position = self.input_content.cursor().position;
+        let input = self.input_content.text();
+        let (cursor_position, _) = self.cursor();
 
-        let insert_text = if let Some(line) = self
-            .input_content
-            .line(cursor_position.line)
-            .map(|line| line.text)
-        {
-            if cursor_position.column == 0 {
-                let suffix_range = cursor_position.column
-                    ..cursor_position.column
-                        + autocomplete.completion_suffixes[0].len();
-
-                if line.get(suffix_range).is_some_and(|text| {
-                    text == autocomplete.completion_suffixes[0]
-                }) {
-                    format!("{nick}")
-                } else {
-                    format!("{nick}{}", autocomplete.completion_suffixes[0])
-                }
-            } else {
-                let suffix_range = cursor_position.column
-                    ..cursor_position.column
-                        + autocomplete.completion_suffixes[1].len();
-
-                if line
-                    .chars()
-                    .nth(cursor_position.column - 1)
-                    .is_some_and(|c| c == ' ')
-                {
-                    if line.get(suffix_range).is_some_and(|text| {
-                        text == autocomplete.completion_suffixes[1]
-                    }) {
-                        format!("{nick}")
-                    } else {
-                        format!("{nick}{}", autocomplete.completion_suffixes[1])
-                    }
-                } else if line.get(suffix_range).is_some_and(|text| {
-                    text == autocomplete.completion_suffixes[1]
-                }) {
-                    format!(" {nick}")
-                } else {
-                    format!(" {nick}{}", autocomplete.completion_suffixes[1])
-                }
-            }
-        } else {
-            format!("{nick}")
-        };
-
-        self.input_content.perform(text_editor::Action::Edit(
-            text_editor::Edit::Paste(std::sync::Arc::new(insert_text)),
-        ));
+        for action in entry.complete_input(&input, cursor_position) {
+            self.input_content.perform(action);
+        }
 
         history.record_draft(RawInput {
-            buffer,
+            convo_id: convo_id.clone(),
             text: self.input_content.text(),
-            reply: self.draft_reply.clone(),
         });
+    }
+
+    fn close_context_menu(
+        mut tasks: Vec<Task<Message>>,
+    ) -> (Task<Message>, Option<Event>) {
+        tasks.push(context_menu::close(std::convert::identity).discard());
+
+        (Task::batch(tasks), None)
+    }
+
+    /// Restores an unsent draft (e.g. after a failed send) when the
+    /// composer is empty.
+    pub fn restore_draft(&mut self, content: &str) {
+        if self.input_content.text().trim().is_empty() {
+            self.replace_input(content);
+        }
     }
 
     pub fn close_picker(&mut self) -> bool {
         self.completion.close_picker()
     }
 
-    pub fn clear_draft_reply(
-        &mut self,
-        buffer: &buffer::Upstream,
-        history: &mut history::Manager,
-        config: &Config,
-    ) -> bool {
-        self.reply_preview = None;
-
-        if self.draft_reply.is_some() {
-            if config.buffer.reply.insert_nick
-                && !matches!(buffer, buffer::Upstream::Query(..))
-                && let Some(draft_reply) = &self.draft_reply
-            {
-                let suffix =
-                    &config.buffer.text_input.autocomplete.completion_suffixes
-                        [0];
-                let prefix_str = format!("{}{suffix}", draft_reply.nick);
-                let current_text = self.input_content.text();
-                if current_text.starts_with(&prefix_str) {
-                    let stripped = current_text[prefix_str.len()..].to_string();
-                    let delta = -(prefix_str.chars().count() as i64);
-                    let cursor = adjust_cursor(
-                        &self.input_content,
-                        &stripped,
-                        0,
-                        0,
-                        delta,
-                    );
-                    self.input_content =
-                        text_editor::Content::with_text(&stripped);
-                    self.input_content.move_to(cursor);
-                }
-            }
-
-            self.draft_reply = None;
-
-            history.record_draft(RawInput {
-                buffer: buffer.clone(),
-                text: self.input_content.text(),
-                reply: None,
-            });
-
-            true
-        } else {
-            false
-        }
-    }
-
-    fn parse_lines_and_maybe_send_typing_status(
-        &mut self,
-        buffer: &buffer::Upstream,
-        clients: &mut client::Map,
-        config: &Config,
-    ) {
-        self.parse_lines(buffer, clients, config);
-        self.maybe_send_typing_status(buffer, clients);
-    }
-
-    fn typing_transition(
-        &mut self,
-        text: &str,
-        enabled: bool,
-        now: Instant,
-    ) -> Option<command::Typing> {
-        if !enabled {
-            self.last_typing_at = None;
-
-            return None;
-        }
-
-        if text.is_empty() {
-            return self.last_typing_at.take().map(|_| command::Typing::Done);
-        }
-
-        if self.last_typing_at.is_none_or(|last| {
-            now.duration_since(last) >= TYPING_REFRESH_INTERVAL
-        }) {
-            self.last_typing_at = Some(now);
-
-            return Some(command::Typing::Active);
-        }
-
-        None
-    }
-
-    fn maybe_send_typing_status(
-        &mut self,
-        buffer: &buffer::Upstream,
-        clients: &mut client::Map,
-    ) {
-        let text = self.current_line_text();
-        let enabled = self.can_send_typing_status(buffer, clients);
-
-        if !enabled {
-            if self.last_typing_at.is_some() {
-                self.send_typing_status(buffer, clients, command::Typing::Done);
-            }
-
-            self.last_typing_at = None;
-
-            return;
-        }
-
-        if let Some(status) =
-            self.typing_transition(&text, enabled, Instant::now())
-        {
-            self.send_typing_status(buffer, clients, status);
-        }
-    }
-
-    fn current_line_text(&self) -> String {
-        let cursor_position = self.input_content.cursor().position;
-
-        self.input_content
-            .line(cursor_position.line)
-            .map(|line| line.text.to_string())
-            .unwrap_or_default()
-    }
-
-    fn reset_typing(&mut self) {
-        self.last_typing_at = None;
-    }
-
-    fn send_typing_status(
-        &self,
-        buffer: &buffer::Upstream,
-        clients: &mut client::Map,
-        status: command::Typing,
-    ) {
-        let Some(target) = buffer.target() else {
-            return;
-        };
-
-        let encoded = data::Input::from_command(
-            buffer.clone(),
-            command::Irc::Typing {
-                target: target.to_string(),
-                value: status,
-            },
+    pub fn focus(&self) -> Task<Message> {
+        iced::advanced::widget::operate(
+            iced::advanced::widget::operation::focusable::focus(
+                self.input_id.clone(),
+            ),
         )
-        .encoded();
-
-        if let Some(encoded) = encoded {
-            clients.send(buffer, encoded, TokenPriority::Low);
-        }
     }
 
-    fn can_send_typing_status(
-        &self,
-        buffer: &buffer::Upstream,
-        clients: &client::Map,
-    ) -> bool {
-        clients.get_server_share_typing(buffer.server())
-            && self.is_message_like_input(buffer, clients)
-    }
-
-    fn is_message_like_input(
-        &self,
-        buffer: &buffer::Upstream,
-        clients: &client::Map,
-    ) -> bool {
-        let cursor_position = self.input_content.cursor().position;
-        let casemapping =
-            clients.get_server_casemapping_or_default(buffer.server());
-
-        self.parsed
-            .get(cursor_position.line)
-            .and_then(|parsed| parsed.as_ref().ok())
-            .and_then(|parsed| parsed.multiline_batch_kind(casemapping))
-            .is_some_and(|kind| kind == MultilineBatchKind::PRIVMSG)
-    }
-
-    fn set_notice(&mut self, line: usize) {
-        match self.parsed.get(line) {
-            Some(Err(error)) if show_while_typing(error) => {
-                self.notice = Some(Notice::Error(error.to_string()));
-            }
-            Some(Ok(parsed)) => {
-                if let Some(warning) = parsed.warning() {
-                    self.notice = Some(Notice::Warning(warning.to_string()));
-                }
-            }
-            _ => (),
-        }
-    }
-}
-
-fn input_lines(text: &str) -> impl Iterator<Item = &str> {
-    text.split('\n')
-}
-
-fn show_while_typing(error: &input::Error) -> bool {
-    match error {
-        input::Error::ExceedsByteLimit { .. }
-        | input::Error::Command(
-            command::Error::InvalidModeString
-            | command::Error::ArgTooLong { .. }
-            | command::Error::TooManyTargets { .. }
-            | command::Error::NotPositiveInteger
-            | command::Error::InvalidChannelName { .. }
-            | command::Error::InvalidServerUrl
-            | command::Error::InvalidChathistoryMessageReference
-            | command::Error::InvalidChathistoryOptionalMessageReference
-            | command::Error::InvalidChathistoryTimestamp
-            | command::Error::ChathistoryLimitTooLarge { .. }
-            | command::Error::ExecDisabled
-            | command::Error::CommandNotAvailable { .. }
-            | command::Error::CommandNotEnabled { .. },
-        ) => true,
-        input::Error::Command(command::Error::IncorrectArgCount {
-            actual,
-            max,
-            ..
-        }) => actual > max,
-        input::Error::Command(command::Error::InvalidSubcommand {
-            is_partial_valid,
-            ..
-        }) => !is_partial_valid,
-        input::Error::Command(
-            command::Error::MissingSlash
-            | command::Error::HasDoubleSlash
-            | command::Error::MissingCommand
-            | command::Error::NoModeString
-            | command::Error::Connected
-            | command::Error::Disconnected
-            | command::Error::NotInChannel,
-        ) => false,
-    }
-}
-
-// arboard returns paths ending with \r
-// https://github.com/1Password/arboard/issues/216
-fn clean_path(path: std::path::PathBuf) -> std::path::PathBuf {
-    let path_string = path.to_string_lossy();
-    let cleaned = path_string.strip_suffix("\r").unwrap_or(&path_string);
-    std::path::PathBuf::from(cleaned)
-}
-
-fn handle_clipboard_content(
-    content: Result<Arc<clipboard::Content>, clipboard::Error>,
-) -> Option<Task<Message>> {
-    match Arc::unwrap_or_clone(content.ok()?) {
-        clipboard::Content::Text(text) | clipboard::Content::Html(text) => {
-            Some(Task::done(Message::Action(text_editor::Action::Edit(
-                text_editor::Edit::Paste(text.into()),
-            ))))
-        }
-        clipboard::Content::Image(clipboard_image) => {
-            let rgba_image: image::RgbaImage = image::ImageBuffer::from_raw(
-                clipboard_image.size.width,
-                clipboard_image.size.height,
-                clipboard_image.rgba.to_vec(),
-            )?;
-
-            let path = std::env::temp_dir()
-                .join(format!("halloy-paste-{}.png", uuid::Uuid::now_v7()));
-
-            rgba_image.save(&path).ok()?;
-
-            Some(Task::done(Message::FilesSelected(vec![path])))
-        }
-        clipboard::Content::Files(paths) => {
-            let cleaned_paths = paths.into_iter().map(clean_path).collect();
-
-            Some(Task::done(Message::FilesSelected(cleaned_paths)))
-        }
-        _ => None,
-    }
-}
-
-fn upload_ghost(id: u32) -> String {
-    if id <= 1 {
-        String::from("[Uploading...]")
-    } else {
-        format!("[Uploading...{id}]")
-    }
-}
-
-/// Converts a `(line, col)` position to a flat char offset.
-///
-/// `text_editor::Content` uses 2D positions, but offset arithmetic requires a
-/// flat char index.
-fn line_col_to_char(
-    content: &text_editor::Content,
-    line: usize,
-    col: usize,
-) -> usize {
-    let text = content.text();
-    let mut pos = 0;
-    for (i, l) in text.lines().enumerate() {
-        if i == line {
-            let mut byte_offset = 0;
-            for grapheme in UnicodeSegmentation::graphemes(l, true) {
-                if byte_offset >= col {
-                    break;
-                }
-                byte_offset += grapheme.len();
-                pos += 1;
-            }
-            return pos;
-        }
-        pos += UnicodeSegmentation::graphemes(l, true).count() + 1;
-    }
-    pos
-}
-
-/// Converts a flat grapheme-cluster offset back to a `(line, col)` position.
-///
-/// `start_pos` is the number of grapheme clusters from the start of `text`.
-/// The returned `column` is a byte offset within the line, matching how
-/// `text_editor::Position` encodes column.
-///
-/// Inverse of [`line_col_to_char`]. Used after offset arithmetic to produce a
-/// position suitable for `move_to`.
-fn char_to_line_col(text: &str, start_pos: usize) -> text_editor::Position {
-    let mut remaining = start_pos;
-    let mut fallback = text_editor::Position { line: 0, column: 0 };
-    for (i, line) in text.lines().enumerate() {
-        let mut count = 0;
-        let mut byte_col = 0;
-        for grapheme in UnicodeSegmentation::graphemes(line, true) {
-            if count >= remaining {
-                break;
-            }
-            byte_col += grapheme.len();
-            count += 1;
-        }
-        if count == remaining {
-            return text_editor::Position {
-                line: i,
-                column: byte_col,
-            };
-        }
-        remaining -= count + 1;
-        // track the end of the last seen line so that an out-of-bounds
-        // start_pos clamps to the end of the text
-        fallback = text_editor::Position {
-            line: i,
-            column: line.len(),
-        };
-    }
-    fallback
-}
-
-/// Adjusts a flat char offset around a text replacement.
-///
-/// `replace_start..replace_start+replace_len` is the replaced region; `delta`
-/// is the signed change in length. Offsets before the region are unchanged,
-/// offsets inside it clamp to the end of the replacement, and offsets after it
-/// are shifted by `delta`.
-fn adjust_char_pos(
-    char_pos: usize,
-    replace_start: usize,
-    replace_len: usize,
-    delta: i64,
-) -> usize {
-    if char_pos > replace_start + replace_len {
-        // cursor was after the replaced region — shift it by how much the content changed
-        (char_pos as i64 + delta).max(0) as usize
-    } else if char_pos >= replace_start {
-        // cursor was inside the replaced region — land at the end of whatever replaced it.
-        ((replace_start + replace_len) as i64 + delta).max(0) as usize
-    } else {
-        char_pos
-    }
-}
-
-/// Adjusts the cursor (position and selection) of `content` for a text replacement.
-///
-/// `replaced` is the new text after replacement; `replace_start`, `replace_len`,
-/// and `delta` describe the replaced region, as in [`adjust_char_pos`].
-fn adjust_cursor(
-    content: &text_editor::Content,
-    replaced: &str,
-    replace_start: usize,
-    replace_len: usize,
-    delta: i64,
-) -> text_editor::Cursor {
-    let cursor = content.cursor();
-    text_editor::Cursor {
-        position: char_to_line_col(
-            replaced,
-            adjust_char_pos(
-                line_col_to_char(
-                    content,
-                    cursor.position.line,
-                    cursor.position.column,
-                ),
-                replace_start,
-                replace_len,
-                delta,
-            ),
-        ),
-        selection: cursor.selection.map(|sel| {
-            char_to_line_col(
-                replaced,
-                adjust_char_pos(
-                    line_col_to_char(content, sel.line, sel.column),
-                    replace_start,
-                    replace_len,
-                    delta,
-                ),
-            )
-        }),
-    }
-}
-
-fn replace_ghost_with_url(
-    input_content: &mut text_editor::Content,
-    ghost: String,
-    url: Option<String>,
-) {
-    let content = input_content.text();
-
-    match url {
-        Some(url) => {
-            if let Some(ghost_byte_pos) = content.find(&ghost) {
-                let ghost_char_pos = UnicodeSegmentation::graphemes(
-                    &content[..ghost_byte_pos],
-                    true,
-                )
-                .count();
-                let replaced = content.replacen(&ghost, &url, 1);
-                let delta =
-                    url.chars().count() as i64 - ghost.chars().count() as i64;
-                let cursor = adjust_cursor(
-                    input_content,
-                    &replaced,
-                    ghost_char_pos,
-                    ghost.chars().count(),
-                    delta,
-                );
-                *input_content = text_editor::Content::with_text(&replaced);
-                input_content.move_to(cursor);
-            } else {
-                // the user edited the ghost away while uploading — append it rather than losing it
-                input_content.perform(text_editor::Action::Move(
-                    text_editor::Motion::DocumentEnd,
-                ));
-                // insert a space if there is none immediately before the URL
-                if !input_content.text().trim_end().is_empty() {
-                    input_content.perform(text_editor::Action::Edit(
-                        text_editor::Edit::Insert(' '),
-                    ));
-                }
-                input_content.perform(text_editor::Action::Edit(
-                    text_editor::Edit::Paste(std::sync::Arc::new(url)),
-                ));
-            }
-        }
-        None => {
-            // upload failed or cancelled
-
-            // the ghost may have inserted surrounding spaces; try widest match
-            // first so we don't leave a stray space behind.
-            let found = [
-                format!(" {ghost} "),
-                format!(" {ghost}"),
-                format!("{ghost} "),
-                ghost.clone(),
-            ]
-            .into_iter()
-            .find_map(|s| content.find(&s).map(|pos| (s, pos)));
-
-            if let Some((search, ghost_byte_pos)) = found {
-                let ghost_char_pos = UnicodeSegmentation::graphemes(
-                    &content[..ghost_byte_pos],
-                    true,
-                )
-                .count();
-                let replaced = content.replacen(&search, "", 1);
-                let delta = -(search.chars().count() as i64);
-                let cursor = adjust_cursor(
-                    input_content,
-                    &replaced,
-                    ghost_char_pos,
-                    search.chars().count(),
-                    delta,
-                );
-                *input_content = text_editor::Content::with_text(&replaced);
-                input_content.move_to(cursor);
-            }
-        }
-    }
-}
-
-fn reset_undo_history(content: &mut text_editor::Content) {
-    let text = content.text();
-    let cursor = content.cursor();
-
-    *content = text_editor::Content::with_text(&text);
-    content.move_to(cursor);
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn char_to_line_col_single_line() {
-        let tests = [("hello", 3), ("안녕하세요", 3), ("👩🏾‍🚒 💬👋🏾🗺️", 3)];
-
-        for (text, chars_to_the_right) in tests {
-            let mut content: text_editor::Content =
-                text_editor::Content::with_text(text);
-
-            for _ in 0..chars_to_the_right {
-                content.perform(text_editor::Action::Move(
-                    text_editor::Motion::Right,
-                ));
-            }
-
-            let content_pos = content.cursor().position;
-
-            let pos = char_to_line_col(text, chars_to_the_right);
-
-            assert_eq!(
-                pos, content_pos,
-                "text: {text:?} chars_to_the_right: {chars_to_the_right}"
-            );
-        }
-    }
-
-    #[test]
-    fn char_to_line_col_second_line() {
-        let tests = [
-            ("hello\nworld", 7),
-            ("안녕하세요\n여러분", 7),
-            ("👩🏾‍🚒 💬👋🏾\n🗺️", 6),
-        ];
-
-        for (text, chars_to_the_right) in tests {
-            let mut content: text_editor::Content =
-                text_editor::Content::with_text(text);
-
-            for _ in 0..chars_to_the_right {
-                content.perform(text_editor::Action::Move(
-                    text_editor::Motion::Right,
-                ));
-            }
-
-            let content_pos = content.cursor().position;
-
-            let pos = char_to_line_col(text, chars_to_the_right);
-
-            assert_eq!(
-                pos, content_pos,
-                "text: {text:?} chars_to_the_right: {chars_to_the_right}"
-            );
-        }
-    }
-
-    #[test]
-    fn char_to_line_col_start_of_second_line() {
-        let pos = char_to_line_col("hello\nworld", 6);
-        assert_eq!(pos.line, 1);
-        assert_eq!(pos.column, 0);
-    }
-
-    #[test]
-    fn char_to_line_col_past_end_clamps() {
-        let pos = char_to_line_col("hello", 100);
-        assert_eq!(pos.line, 0);
-        assert_eq!(pos.column, 5);
-    }
-
-    #[test]
-    fn char_to_line_col_empty_string() {
-        let pos = char_to_line_col("", 0);
-        assert_eq!(pos.line, 0);
-        assert_eq!(pos.column, 0);
-    }
-
-    #[test]
-    fn adjust_char_pos_before_region_unchanged() {
-        // cursor at 2, region at 5..8 — unaffected
-        assert_eq!(adjust_char_pos(2, 5, 3, -3), 2);
-    }
-
-    #[test]
-    fn adjust_char_pos_after_region_shifts() {
-        // cursor at 10, region at 5..8, replaced with 1 char (delta -2)
-        assert_eq!(adjust_char_pos(10, 5, 3, -2), 8);
-    }
-
-    #[test]
-    fn adjust_char_pos_inside_region_clamps_to_end_of_replacement() {
-        // cursor at 6, region at 5..8, replaced with 1 char (delta -2)
-        // end of replacement = 5 + 3 - 2 = 6
-        assert_eq!(adjust_char_pos(6, 5, 3, -2), 6);
-    }
-
-    #[test]
-    fn adjust_char_pos_at_region_start_treated_as_inside() {
-        // cursor exactly at replace_start is inside
-        assert_eq!(adjust_char_pos(5, 5, 3, -2), 6);
-    }
-
-    #[test]
-    fn adjust_char_pos_positive_delta() {
-        // region at 5..8 replaced with 6 chars (delta +3), cursor at 10
-        assert_eq!(adjust_char_pos(10, 5, 3, 3), 13);
-    }
-
-    fn set_cursor(
-        content: &mut text_editor::Content,
-        motion: i64,
-        select: i64,
-    ) {
-        if motion > 0 {
-            content.perform(text_editor::Action::Move(
-                text_editor::Motion::DocumentStart,
-            ));
-            for _ in 0..motion {
-                content.perform(text_editor::Action::Move(
-                    text_editor::Motion::Right,
-                ));
-            }
-        } else {
-            content.perform(text_editor::Action::Move(
-                text_editor::Motion::DocumentEnd,
-            ));
-            for _ in 0..-motion {
-                content.perform(text_editor::Action::Move(
-                    text_editor::Motion::Left,
-                ));
-            }
-        }
-
-        if select > 0 {
-            for _ in 0..select {
-                content.perform(text_editor::Action::Select(
-                    text_editor::Motion::Right,
-                ));
-            }
-        } else {
-            for _ in 0..-select {
-                content.perform(text_editor::Action::Select(
-                    text_editor::Motion::Left,
-                ));
-            }
-        }
-    }
-
-    #[test]
-    fn cursor_after_ghost_replaced_with_url() {
-        let tests = [
-            (
-                "hello world",
-                2,
-                "\nI will tell you what Royalty is\nit is a continuous cutting motion",
-                "https://example.com/image.jpg",
-                -40,
-                10,
-            ),
-            (
-                "hello world",
-                2,
-                "\nI will tell you what Royalty is\nit is a continuous cutting motion",
-                "https://🗺.example.com/image.jpg",
-                -12,
-                4,
-            ),
-            (
-                "안녕하세요 여러분\n",
-                1,
-                "\n시간이 쏜 살 같다",
-                "https://example.com/image.jpg",
-                -2,
-                -2,
-            ),
-            (
-                "안녕하세요 여러분\n",
-                1,
-                "\n시간이 쏜 살 같다",
-                "https://🗺.example.com/image.jpg",
-                5,
-                -2,
-            ),
-            (
-                "👩🏾‍🚒 (",
-                1,
-                ") 💬👋🏾🗺️",
-                "https://example.com/image.jpg",
-                -2,
-                1,
-            ),
-        ];
-
-        for (ghost_prefix, id, ghost_suffix, url, motion, select) in tests {
-            let ghost = upload_ghost(id);
-
-            let mut content: text_editor::Content =
-                text_editor::Content::with_text(&format!(
-                    "{ghost_prefix}{ghost}{ghost_suffix}"
-                ));
-
-            set_cursor(&mut content, motion, select);
-
-            replace_ghost_with_url(
-                &mut content,
-                ghost.clone(),
-                Some(url.to_string()),
-            );
-
-            let adjusted_cursor = content.cursor();
-
-            content = text_editor::Content::with_text(&format!(
-                "{ghost_prefix}{url}{ghost_suffix}"
-            ));
-
-            set_cursor(&mut content, motion, select);
-
-            let cursor = content.cursor();
-
-            assert_eq!(
-                adjusted_cursor, cursor,
-                "text: {ghost_prefix}{ghost}{ghost_suffix} url: {url} motion: {motion}"
-            );
-        }
+    pub fn reset(&mut self) {
+        self.notice = None;
+        self.selected_history = None;
+        self.completion.reset();
     }
 }

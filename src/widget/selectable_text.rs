@@ -320,8 +320,9 @@ where
             }
         }
 
-        // TODO: This method is better for ensuring whole letters are visually selected,
-        // but breaks down once wrapping comes to play.
+        // TODO(upstream): this method is better for ensuring whole letters are
+        // visually selected, but breaks down once wrapping comes into play —
+        // it needs a selection API iced does not expose yet.
         // if let Some(Selection { start, end }) = state.selection().and_then(|raw| {
         //     selection(
         //         raw,

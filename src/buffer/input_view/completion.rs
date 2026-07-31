@@ -1,43 +1,58 @@
-use std::borrow::Cow;
-use std::cmp::Ordering;
-use std::collections::HashMap;
+use std::iter;
 use std::ops::RangeInclusive;
-use std::sync::LazyLock;
-use std::{fmt, iter};
 
-use chrono::{DateTime, Utc};
-use const_format::concatcp;
+use data::Config;
 use data::buffer::SkinTone;
-use data::config::buffer::text_input::{OrderBy, SortDirection};
-use data::features::Features;
-use data::history::filter::FilterChain;
-use data::isupport::{self, find_target_limit};
-use data::server::Server;
-use data::target::{self, Target};
-use data::user::{ChannelUsers, Nick, NickRef};
-use data::{Config, command, mode};
 use iced::Length;
 use iced::widget::text::Shaping;
-use iced::widget::{button, column, container, row, text_editor, tooltip};
-use irc::proto;
-use itertools::{Either, Itertools};
+use iced::widget::{button, column, container, row, text_editor};
 use unicode_segmentation::UnicodeSegmentation;
 
-use crate::theme::{self, Theme};
 use crate::widget::{Element, double_pass, text};
-use crate::{emoji, font};
+use crate::{Theme, emoji, font, theme};
 
-const MAX_SHOWN_COMMAND_ENTRIES: usize = 5;
+const MAX_SHOWN_COMMAND_ENTRIES: usize = 6;
 const MAX_SHOWN_EMOJI_ENTRIES: usize = 8;
-const MAX_SHOWN_PATH_ENTRIES: usize = 8;
-const MAX_SHOWN_WORD_ENTRIES: usize = 8;
+
+/// The composer command set: the six Logos slash commands with their
+/// argument hints. ISUPPORT/nick/channel completion died with IRC.
+const COMMAND_LIST: &[Command] = &[
+    Command {
+        title: "dm",
+        args: "[address]",
+        description: "Open a direct conversation with an address",
+    },
+    Command {
+        title: "group",
+        args: "[name] [description]",
+        description: "Create a group conversation",
+    },
+    Command {
+        title: "add",
+        args: "<address>",
+        description: "Add a member to this group conversation",
+    },
+    Command {
+        title: "nick",
+        args: "[name]",
+        description: "Set a local nickname for this conversation",
+    },
+    Command {
+        title: "details",
+        args: "",
+        description: "Toggle the details panel",
+    },
+    Command {
+        title: "clear",
+        args: "",
+        description: "Clear this buffer's messages",
+    },
+];
 
 #[derive(Debug, Clone, Default)]
 pub struct Completion {
     commands: Commands,
-    words: Words,
     emojis: Emojis,
-    paths: Paths,
 }
 
 impl Completion {
@@ -46,47 +61,19 @@ impl Completion {
     }
 
     /// Process input and update the completion state
-    pub fn process<'a>(
+    pub fn process(
         &mut self,
         input: &str,
         cursor_position: usize,
         cursor_is_selection: bool,
-        our_nickname: Option<NickRef>,
-        users: Option<&ChannelUsers>,
-        filters: FilterChain,
-        last_seen: &HashMap<Nick, DateTime<Utc>>,
-        channels: impl IntoIterator<Item = &'a target::Channel>,
-        current_target: Option<&Target>,
-        server: &Server,
-        is_connected: bool,
-        isupport: &HashMap<isupport::Kind, isupport::Parameter>,
-        features: &Features,
         config: &Config,
     ) {
-        let channels: Vec<_> = channels.into_iter().collect();
-        let is_command = input.starts_with('/');
-
-        if is_command {
-            self.commands.process(
-                input,
-                cursor_position,
-                cursor_is_selection,
-                our_nickname,
-                channels.iter().copied(),
-                current_target,
-                server,
-                is_connected,
-                isupport,
-                features,
-                config,
-            );
+        if input.starts_with('/') {
+            self.commands.process(input);
 
             // Disallow other completions when selecting a command
             if matches!(self.commands, Commands::Selecting { .. }) {
-                self.words = Words::default();
                 self.emojis = Emojis::default();
-                self.paths = Paths::default();
-
                 return;
             }
         } else {
@@ -95,10 +82,7 @@ impl Completion {
 
         // If the text input has a selection, then don't show pickers
         if cursor_is_selection {
-            self.words = Words::default();
             self.emojis = Emojis::default();
-            self.paths = Paths::default();
-
             return;
         }
 
@@ -111,35 +95,7 @@ impl Completion {
             .flatten()
         {
             self.emojis.process(shortcode, config);
-
-            self.words = Words::default();
-        } else if let Commands::Selected { command, .. } = &self.commands
-            && command.title() == "UPLOAD"
-        {
-            self.paths.process(input);
-
-            self.words = Words::default();
-            self.emojis = Emojis::default();
         } else {
-            let casemapping = isupport::get_casemapping_or_default(isupport);
-
-            let chantypes = isupport::get_chantypes_or_default(isupport);
-
-            self.words.process(
-                input,
-                cursor_position,
-                casemapping,
-                users,
-                filters,
-                last_seen,
-                channels.iter().copied(),
-                current_target,
-                server,
-                chantypes,
-                config,
-            );
-
-            self.paths = Paths::default();
             self.emojis = Emojis::default();
         }
     }
@@ -149,10 +105,6 @@ impl Completion {
             .select()
             .map(Entry::Command)
             .or(self.emojis.select(config).map(Entry::Emoji))
-            .or(self.words.select().map(|next| Entry::Word {
-                next,
-                append_suffix: true,
-            }))
     }
 
     pub fn select_at(
@@ -164,13 +116,10 @@ impl Completion {
             .select_at(index)
             .map(Entry::Command)
             .or(self.emojis.select_at(index, config).map(Entry::Emoji))
-            .or(self.paths.select_at(index).map(Entry::Path))
-            .or(self.words.select_at(index).map(|next| Entry::Word {
-                next,
-                append_suffix: true,
-            }))
     }
 
+    /// The auto-replace path: a fully typed `:shortcode:` resolves without
+    /// the picker.
     pub fn complete_emoji(
         &self,
         input: &str,
@@ -187,15 +136,6 @@ impl Completion {
         self.commands
             .tab(reverse)
             .or_else(|| self.emojis.tab(reverse, config))
-            .or_else(|| self.paths.tab(reverse))
-            .or_else(|| self.words.tab(reverse))
-    }
-
-    pub fn tab_candidate_count(&self) -> Option<usize> {
-        self.commands
-            .tab_candidate_count()
-            .or_else(|| self.emojis.tab_candidate_count())
-            .or_else(|| self.paths.tab_candidate_count())
     }
 
     pub fn arrow(&mut self, arrow: Arrow) -> bool {
@@ -204,54 +144,20 @@ impl Completion {
             Arrow::Down => false,
         };
 
-        if self.commands.cycle(reverse) {
-            return true;
-        }
-
-        if self.emojis.cycle(reverse) {
-            return true;
-        }
-
-        if self.words.cycle(reverse) {
-            return true;
-        }
-
-        false
+        self.commands.cycle(reverse) || self.emojis.cycle(reverse)
     }
 
     pub fn view<'a, Message: Clone + 'a>(
-        &'a self,
-        input: &str,
-        cursor_position: usize,
-        cursor_is_selection: bool,
-        server: &Server,
+        &self,
         config: &Config,
         theme: &'a Theme,
-        on_select_command: impl Fn(usize) -> Message + Copy + 'a,
+        on_select: impl Fn(usize) -> Message + Copy + 'a,
     ) -> Option<Element<'a, Message>> {
-        let command_view = self.commands.view(
-            input,
-            cursor_position,
-            cursor_is_selection,
-            server,
-            config,
-            theme,
-            on_select_command,
-        );
-        let emojis_view = self.emojis.view(config, on_select_command);
-        let paths_view = self.paths.view(on_select_command);
-        let words_view = self.words.view(on_select_command);
+        let command_view = self.commands.view(theme, on_select);
+        let emojis_view = self.emojis.view(config, on_select);
 
-        if command_view.is_some()
-            || emojis_view.is_some()
-            || paths_view.is_some()
-            || words_view.is_some()
-        {
-            Some(
-                column![emojis_view, paths_view, words_view, command_view]
-                    .spacing(4)
-                    .into(),
-            )
+        if command_view.is_some() || emojis_view.is_some() {
+            Some(column![emojis_view, command_view].spacing(4).into())
         } else {
             None
         }
@@ -266,10 +172,6 @@ impl Completion {
             self.emojis = Emojis::Idle;
 
             return true;
-        } else if matches!(self.words, Words::Selecting { .. }) {
-            self.words = Words::Idle;
-
-            return true;
         }
 
         false
@@ -278,9 +180,7 @@ impl Completion {
 
 #[derive(Debug, Clone)]
 pub enum Entry {
-    Command(String),
-    Word { next: String, append_suffix: bool },
-    Path(String),
+    Command(&'static Command),
     Emoji(String),
 }
 
@@ -289,56 +189,26 @@ impl Entry {
         &self,
         input: &str,
         cursor_position: usize,
-        chantypes: &[char],
-        config: &Config,
     ) -> Vec<text_editor::Action> {
         match self {
-            Entry::Command(command) => replace_word_with_text(
-                input,
-                cursor_position,
-                &format!("/{command} "),
-                None,
-            ),
-            Entry::Word {
-                next,
-                append_suffix,
-            } => {
-                let autocomplete = &config.buffer.text_input.autocomplete;
-                let is_channel = next.starts_with(chantypes);
-
-                // If next is not the original prompt, then append the
-                // configured suffix
-                let suffix = if *append_suffix {
-                    if input.trim_end().find(' ').is_none_or(|space_position| {
-                        cursor_position <= space_position
-                    }) && !is_channel
-                    {
-                        // If completed at the beginning of the input line and
-                        // not a channel.
-                        Some(autocomplete.completion_suffixes[0].as_str())
-                    } else {
-                        // Otherwise, use second suffix.
-                        Some(autocomplete.completion_suffixes[1].as_str())
-                    }
-                } else {
-                    None
-                };
-
-                replace_word_with_text(input, cursor_position, next, suffix)
-            }
+            Entry::Command(command) => vec![
+                text_editor::Action::SelectAll,
+                text_editor::Action::Edit(text_editor::Edit::Paste(
+                    std::sync::Arc::new(format!("/{} ", command.title)),
+                )),
+            ],
             Entry::Emoji(emoji) => {
                 replace_word_with_text(input, cursor_position, emoji, None)
             }
-            Entry::Path(path) => {
-                vec![
-                    text_editor::Action::SelectAll,
-                    text_editor::Action::Edit(text_editor::Edit::Paste(
-                        std::sync::Arc::new(format!("/upload {path}")),
-                    )),
-                ]
-            }
         }
     }
+}
+
+#[derive(Debug, Clone, Copy)]
+pub struct Command {
+    title: &'static str,
+    args: &'static str,
+    description: &'static str,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -347,309 +217,57 @@ enum Commands {
     Idle,
     Selecting {
         highlighted: Option<usize>,
-        filtered: Vec<(String, Command)>,
+        filtered: Vec<&'static Command>,
     },
     Selected {
-        command: Command,
-        subcommand: Option<Command>,
+        command: &'static Command,
     },
 }
 
 impl Commands {
-    fn process<'a>(
-        &mut self,
-        input: &str,
-        cursor_position: usize,
-        cursor_is_selection: bool,
-        our_nickname: Option<NickRef>,
-        channels: impl IntoIterator<Item = &'a target::Channel>,
-        current_target: Option<&Target>,
-        server: &Server,
-        is_connected: bool,
-        isupport: &HashMap<isupport::Kind, isupport::Parameter>,
-        features: &Features,
-        config: &Config,
-    ) {
-        let Some((head, rest)) = input.split_once('/') else {
+    fn process(&mut self, input: &str) {
+        let Some(rest) = input.strip_prefix('/') else {
             *self = Self::Idle;
             return;
         };
 
-        // Don't allow text before a command slash
-        if !head.is_empty() {
+        let head = rest.split_whitespace().next().unwrap_or("").to_lowercase();
+
+        // A fully typed command shows its usage hint; Enter executes it.
+        if let Some(command) =
+            COMMAND_LIST.iter().find(|command| command.title == head)
+        {
+            *self = Self::Selected { command };
+            return;
+        }
+
+        // Arguments after an unknown command head can't be completed.
+        if rest.contains(char::is_whitespace) {
             *self = Self::Idle;
             return;
         }
 
-        let editing_command = !rest
-            .get(..cursor_position.saturating_sub(1))
-            .unwrap_or(rest)
-            .contains(' ');
+        let filtered = COMMAND_LIST
+            .iter()
+            .filter(|command| command.title.starts_with(&head))
+            .collect::<Vec<_>>();
 
-        let cmd = if let Some(index) = rest.find(' ') {
-            &rest[0..index]
-        } else {
-            rest
-        };
-
-        let aliases = command::alias::list(config);
-        let alias_names: Vec<_> =
-            aliases.iter().map(|a| a.name.as_str()).collect();
-
-        let builtin_command_list = if is_connected {
-            connected_command_list(
-                our_nickname,
-                channels,
-                current_target,
-                isupport,
-            )
-        } else {
-            disconnected_command_list(server)
-        };
-
-        let mut command_list = commands_from_aliases(&aliases);
-        command_list.extend(builtin_command_list.into_iter().filter(
-            |command| !command_is_overridden_by_alias(command, &alias_names),
-        ));
-
-        match self {
-            // Command not fully typed, show filtered entries
-            _ if editing_command => {
-                if let Some(command) = command_list.iter().find(|command| {
-                    command.title().to_lowercase() == cmd.to_lowercase()
-                        || command.aliases().iter().any(|alias| {
-                            !command
-                                .title()
-                                .to_lowercase()
-                                .starts_with(&alias.to_lowercase())
-                                && alias.to_lowercase() == cmd.to_lowercase()
-                        })
-                }) {
-                    *self = Self::Selected {
-                        command: command.clone(),
-                        subcommand: None,
-                    };
-                } else {
-                    let mut filtered = command_list
-                        .iter()
-                        .filter_map(|command| {
-                            let title = command.title().to_lowercase();
-
-                            title
-                                .starts_with(&cmd.to_lowercase())
-                                .then_some((title, command.clone()))
-                        })
-                        .collect::<Vec<_>>();
-
-                    filtered.extend(command_list.into_iter().flat_map(
-                        |command| {
-                            command
-                                .aliases()
-                                .iter()
-                                .filter_map({
-                                    let alias_command = command.clone();
-                                    move |alias| {
-                                        alias
-                                            .to_lowercase()
-                                            .starts_with(&cmd.to_lowercase())
-                                            .then_some((
-                                                alias.to_string(),
-                                                alias_command.clone(),
-                                            ))
-                                    }
-                                })
-                                .collect::<Vec<_>>()
-                        },
-                    ));
-
-                    *self = Self::Selecting {
-                        highlighted: None,
-                        filtered,
-                    };
-                }
-            }
-            // Command fully typed, transition to showing known entry
-            Self::Idle | Self::Selecting { .. } => {
-                if let Some(command) =
-                    command_list.into_iter().find(|command| {
-                        command.title().to_lowercase() == cmd.to_lowercase()
-                            || command.aliases().iter().any(|alias| {
-                                alias.to_lowercase() == cmd.to_lowercase()
-                            })
-                    })
-                {
-                    *self = Self::Selected {
-                        command,
-                        subcommand: None,
-                    };
-                } else {
-                    *self = Self::Idle;
-                }
-            }
-            // Command fully typed & already selected
-            Self::Selected { .. } => {}
-        }
-
-        if let Self::Selected { command, .. } = self {
-            // Mark skipped arguments as skipped
-            match &*command.title {
-                "CTCP" => {
-                    if let Some(nick_arg) = command.args.get_mut(0) {
-                        let skip = rest
-                            .split_ascii_whitespace()
-                            .nth(1)
-                            .is_some_and(|nick| {
-                                matches!(
-                                    nick.to_uppercase().as_str(),
-                                    "ACTION"
-                                        | "CLIENTINFO"
-                                        | "PING"
-                                        | "SOURCE"
-                                        | "TIME"
-                                        | "VERSION"
-                                )
-                            });
-
-                        nick_arg.kind.skip(skip);
-                    }
-                }
-                "JOIN" => {
-                    if let Some(channel) = rest.split_ascii_whitespace().nth(1)
-                    {
-                        let chantypes =
-                            isupport::get_chantypes_or_default(isupport);
-
-                        if let Some(channel_arg) = command.args.get_mut(0) {
-                            let skip = !proto::is_channel(channel, chantypes);
-
-                            channel_arg.kind.skip(skip);
-                        }
-                    }
-                }
-                "KICK" => {
-                    if let Some(channel) = rest.split_ascii_whitespace().nth(1)
-                    {
-                        let chantypes =
-                            isupport::get_chantypes_or_default(isupport);
-
-                        if let Some(channel_arg) = command.args.get_mut(0) {
-                            let skip = !proto::is_channel(channel, chantypes);
-
-                            channel_arg.kind.skip(skip);
-                        }
-                    }
-                }
-                "MODE" => {
-                    if let Some(target_arg) = command.args.get_mut(0) {
-                        let skip = rest
-                            .split_ascii_whitespace()
-                            .nth(1)
-                            .is_some_and(|target| {
-                                target.starts_with(['+', '-'])
-                                    || (features.list_mode_with_equal
-                                        && target.starts_with('='))
-                            });
-
-                        target_arg.kind.skip(skip);
-                    }
-                }
-                "TOPIC" => {
-                    if let Some(channel) = rest.split_ascii_whitespace().nth(1)
-                    {
-                        let chantypes =
-                            isupport::get_chantypes_or_default(isupport);
-
-                        if let Some(channel_arg) = command.args.get_mut(0) {
-                            let skip =
-                                matches!(
-                                    current_target,
-                                    Some(Target::Channel(_))
-                                ) && !proto::is_channel(channel, chantypes);
-
-                            channel_arg.kind.skip(skip);
-                        }
-                    }
-                }
-                _ => (),
-            }
-
-            // Check for subcommand, if any exist
-            if let Some(subcommands) = &command.subcommands {
-                if let Some(subcmd) =
-                    rest[cmd.len()..].split_ascii_whitespace().nth(
-                        command
-                            .args
-                            .iter()
-                            .filter(|arg| !arg.kind.skipped())
-                            .count()
-                            .saturating_sub(1),
-                    )
-                {
-                    let subcmd = if command.title != "MODE" {
-                        format!("{} {}", command.title, subcmd).to_lowercase()
-                    } else {
-                        let text = if subcmd.starts_with(['+', '-'])
-                            || (features.list_mode_with_equal
-                                && subcmd.starts_with('='))
-                        {
-                            if let Some(target) = current_target {
-                                match target {
-                                    Target::Channel(_) => "channel",
-                                    Target::Query(_) => "user",
-                                }
-                            } else {
-                                "user"
-                            }
-                        } else {
-                            let chantypes =
-                                isupport::get_chantypes_or_default(isupport);
-
-                            if proto::is_channel(subcmd, chantypes) {
-                                "channel"
-                            } else {
-                                "user"
-                            }
-                        };
-
-                        format!(
-                            "{} {}",
-                            command.title,
-                            Argument {
-                                text: text.into(),
-                                kind: ArgumentKind::Required,
-                                tooltip: None,
-                            }
-                        )
-                        .to_lowercase()
-                    };
-
-                    let subcommand = subcommands.iter().find(|subcommand| {
-                        subcommand.title.to_lowercase() == subcmd
-                            || subcommand
-                                .aliases()
-                                .iter()
-                                .any(|alias| alias.to_lowercase() == subcmd)
-                    });
-
-                    *self = Self::Selected {
-                        command: command.clone(),
-                        subcommand: subcommand.cloned(),
-                    };
-                } else {
-                    *self = Self::Selected {
-                        command: command.clone(),
-                        subcommand: None,
-                    };
-                }
-            }
-        }
-
-        if cursor_is_selection && !matches!(self, Self::Selected { .. }) {
+        if filtered.is_empty() {
             *self = Self::Idle;
+        } else {
+            *self = Self::Selecting {
+                highlighted: match self {
+                    Self::Selecting { highlighted, .. } => {
+                        highlighted.filter(|index| *index < filtered.len())
+                    }
+                    Self::Idle | Self::Selected { .. } => None,
+                },
+                filtered,
+            };
         }
     }
 
-    fn select(&mut self) -> Option<String> {
+    fn select(&mut self) -> Option<&'static Command> {
         let index = if let Self::Selecting { highlighted, .. } = self {
             highlighted.unwrap_or(0)
         } else {
@@ -659,18 +277,13 @@ impl Commands {
         self.select_at(index)
     }
 
-    fn select_at(&mut self, index: usize) -> Option<String> {
+    fn select_at(&mut self, index: usize) -> Option<&'static Command> {
         if let Self::Selecting { filtered, .. } = self
-            && let Some((title, command)) = filtered
-                .get(index)
-                .map(|(title, command)| (title.clone(), command.clone()))
+            && let Some(command) = filtered.get(index).copied()
         {
-            *self = Self::Selected {
-                command: command.clone(),
-                subcommand: None,
-            };
+            *self = Self::Selected { command };
 
-            return Some(title);
+            return Some(command);
         }
 
         None
@@ -685,9 +298,7 @@ impl Commands {
             selecting_tab(highlighted, filtered, reverse);
 
             highlighted.and_then(|index| {
-                filtered
-                    .get(index)
-                    .map(|(title, _)| Entry::Command(title.clone()))
+                filtered.get(index).copied().map(Entry::Command)
             })
         } else {
             None
@@ -708,22 +319,10 @@ impl Commands {
         }
     }
 
-    fn tab_candidate_count(&self) -> Option<usize> {
-        match self {
-            Self::Selecting { filtered, .. } => Some(filtered.len()),
-            _ => None,
-        }
-    }
-
     fn view<'a, Message: Clone + 'a>(
-        &'a self,
-        input: &str,
-        cursor_position: usize,
-        cursor_is_selection: bool,
-        server: &Server,
-        config: &Config,
+        &self,
         theme: &'a Theme,
-        on_select_command: impl Fn(usize) -> Message + Copy + 'a,
+        on_select: impl Fn(usize) -> Message + Copy + 'a,
     ) -> Option<Element<'a, Message>> {
         match self {
             Self::Idle => None,
@@ -732,11 +331,7 @@ impl Commands {
                 filtered,
             } => {
                 let skip = {
-                    let index = if let Some(index) = highlighted {
-                        *index
-                    } else {
-                        0
-                    };
+                    let index = highlighted.unwrap_or(0);
 
                     let to = index.max(MAX_SHOWN_COMMAND_ENTRIES - 1);
                     to.saturating_sub(MAX_SHOWN_COMMAND_ENTRIES - 1)
@@ -750,2589 +345,74 @@ impl Commands {
                     .collect::<Vec<_>>();
 
                 let content = |width| {
-                    column(entries.iter().map(|(index, (title, _))| {
+                    column(entries.iter().map(|(index, command)| {
                         let selected = Some(*index) == *highlighted;
-                        let content = text(format!("/{title}"));
+
+                        let title = text(format!("/{}", command.title));
+                        let args = (!command.args.is_empty()).then(|| {
+                            text(command.args)
+                                .style(theme::text::secondary)
+                                .font_maybe(
+                                    theme::font_style::secondary(theme)
+                                        .map(font::get),
+                                )
+                        });
 
                         Element::from(
-                            button(content)
-                                .width(width)
-                                .padding(6)
-                                .style(move |theme, status| {
-                                    theme::button::picker(
-                                        theme, status, selected,
-                                    )
-                                })
-                                .on_press(on_select_command(*index)),
+                            button(
+                                row![title, args]
+                                    .spacing(6)
+                                    .align_y(iced::Alignment::Center),
+                            )
+                            .width(width)
+                            .padding(6)
+                            .style(move |theme, status| {
+                                theme::button::picker(theme, status, selected)
+                            })
+                            .on_press(on_select(*index)),
                         )
                     }))
-                };
-
-                let description = if config.buffer.commands.show_description {
-                    highlighted.and_then(|index| {
-                        filtered.get(index).map(|(_, command)| {
-                            command.view(
-                                input,
-                                cursor_position,
-                                cursor_is_selection,
-                                None,
-                                server,
-                                config,
-                                theme,
-                            )
-                        })
-                    })
-                } else {
-                    None
                 };
 
                 (!entries.is_empty()).then(|| {
                     let first_pass = content(Length::Shrink);
                     let second_pass = content(Length::Fill);
 
-                    let picker =
-                        container(double_pass(first_pass, second_pass))
-                            .padding(4)
-                            .style(theme::container::tooltip)
-                            .width(Length::Shrink)
-                            .into();
-
-                    if let Some(description) = description {
-                        column![picker, description].spacing(4).into()
-                    } else {
-                        picker
-                    }
-                })
-            }
-            Self::Selected {
-                command,
-                subcommand,
-            } => {
-                if config.buffer.commands.show_description {
-                    Some(command.view(
-                        input,
-                        cursor_position,
-                        cursor_is_selection,
-                        subcommand.as_ref(),
-                        server,
-                        config,
-                        theme,
-                    ))
-                } else {
-                    None
-                }
-            }
-        }
-    }
-}
-
-fn connected_command_list<'a>(
-    our_nickname: Option<NickRef>,
-    channels: impl IntoIterator<Item = &'a target::Channel>,
-    current_target: Option<&Target>,
-    isupport: &HashMap<isupport::Kind, isupport::Parameter>,
-) -> Vec<Command> {
-    let channels: Vec<_> = channels.into_iter().collect();
-
-    vec![
-        // MOTD
-        {
-            Command {
-                title: "MOTD".into(),
-                args: vec![Argument {
-                    text: "server".into(),
-                    kind: ArgumentKind::Optional { skipped: false },
-                    tooltip: None,
-                }],
-                subcommands: None,
-            }
-        },
-        // QUIT
-        {
-            Command {
-                title: "QUIT".into(),
-                args: vec![Argument {
-                    text: "reason".into(),
-                    kind: ArgumentKind::Optional { skipped: false },
-                    tooltip: None,
-                }],
-                subcommands: None,
-            }
-        },
-        // AWAY
-        {
-            let max_len = match isupport.get(&isupport::Kind::AWAYLEN) {
-                Some(isupport::Parameter::AWAYLEN(len)) => Some(*len),
-                _ => None,
-            };
-
-            away_command(max_len)
-        },
-        // JOIN
-        {
-            {
-                let channel_len = match isupport
-                    .get(&isupport::Kind::CHANNELLEN)
-                {
-                    Some(isupport::Parameter::CHANNELLEN(len)) => Some(*len),
-                    _ => None,
-                };
-
-                let channel_limits =
-                    match isupport.get(&isupport::Kind::CHANLIMIT) {
-                        Some(isupport::Parameter::CHANLIMIT(len)) => Some(len),
-                        _ => None,
-                    };
-
-                let key_len = match isupport.get(&isupport::Kind::KEYLEN) {
-                    Some(isupport::Parameter::KEYLEN(len)) => Some(*len),
-                    _ => None,
-                };
-
-                let default = current_target
-                    .and_then(|target| target.as_channel())
-                    .and_then(|target| {
-                        if channels
-                            .iter()
-                            .copied()
-                            .any(|channel| channel == target)
-                        {
-                            None
-                        } else {
-                            Some(target.to_string())
-                        }
-                    });
-
-                join_command(default, channel_len, channel_limits, key_len)
-            }
-        },
-        // KICK
-        {
-            let default = current_target
-                .and_then(|target| target.as_channel())
-                .map(target::Channel::to_string);
-
-            let kick_len = match isupport.get(&isupport::Kind::KICKLEN) {
-                Some(isupport::Parameter::KICKLEN(len)) => Some(*len),
-                _ => None,
-            };
-
-            let target_limit = find_target_limit(isupport, "KICK");
-
-            kick_command(default, target_limit, kick_len)
-        },
-        // MSG
-        {
-            let channel_membership_prefixes: &[char] =
-                match isupport.get(&isupport::Kind::STATUSMSG) {
-                    Some(isupport::Parameter::STATUSMSG(len)) => len,
-                    _ => &[],
-                };
-
-            let target_limit = find_target_limit(isupport, "PRIVMSG");
-
-            msg_command(
-                Formatting::Default,
-                channel_membership_prefixes,
-                target_limit,
-            )
-        },
-        // FORMAT-MSG
-        {
-            let channel_membership_prefixes: &[char] =
-                match isupport.get(&isupport::Kind::STATUSMSG) {
-                    Some(isupport::Parameter::STATUSMSG(len)) => len,
-                    _ => &[],
-                };
-
-            let target_limit = find_target_limit(isupport, "PRIVMSG");
-
-            msg_command(
-                Formatting::Format,
-                channel_membership_prefixes,
-                target_limit,
-            )
-        },
-        // PLAIN-MSG
-        {
-            let channel_membership_prefixes: &[char] =
-                match isupport.get(&isupport::Kind::STATUSMSG) {
-                    Some(isupport::Parameter::STATUSMSG(len)) => len,
-                    _ => &[],
-                };
-
-            let target_limit = find_target_limit(isupport, "PRIVMSG");
-
-            msg_command(
-                Formatting::Plain,
-                channel_membership_prefixes,
-                target_limit,
-            )
-        },
-        // NAMES
-        {
-            let target_limit = find_target_limit(isupport, "NAMES");
-
-            names_command(target_limit)
-        },
-        // NICK
-        {
-            let nick_len = match isupport.get(&isupport::Kind::NICKLEN) {
-                Some(isupport::Parameter::NICKLEN(len)) => Some(*len),
-                _ => None,
-            };
-
-            nick_command(nick_len)
-        },
-        // NOTICE
-        {
-            let channel_membership_prefixes: &[char] =
-                match isupport.get(&isupport::Kind::STATUSMSG) {
-                    Some(isupport::Parameter::STATUSMSG(len)) => len,
-                    _ => &[],
-                };
-
-            let target_limit = find_target_limit(isupport, "NOTICE");
-
-            notice_command(
-                Formatting::Default,
-                channel_membership_prefixes,
-                target_limit,
-            )
-        },
-        // FORMAT-NOTICE
-        {
-            let channel_membership_prefixes: &[char] =
-                match isupport.get(&isupport::Kind::STATUSMSG) {
-                    Some(isupport::Parameter::STATUSMSG(len)) => len,
-                    _ => &[],
-                };
-
-            let target_limit = find_target_limit(isupport, "NOTICE");
-
-            notice_command(
-                Formatting::Format,
-                channel_membership_prefixes,
-                target_limit,
-            )
-        },
-        // PLAIN-NOTICE
-        {
-            let channel_membership_prefixes: &[char] =
-                match isupport.get(&isupport::Kind::STATUSMSG) {
-                    Some(isupport::Parameter::STATUSMSG(len)) => len,
-                    _ => &[],
-                };
-
-            let target_limit = find_target_limit(isupport, "NOTICE");
-
-            notice_command(
-                Formatting::Plain,
-                channel_membership_prefixes,
-                target_limit,
-            )
-        },
-        // PART
-        {
-            let default = current_target.map(Target::to_string);
-
-            let channel_len = match isupport.get(&isupport::Kind::CHANNELLEN) {
-                Some(isupport::Parameter::CHANNELLEN(len)) => Some(*len),
-                _ => None,
-            };
-
-            part_command(default, channel_len)
-        },
-        // TOPIC
-        {
-            let default = current_target
-                .and_then(|target| target.as_channel())
-                .map(target::Channel::to_string);
-
-            let max_len = match isupport.get(&isupport::Kind::TOPICLEN) {
-                Some(isupport::Parameter::TOPICLEN(len)) => Some(*len),
-                _ => None,
-            };
-
-            topic_command(default, max_len)
-        },
-        // WHO -- WHOX
-        {
-            if isupport.get(&isupport::Kind::WHOX).is_some() {
-                whox_command()
-            } else {
-                who_command()
-            }
-        },
-        // WHOIS
-        {
-            let target_limit = find_target_limit(isupport, "WHOIS");
-            whois_command(target_limit)
-        },
-        // WHOWAS
-        {
-            Command {
-                title: "WHOWAS".into(),
-                args: vec![
-                    Argument {
-                        text: "nick".into(),
-                        kind: ArgumentKind::Required,
-                        tooltip: None,
-                    },
-                    Argument {
-                        text: "count".into(),
-                        kind: ArgumentKind::Optional { skipped: false },
-                        tooltip: Some(String::from(
-                            "maximum number of nickname history entries returned, or all if omitted",
-                        )),
-                    },
-                ],
-                subcommands: None,
-            }
-        },
-        // ME
-        {
-            Command {
-                title: "ME".into(),
-                args: vec![Argument {
-                    text: "action".into(),
-                    kind: ArgumentKind::Required,
-                    tooltip: None,
-                }],
-                subcommands: None,
-            }
-        },
-        // FORMAT-ME
-        {
-            Command {
-                title: "FORMAT-ME".into(),
-                args: vec![Argument {
-                    text: "action".into(),
-                    kind: ArgumentKind::Required,
-                    tooltip: Some(
-                        include_str!("./format_tooltip.txt")
-                            .trim_end()
-                            .to_string(),
-                    ),
-                }],
-                subcommands: None,
-            }
-        },
-        // PLAIN-ME
-        {
-            Command {
-                title: "PLAIN-ME".into(),
-                args: vec![Argument {
-                    text: "action".into(),
-                    kind: ArgumentKind::Required,
-                    tooltip: None,
-                }],
-                subcommands: None,
-            }
-        },
-        // MODE
-        {
-            let chanmodes = isupport::get_chanmodes_or_default(isupport);
-            let prefix = isupport::get_prefix_or_default(isupport);
-            let mode_limit = isupport::get_mode_limit_or_default(isupport);
-
-            let default = current_target
-                .map(Target::to_string)
-                .or(our_nickname.map(|nickname| nickname.to_string()));
-
-            let mut tooltip = String::from("a channel or user");
-
-            if let Some(ref default) = default {
-                tooltip.push_str(
-                    format!("\nmay be skipped (default: {default})").as_str(),
-                );
-            }
-
-            Command {
-                title: "MODE".into(),
-                args: vec![Argument {
-                    text: "target".into(),
-                    kind: if default.is_some() {
-                        ArgumentKind::Optional { skipped: false }
-                    } else {
-                        ArgumentKind::Required
-                    },
-                    tooltip: Some(tooltip),
-                }],
-                subcommands: Some(vec![
-                    mode_channel_command(chanmodes, prefix, mode_limit),
-                    mode_user_command(mode_limit),
-                ]),
-            }
-        },
-        // RAW
-        {
-            Command {
-                title: "RAW".into(),
-                args: vec![
-                    Argument {
-                        text: "command".into(),
-                        kind: ArgumentKind::Required,
-                        tooltip: None,
-                    },
-                    Argument {
-                        text: "args".into(),
-                        kind: ArgumentKind::Optional { skipped: false },
-                        tooltip: None,
-                    },
-                ],
-                subcommands: None,
-            }
-        },
-        // FORMAT
-        {
-            Command {
-                title: "FORMAT".into(),
-                args: vec![Argument {
-                    text: "text".into(),
-                    kind: ArgumentKind::Required,
-                    tooltip: Some(
-                        include_str!("./format_tooltip.txt")
-                            .trim_end()
-                            .to_string(),
-                    ),
-                }],
-                subcommands: None,
-            }
-        },
-        // PLAIN
-        {
-            Command {
-                title: "PLAIN".into(),
-                args: vec![Argument {
-                    text: "text".into(),
-                    kind: ArgumentKind::Required,
-                    tooltip: None,
-                }],
-                subcommands: None,
-            }
-        },
-        // INVITE
-        {
-            let default = current_target
-                .and_then(|target| target.as_channel())
-                .map(target::Channel::to_string);
-
-            invite_command(default)
-        },
-        // HOP
-        {
-            Command {
-                title: "HOP".into(),
-                args: vec![
-                    Argument {
-                        text: "channel".into(),
-                        kind: ArgumentKind::Optional { skipped: false },
-                        tooltip: Some(String::from("the channel to join")),
-                    },
-                    Argument {
-                        text: "message".into(),
-                        kind: ArgumentKind::Optional { skipped: false },
-                        tooltip: Some(String::from(
-                            "the part message to be sent",
-                        )),
-                    },
-                ],
-                subcommands: None,
-            }
-        },
-        // SYSINFO
-        {
-            Command {
-                title: "SYSINFO".into(),
-                args: vec![],
-                subcommands: None,
-            }
-        },
-        // EXEC
-        exec_command(),
-        // CLEAR
-        {
-            Command {
-                title: "CLEAR".into(),
-                args: vec![],
-                subcommands: None,
-            }
-        },
-        // CLEARTOPIC
-        {
-            let default = current_target
-                .and_then(|target| target.as_channel())
-                .map(target::Channel::to_string);
-
-            Command {
-                title: "CLEARTOPIC".into(),
-                args: vec![Argument {
-                    text: "channel".into(),
-                    kind: if default.is_some() {
-                        ArgumentKind::Optional { skipped: false }
-                    } else {
-                        ArgumentKind::Required
-                    },
-                    tooltip: default.map(|default| {
-                        format!("may be omitted (default: {default})")
-                    }),
-                }],
-                subcommands: None,
-            }
-        },
-        // CTCP
-        {
-            let default = current_target
-                .and_then(|target| target.as_query())
-                .map(target::Query::to_string);
-
-            Command {
-                title: "CTCP".into(),
-                args: vec![
-                    Argument {
-                        text: "nick".into(),
-                        kind: if default.is_some() {
-                            ArgumentKind::Optional { skipped: false }
-                        } else {
-                            ArgumentKind::Required
-                        },
-                        tooltip: default.map(|default| {
-                            format!("may be skipped (default: {default})")
-                        }),
-                    },
-                    Argument {
-                        text: "command".into(),
-                        kind: ArgumentKind::Required,
-                        tooltip: Some(
-                            "    ACTION: Display <text> as a third-person action or emote\
-                           \nCLIENTINFO: Request a list of the CTCP messages <nick> supports\
-                           \n      PING: Request a reply containing the same <info> that was sent\
-                           \n    SOURCE: Request a URL where the source code for <nick>'s IRC client can be found\
-                           \n      TIME: Request the <nick>'s local time in a human-readable format\
-                           \n  USERINFO: Request miscellaneous information about the user\
-                           \n   VERSION: Request the name and version of <nick>'s IRC client".to_string(),
-                        ),
-                    },
-                ],
-                subcommands: Some(vec![
-                        ctcp_action_command(),
-                        ctcp_clientinfo_command(),
-                        ctcp_userinfo_command(),
-                        ctcp_ping_command(),
-                        ctcp_source_command(),
-                        ctcp_time_command(),
-                        ctcp_version_command()
-                    ]),
-            }
-        },
-        // LIST
-        {
-            Command {
-                title: "LIST".into(),
-                args: vec![],
-                subcommands: None,
-            }
-        },
-        // CONNECT
-        {
-            Command {
-                title: "CONNECT".into(),
-                args: vec![Argument {
-                    text: "server".into(),
-                    kind: ArgumentKind::Required,
-                    tooltip: Some(
-                        "URL of the format (irc|ircs)://(server):(port)/"
-                            .to_string(),
-                    ),
-                }],
-                subcommands: None,
-            }
-        },
-        // CHATHISTORY
-        {
-            let maximum_limit = match isupport.get(&isupport::Kind::CHATHISTORY)
-            {
-                Some(isupport::Parameter::CHATHISTORY(maximum_limit)) => {
-                    Some(*maximum_limit)
-                }
-                _ => None,
-            };
-
-            chathistory_command(maximum_limit)
-        },
-        // MONITOR
-        {
-            let target_limit = match isupport.get(&isupport::Kind::MONITOR) {
-                Some(isupport::Parameter::MONITOR(target_limit)) => {
-                    *target_limit
-                }
-                _ => None,
-            };
-
-            monitor_command(target_limit)
-        },
-        // SETNAME
-        {
-            let max_len = match isupport.get(&isupport::Kind::NAMELEN) {
-                Some(isupport::Parameter::NAMELEN(max_len)) => Some(*max_len),
-                _ => None,
-            };
-
-            setname_command(max_len)
-        },
-        // DETACH
-        {
-            let default = current_target
-                .and_then(|target| target.as_channel())
-                .map(target::Channel::to_string);
-
-            let channel_len = match isupport.get(&isupport::Kind::CHANNELLEN) {
-                Some(isupport::Parameter::CHANNELLEN(len)) => Some(*len),
-                _ => None,
-            };
-
-            detach_command(default, channel_len)
-        },
-        // MASSMESSAGE
-        Command {
-            title: "MASSMESSAGE".into(),
-            args: vec![Argument {
-                text: "message".into(),
-                kind: ArgumentKind::Required,
-                tooltip: None,
-            }],
-            subcommands: None,
-        },
-        // CPRIVMSG
-        Command {
-            title: "CPRIVMSG".into(),
-            args: vec![
-                Argument {
-                    text: "nickname".into(),
-                    kind: ArgumentKind::Required,
-                    tooltip: None,
-                },
-                Argument {
-                    text: "channel".into(),
-                    kind: ArgumentKind::Required,
-                    tooltip: None,
-                },
-                Argument {
-                    text: "message".into(),
-                    kind: ArgumentKind::Required,
-                    tooltip: None,
-                },
-            ],
-            subcommands: None,
-        },
-        // CNOTICE
-        Command {
-            title: "CNOTICE".into(),
-            args: vec![
-                Argument {
-                    text: "nickname".into(),
-                    kind: ArgumentKind::Required,
-                    tooltip: None,
-                },
-                Argument {
-                    text: "channel".into(),
-                    kind: ArgumentKind::Required,
-                    tooltip: None,
-                },
-                Argument {
-                    text: "message".into(),
-                    kind: ArgumentKind::Required,
-                    tooltip: None,
-                },
-            ],
-            subcommands: None,
-        },
-        // KNOCK
-        Command {
-            title: "KNOCK".into(),
-            args: vec![
-                Argument {
-                    text: "channel".into(),
-                    kind: ArgumentKind::Required,
-                    tooltip: None,
-                },
-                Argument {
-                    text: "message".into(),
-                    kind: ArgumentKind::Optional { skipped: false },
-                    tooltip: None,
-                },
-            ],
-            subcommands: None,
-        },
-        // USERIP
-        Command {
-            title: "USERIP".into(),
-            args: vec![Argument {
-                text: "nickname".into(),
-                kind: ArgumentKind::Required,
-                tooltip: None,
-            }],
-            subcommands: None,
-        },
-        // UPLOAD
-        Command {
-            title: "UPLOAD".into(),
-            args: vec![Argument {
-                text: "file".into(),
-                kind: ArgumentKind::Required,
-                tooltip: Some("Path to a file".to_string()),
-            }],
-            subcommands: None,
-        },
-    ]
-}
-
-fn disconnected_command_list(server: &Server) -> Vec<Command> {
-    vec![
-        // EXEC
-        exec_command(),
-        // CONNECT
-        {
-            Command {
-                title: "CONNECT".into(),
-                args: vec![Argument {
-                    text: "server".into(),
-                    kind: ArgumentKind::Optional { skipped: false },
-                    tooltip: Some(format!(
-                        "URL of the format (irc|ircs)://(server):(port)/\
-                       \nmay be skipped (default: reconnect to {server})"
-                    )),
-                }],
-                subcommands: None,
-            }
-        },
-        // RECONNECT
-        {
-            Command {
-                title: "RECONNECT".into(),
-                args: vec![],
-                subcommands: None,
-            }
-        },
-    ]
-}
-
-fn exec_command() -> Command {
-    Command {
-        title: "EXEC".into(),
-        args: vec![Argument {
-            text: "command".into(),
-            kind: ArgumentKind::Required,
-            tooltip: Some(
-                "runs a local shell command and sends the first line of stdout to the current buffer"
-                    .to_string(),
-            ),
-        }],
-        subcommands: None,
-    }
-}
-
-fn commands_from_aliases(aliases: &[command::Alias]) -> Vec<Command> {
-    aliases
-        .iter()
-        .map(|alias| Command {
-            title: alias.name.clone().into(),
-            args: command::alias::placeholder_args(&alias.body)
-                .iter()
-                .map(|(text, optional)| Argument {
-                    text: text.clone().into(),
-                    kind: if *optional {
-                        ArgumentKind::Optional { skipped: false }
-                    } else {
-                        ArgumentKind::Required
-                    },
-                    tooltip: None,
-                })
-                .collect(),
-            subcommands: None,
-        })
-        .collect()
-}
-
-fn command_is_overridden_by_alias(
-    command: &Command,
-    alias_names: &[&str],
-) -> bool {
-    let title = command.title.to_lowercase();
-
-    alias_names.iter().any(|alias| *alias == title)
-        || command
-            .aliases()
-            .iter()
-            .any(|command_alias| alias_names.contains(command_alias))
-}
-
-#[derive(Debug, Clone)]
-pub struct Command {
-    title: Cow<'static, str>,
-    args: Vec<Argument>,
-    subcommands: Option<Vec<Command>>,
-}
-
-const MODE_CHANNEL_PATTERN: &str =
-    concatcp!("mode ", REQUIRED_ARG_PREFIX, "channel", REQUIRED_ARG_SUFFIX);
-const MODE_USER_PATTERN: &str =
-    concatcp!("mode ", REQUIRED_ARG_PREFIX, "user", REQUIRED_ARG_SUFFIX);
-
-impl Command {
-    fn title(&self) -> &str {
-        &self.title
-    }
-
-    fn description(
-        &self,
-        server: &Server,
-        config: &Config,
-    ) -> Option<Cow<'static, str>> {
-        Some(match self.title.to_lowercase().as_str() {
-            "away" => Cow::Borrowed(
-                "Mark yourself as away. If already away, the status is removed",
-            ),
-            "join" => Cow::Borrowed("Join channel(s) with optional key(s)"),
-            "me" => Cow::Borrowed("Send an action message to the channel"),
-            "mode" => Cow::Borrowed("Set or retrieve target's mode(s)"),
-            MODE_CHANNEL_PATTERN => {
-                Cow::Borrowed("Set or retrieve channel's mode(s)")
-            }
-            MODE_USER_PATTERN => {
-                Cow::Borrowed("Set or retrieve user's mode(s)")
-            }
-            "monitor" => Cow::Borrowed(
-                "System to notify when users become online/offline",
-            ),
-            "monitor +" => Cow::Borrowed("Add user(s) to list being monitored"),
-            "monitor -" => {
-                Cow::Borrowed("Remove user(s) from list being monitored")
-            }
-            "monitor c" => {
-                Cow::Borrowed("Clear the list of users being monitored")
-            }
-            "monitor l" => Cow::Borrowed("Get list of users being monitored"),
-            "monitor s" => Cow::Borrowed(
-                "For each user in the list being monitored, get the current status",
-            ),
-            "msg" => Cow::Borrowed(
-                "Open a pane with a target and send an optional message",
-            ),
-            "notice" => Cow::Borrowed("Send a notice message to a target"),
-            "nick" => Cow::Owned(format!("Change your nickname on {server}")),
-            "part" => Cow::Borrowed("Leave channel(s) with an optional reason"),
-            "quit" => Cow::Owned(format!(
-                "Disconnect from {server} with an optional reason"
-            )),
-            "raw" => Cow::Owned(format!(
-                "Send data to {server} without modifying it"
-            )),
-            "topic" => Cow::Borrowed(
-                "Retrieve the topic of a channel or set a new topic",
-            ),
-            "whois" => Cow::Borrowed("Retrieve information about user(s)"),
-            "whowas" => Cow::Borrowed(
-                "Retrieve information about no longer present user(s)",
-            ),
-            "format" => {
-                Cow::Borrowed("Format text using markdown or $ sequences")
-            }
-            "format-me" => Cow::Borrowed(
-                "Format an action message using markdown or $ sequences",
-            ),
-            "format-msg" => Cow::Borrowed(
-                "Open a pane with a target and send an optional message formatted using markdown or $ sequences",
-            ),
-            "format-notice" => Cow::Borrowed(
-                "Send target a notice message formatted using markdown or $ sequences",
-            ),
-            "plain" => {
-                Cow::Borrowed("Send text with automatic formatting disabled")
-            }
-            "plain-me" => Cow::Borrowed(
-                "Send an action message with automatic formatting disabled",
-            ),
-            "plain-msg" => Cow::Borrowed(
-                "Open a pane with a target and send an optional message with automatic formatting disabled",
-            ),
-            "plain-notice" => Cow::Borrowed(
-                "Send target a notice message with automatic formatting disabled",
-            ),
-            "ctcp" => Cow::Borrowed("Send Client-To-Client requests"),
-            "ctcp action" => Cow::Borrowed(
-                "Display <text> as a third-person action or emote",
-            ),
-            "ctcp clientinfo" => Cow::Borrowed(
-                "Request a list of the CTCP messages <nick> supports",
-            ),
-            "ctcp ping" => Cow::Borrowed(
-                "Request a reply containing the same <info> that was sent",
-            ),
-            "ctcp source" => Cow::Borrowed(
-                "Request a URL where the source code for <nick>'s IRC client can be found",
-            ),
-            "ctcp time" => Cow::Borrowed(
-                "Request the <nick>'s local time in a human-readable format",
-            ),
-            "ctcp version" => Cow::Borrowed(
-                "Request the name and version of <nick>'s IRC client",
-            ),
-            "hop" => {
-                Cow::Borrowed("Parts the current channel and joins a new one")
-            }
-            "clear" => Cow::Borrowed("Clears the buffer"),
-            "cleartopic" => Cow::Borrowed("Clear the topic of a channel"),
-            "sysinfo" => Cow::Borrowed("Send system information"),
-            "detach" => Cow::Borrowed(
-                "Hide the channel, leaving the bouncer's connection to the channel active",
-            ),
-            "massmessage" => {
-                Cow::Borrowed("Send announcement to all connected users")
-            }
-            "list" => {
-                Cow::Owned(format!("Open Channel Discovery for {server}"))
-            }
-            "connect" => Cow::Borrowed("Connect to server"),
-            "reconnect" => Cow::Owned(format!("Reconnect to {server}")),
-            "upload" => Cow::Borrowed("Upload a file to the server's filehost"),
-            "invite" => Cow::Borrowed("Invite user to channel"),
-            _ => config
-                .buffer
-                .commands
-                .aliases
-                .get(&self.title.to_lowercase())
-                .map(|alias| Cow::Owned(format!("Alias for {alias}")))?,
-        })
-    }
-
-    fn aliases(&self) -> Vec<&str> {
-        match self.title.to_lowercase().as_str() {
-            "join" => vec!["j"],
-            "me" => vec!["describe"],
-            "mode" => vec!["m"],
-            "msg" => vec!["query"],
-            "part" => vec!["leave"],
-            "quit" => vec!["disconnect"],
-            "topic" => vec!["t"],
-            "format" => vec!["f"],
-            "plain" => vec!["p"],
-            "hop" => vec!["rejoin"],
-            "cleartopic" => vec!["ct"],
-            "massmessage" => vec!["mm"],
-            _ => vec![],
-        }
-    }
-
-    fn view<'a, Message: 'a>(
-        &self,
-        input: &str,
-        cursor_position: usize,
-        cursor_is_selection: bool,
-        subcommand: Option<&'a Command>,
-        server: &Server,
-        config: &Config,
-        theme: &'a Theme,
-    ) -> Element<'a, Message> {
-        let num_skipped =
-            self.args.iter().filter(|arg| arg.kind.skipped()).count()
-                + subcommand.map_or(0, |subcommand| {
-                    subcommand
-                        .args
-                        .iter()
-                        .filter(|arg| arg.kind.skipped())
-                        .count()
-                });
-
-        let active_arg = if cursor_is_selection {
-            None
-        } else {
-            input.split_at_checked(cursor_position).and_then(
-                |(before_cursor, _)| {
-                    let index = [before_cursor, "_"]
-                        .concat()
-                        .split_ascii_whitespace()
-                        .count()
-                        .saturating_add(num_skipped)
-                        .saturating_sub(1)
-                        .min(
-                            self.args.len()
-                                + subcommand.map_or(0, |subcommand| {
-                                    subcommand.args.len()
-                                }),
-                        );
-
-                    (index > 0).then_some(index.saturating_sub(1))
-                },
-            )
-        };
-
-        let title = Some(Element::from(text(self.title.to_string())));
-
-        let is_active_arg = move |index: usize| -> bool {
-            active_arg.is_some_and(|active_arg| active_arg == index)
-        };
-
-        let arg_text = |index: usize, arg: &Argument| {
-            let content = text(format!("{arg}"))
-                .style(move |theme| {
-                    if is_active_arg(index) {
-                        theme::text::tertiary(theme)
-                    } else {
-                        theme::text::none(theme)
-                    }
-                })
-                .font_maybe(
-                    theme::font_style::tertiary(theme)
-                        .filter(|_| is_active_arg(index))
-                        .map(font::get),
-                );
-
-            if let Some(arg_tooltip) = &arg.tooltip {
-                let tooltip_indicator = text("*")
-                    .style(move |theme| {
-                        if is_active_arg(index) {
-                            theme::text::tertiary(theme)
-                        } else {
-                            theme::text::none(theme)
-                        }
-                    })
-                    .font_maybe(
-                        theme::font_style::tertiary(theme)
-                            .filter(|_| is_active_arg(index))
-                            .map(font::get),
-                    )
-                    .size(8);
-
-                Element::from(row![
-                    text(" "),
-                    tooltip(
-                        row![content, tooltip_indicator]
-                            .align_y(iced::Alignment::Start),
-                        container(
-                            text(arg_tooltip.clone())
-                                .style(move |theme| {
-                                    if is_active_arg(index) {
-                                        theme::text::tertiary(theme)
-                                    } else {
-                                        theme::text::secondary(theme)
-                                    }
-                                })
-                                .font_maybe(if is_active_arg(index) {
-                                    theme::font_style::tertiary(theme)
-                                        .map(font::get)
-                                } else {
-                                    theme::font_style::secondary(theme)
-                                        .map(font::get)
-                                })
-                        )
+                    container(double_pass(first_pass, second_pass))
+                        .padding(4)
                         .style(theme::container::tooltip)
-                        .padding(8),
-                        tooltip::Position::Top,
-                    )
-                    .delay(iced::time::Duration::ZERO)
-                ])
-            } else {
-                Element::from(row![text(" "), content])
-            }
-        };
-
-        let args = if let Some(subcommand) = subcommand {
-            Either::Left(
-                self.args
-                    .iter()
-                    .take(self.args.len() - 1)
-                    .enumerate()
-                    .map(|(index, arg)| arg_text(index, arg))
-                    .chain(std::iter::once(Element::from(row![
-                        text(
-                            subcommand
-                                .title
-                                .strip_prefix(&*self.title)
-                                .unwrap_or_default(),
-                        )
-                        .style(move |theme| {
-                            if is_active_arg(0) {
-                                theme::text::tertiary(theme)
-                            } else {
-                                theme::text::none(theme)
-                            }
-                        })
-                    ])))
-                    .chain(subcommand.args.iter().enumerate().map(
-                        |(index, arg)| arg_text(self.args.len() + index, arg),
-                    )),
-            )
-        } else {
-            let args = self
-                .args
-                .iter()
-                .enumerate()
-                .map(|(index, arg)| arg_text(index, arg));
-
-            Either::Right(if self.subcommands.is_some() {
-                Either::Left(args.chain(iter::once(Element::from(row![
-                    text(" ...").style(theme::text::none)
-                ]))))
-            } else {
-                Either::Right(args)
-            })
-        };
-
-        container(column![
-            subcommand
-                .map_or(self.description(server, config), |subcommand| {
-                    subcommand.description(server, config)
+                        .width(Length::Shrink)
+                        .into()
                 })
-                .map(|description| {
-                    text(description).style(theme::text::secondary).font_maybe(
-                        theme::font_style::secondary(theme).map(font::get),
-                    )
-                }),
-            row(title.into_iter().chain(args)),
-        ])
-        .style(theme::container::tooltip)
-        .padding(8)
-        .center_y(Length::Shrink)
-        .into()
-    }
-}
-
-#[derive(Debug, Clone)]
-struct Argument {
-    text: Cow<'static, str>,
-    kind: ArgumentKind,
-    tooltip: Option<String>,
-}
-
-// Whether the argument can be skipped or omitted, and if so whether it has been
-// skipped
-#[derive(Debug, Clone)]
-enum ArgumentKind {
-    Required,
-    Optional { skipped: bool },
-}
-
-impl ArgumentKind {
-    fn skip(&mut self, skip: bool) {
-        match self {
-            ArgumentKind::Required => (),
-            ArgumentKind::Optional { skipped } => *skipped = skip,
-        }
-    }
-
-    fn skipped(&self) -> bool {
-        match self {
-            ArgumentKind::Required => false,
-            ArgumentKind::Optional { skipped } => *skipped,
-        }
-    }
-}
-
-const REQUIRED_ARG_PREFIX: &str = "<";
-const REQUIRED_ARG_SUFFIX: &str = ">";
-
-impl fmt::Display for Argument {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        if matches!(self.kind, ArgumentKind::Optional { .. }) {
-            write!(f, "[<{}>]", self.text)
-        } else {
-            write!(
-                f,
-                "{}{}{}",
-                REQUIRED_ARG_PREFIX, self.text, REQUIRED_ARG_SUFFIX
-            )
-        }
-    }
-}
-
-#[derive(Debug, Clone, Default)]
-enum Words {
-    #[default]
-    Idle,
-    Selecting {
-        prompt: String,
-        show_picker: bool,
-        highlighted: Option<usize>,
-        filtered: Vec<String>,
-    },
-    Selected,
-}
-
-impl Words {
-    fn set_selecting(&mut self, prompt: String, filtered: Vec<String>) {
-        if filtered.is_empty() {
-            *self = Self::Idle;
-        } else {
-            *self = Self::Selecting {
-                prompt,
-                show_picker: false,
-                highlighted: None,
-                filtered,
-            };
-        }
-    }
-
-    fn process<'a>(
-        &mut self,
-        input: &str,
-        cursor_position: usize,
-        casemapping: isupport::CaseMap,
-        users: Option<&ChannelUsers>,
-        filters: FilterChain,
-        last_seen: &HashMap<Nick, DateTime<Utc>>,
-        channels: impl IntoIterator<Item = &'a target::Channel>,
-        current_target: Option<&Target>,
-        server: &Server,
-        chantypes: &[char],
-        config: &Config,
-    ) {
-        if !self.process_channels(
-            input,
-            cursor_position,
-            channels,
-            current_target.and_then(Target::as_channel),
-            chantypes,
-            config,
-        ) {
-            self.process_users(
-                input,
-                cursor_position,
-                casemapping,
-                users,
-                filters,
-                current_target.and_then(Target::as_channel),
-                server,
-                last_seen,
-                config,
-            );
-        }
-    }
-
-    fn process_users(
-        &mut self,
-        input: &str,
-        cursor_position: usize,
-        casemapping: isupport::CaseMap,
-        users: Option<&ChannelUsers>,
-        filters: FilterChain,
-        current_channel: Option<&target::Channel>,
-        server: &Server,
-        last_seen: &HashMap<Nick, DateTime<Utc>>,
-        config: &Config,
-    ) {
-        let autocomplete = &config.buffer.text_input.autocomplete;
-
-        let Some(word) = get_word(input, cursor_position) else {
-            *self = Self::default();
-            return;
-        };
-
-        let nick = casemapping.normalize(word);
-
-        let filtered = users
-            .into_iter()
-            .flatten()
-            .filter(|user| {
-                !filters.filter_user(user, current_channel, server)
-                    && user.as_normalized_str().starts_with(&nick)
-            })
-            .sorted_by(|a, b| {
-                if matches!(autocomplete.order_by, OrderBy::Recent) {
-                    if let Some(a_last_seen) =
-                        last_seen.get(&a.nickname().to_owned())
-                    {
-                        if let Some(b_last_seen) =
-                            last_seen.get(&b.nickname().to_owned())
-                        {
-                            b_last_seen.cmp(a_last_seen)
-                        } else {
-                            Ordering::Less
-                        }
-                    } else if last_seen.get(&b.nickname().to_owned()).is_some()
-                    {
-                        Ordering::Greater
-                    } else {
-                        match autocomplete.sort_direction {
-                            SortDirection::Asc => {
-                                a.nickname().cmp(&b.nickname())
-                            }
-                            SortDirection::Desc => {
-                                b.nickname().cmp(&a.nickname())
-                            }
-                        }
-                    }
+            }
+            Self::Selected { command } => {
+                let usage = if command.args.is_empty() {
+                    format!("/{}", command.title)
                 } else {
-                    match autocomplete.sort_direction {
-                        SortDirection::Asc => a.nickname().cmp(&b.nickname()),
-                        SortDirection::Desc => b.nickname().cmp(&a.nickname()),
-                    }
-                }
-            })
-            .map(|user| user.nickname().to_string())
-            .collect();
-
-        self.set_selecting(word.to_string(), filtered);
-    }
-
-    fn process_channels<'a>(
-        &mut self,
-        input: &str,
-        cursor_position: usize,
-        channels: impl IntoIterator<Item = &'a target::Channel>,
-        current_channel: Option<&target::Channel>,
-        chantypes: &[char],
-        config: &Config,
-    ) -> bool {
-        let autocomplete = &config.buffer.text_input.autocomplete;
-
-        if let Some(input_channel) = get_word(input, cursor_position)
-            && input_channel.starts_with(chantypes)
-        {
-            let filtered = channels
-                .into_iter()
-                .filter(|&channel| channel.as_str().starts_with(input_channel))
-                .sorted_by(|a, b: &&target::Channel| {
-                    if let Some(current_channel) = current_channel {
-                        let a_is_current_channel = a.as_normalized_str()
-                            == current_channel.as_normalized_str();
-                        let b_is_current_channel = b.as_normalized_str()
-                            == current_channel.as_normalized_str();
-
-                        match (a_is_current_channel, b_is_current_channel) {
-                            (false, false) => (),
-                            (true, false) => return std::cmp::Ordering::Less,
-                            (false, true) => {
-                                return std::cmp::Ordering::Greater;
-                            }
-                            (true, true) => return std::cmp::Ordering::Equal,
-                        }
-                    }
-
-                    match autocomplete.sort_direction {
-                        SortDirection::Asc => a
-                            .as_normalized_str()
-                            .trim_start_matches(chantypes)
-                            .cmp(
-                                b.as_normalized_str()
-                                    .trim_start_matches(chantypes),
-                            ),
-                        SortDirection::Desc => b
-                            .as_normalized_str()
-                            .trim_start_matches(chantypes)
-                            .cmp(
-                                a.as_normalized_str()
-                                    .trim_start_matches(chantypes),
-                            ),
-                    }
-                })
-                .map(ToString::to_string)
-                .collect();
-
-            self.set_selecting(input_channel.to_string(), filtered);
-
-            matches!(self, Self::Selecting { .. })
-        } else {
-            false
-        }
-    }
-
-    fn tab(&mut self, reverse: bool) -> Option<Entry> {
-        if let Self::Selecting {
-            prompt,
-            show_picker,
-            highlighted,
-            filtered,
-        } = self
-        {
-            if filtered.is_empty() {
-                return None;
-            }
-
-            *show_picker = true;
-
-            if let Some(index) = highlighted {
-                if reverse {
-                    if *index > 0 {
-                        *index -= 1;
-
-                        return filtered.get(*index).cloned().map(|next| {
-                            Entry::Word {
-                                next,
-                                append_suffix: true,
-                            }
-                        });
-                    }
-
-                    *highlighted = None;
-
-                    return Some(Entry::Word {
-                        next: prompt.clone(),
-                        append_suffix: false,
-                    });
-                }
-
-                if *index < filtered.len() - 1 {
-                    *index += 1;
-
-                    return filtered.get(*index).cloned().map(|next| {
-                        Entry::Word {
-                            next,
-                            append_suffix: true,
-                        }
-                    });
-                }
-
-                *highlighted = None;
-
-                return Some(Entry::Word {
-                    next: prompt.clone(),
-                    append_suffix: false,
-                });
-            }
-
-            let index = if reverse { filtered.len() - 1 } else { 0 };
-            *highlighted = Some(index);
-
-            filtered.get(index).cloned().map(|next| Entry::Word {
-                next,
-                append_suffix: true,
-            })
-        } else {
-            None
-        }
-    }
-
-    fn select(&mut self) -> Option<String> {
-        let index = if let Self::Selecting {
-            highlighted,
-            show_picker: true,
-            ..
-        } = self
-        {
-            highlighted.unwrap_or(0)
-        } else {
-            return None;
-        };
-
-        self.select_at(index)
-    }
-
-    fn select_at(&mut self, index: usize) -> Option<String> {
-        if let Self::Selecting {
-            filtered,
-            show_picker: true,
-            ..
-        } = self
-            && let Some(next) = filtered.get(index).cloned()
-        {
-            *self = Self::Selected;
-
-            return Some(next);
-        }
-
-        None
-    }
-
-    fn cycle(&mut self, reverse: bool) -> bool {
-        if let Self::Selecting {
-            highlighted,
-            filtered,
-            show_picker: true,
-            ..
-        } = self
-        {
-            selecting_tab(highlighted, filtered, reverse);
-
-            true
-        } else {
-            false
-        }
-    }
-
-    fn view<'a, Message: Clone + 'a>(
-        &'a self,
-        on_select_command: impl Fn(usize) -> Message + Copy + 'a,
-    ) -> Option<Element<'a, Message>> {
-        match self {
-            Self::Idle | Self::Selected { .. } => None,
-            Self::Selecting {
-                show_picker: true,
-                highlighted,
-                filtered,
-                ..
-            } if filtered.len() > 1 => {
-                let skip = {
-                    let index = if let Some(index) = highlighted {
-                        *index
-                    } else {
-                        0
-                    };
-
-                    let to = index.max(MAX_SHOWN_WORD_ENTRIES - 1);
-                    to.saturating_sub(MAX_SHOWN_WORD_ENTRIES - 1)
+                    format!("/{} {}", command.title, command.args)
                 };
 
-                let entries = filtered
-                    .iter()
-                    .enumerate()
-                    .skip(skip)
-                    .take(MAX_SHOWN_WORD_ENTRIES)
-                    .collect::<Vec<_>>();
-
-                let content = |width| {
-                    column(entries.iter().map(|(index, word)| {
-                        let selected = Some(*index) == *highlighted;
-
-                        Element::from(
-                            button(text(word.as_str()))
-                                .width(width)
-                                .padding(6)
-                                .style(move |theme, status| {
-                                    theme::button::picker(
-                                        theme, status, selected,
-                                    )
-                                })
-                                .on_press(on_select_command(*index)),
-                        )
-                    }))
-                };
-
-                (!entries.is_empty()).then(|| {
-                    container(double_pass(
-                        content(Length::Shrink),
-                        content(Length::Fill),
-                    ))
-                    .padding(4)
+                Some(
+                    container(
+                        row![
+                            text(usage),
+                            text(command.description)
+                                .style(theme::text::secondary)
+                                .font_maybe(
+                                    theme::font_style::secondary(theme)
+                                        .map(font::get),
+                                ),
+                        ]
+                        .spacing(8)
+                        .align_y(iced::Alignment::Center),
+                    )
+                    .padding(8)
                     .style(theme::container::tooltip)
                     .width(Length::Shrink)
-                    .into()
-                })
+                    .into(),
+                )
             }
-            Self::Selecting { .. } => None,
         }
-    }
-}
-
-fn away_command(max_len: Option<u16>) -> Command {
-    let tooltip = max_len.map(|max_len| format!("maximum length: {max_len}"));
-
-    Command {
-        title: "AWAY".into(),
-        args: vec![Argument {
-            text: "reason".into(),
-            kind: ArgumentKind::Optional { skipped: false },
-            tooltip,
-        }],
-        subcommands: None,
-    }
-}
-
-fn ctcp_action_command() -> Command {
-    Command {
-        title: "CTCP ACTION".into(),
-        args: vec![Argument {
-            text: "text".into(),
-            kind: ArgumentKind::Required,
-            tooltip: Some(String::from(
-                "message to display as a third-person action or emote",
-            )),
-        }],
-        subcommands: None,
-    }
-}
-
-fn ctcp_clientinfo_command() -> Command {
-    Command {
-        title: "CTCP CLIENTINFO".into(),
-        args: vec![],
-        subcommands: None,
-    }
-}
-
-fn ctcp_userinfo_command() -> Command {
-    Command {
-        title: "CTCP USERINFO".into(),
-        args: vec![],
-        subcommands: None,
-    }
-}
-
-fn ctcp_ping_command() -> Command {
-    Command {
-        title: "CTCP PING".into(),
-        args: vec![Argument {
-            text: "info".into(),
-            kind: ArgumentKind::Required,
-            tooltip: Some(String::from(
-                "text that should be exactly reproduced in the reply PING",
-            )),
-        }],
-        subcommands: None,
-    }
-}
-
-fn ctcp_source_command() -> Command {
-    Command {
-        title: "CTCP SOURCE".into(),
-        args: vec![],
-        subcommands: None,
-    }
-}
-
-fn ctcp_time_command() -> Command {
-    Command {
-        title: "CTCP TIME".into(),
-        args: vec![],
-        subcommands: None,
-    }
-}
-
-fn ctcp_version_command() -> Command {
-    Command {
-        title: "CTCP VERSION".into(),
-        args: vec![],
-        subcommands: None,
-    }
-}
-
-fn chathistory_command(maximum_limit: Option<u16>) -> Command {
-    Command {
-        title: "CHATHISTORY".into(),
-        args: vec![Argument {
-            text: "subcommand".into(),
-            kind: ArgumentKind::Required,
-            tooltip: Some(String::from(
-                " BEFORE: Request messages before a timestamp or msgid\
-               \n  AFTER: Request after before a timestamp or msgid\
-               \n LATEST: Request most recent messages that have been sent\
-               \n AROUND: Request messages before or after a timestamp or msgid\
-               \nBETWEEN: Request messages between a timestamp or msgid and another timestamp or msgid\
-               \nTARGETS: List channels with visible history and users that have sent direct messages",
-            )),
-        }],
-        subcommands: Some(vec![
-            chathistory_after_command(maximum_limit),
-            chathistory_around_command(maximum_limit),
-            chathistory_before_command(maximum_limit),
-            chathistory_between_command(maximum_limit),
-            chathistory_latest_command(maximum_limit),
-            chathistory_targets_command(maximum_limit),
-        ]),
-    }
-}
-
-fn chathistory_after_command(maximum_limit: Option<u16>) -> Command {
-    let limit_tooltip = maximum_limit.map(|maximum_limit| {
-        if maximum_limit == 1 {
-            String::from("up to 1 message")
-        } else {
-            format!("up to {maximum_limit} messages")
-        }
-    });
-
-    Command {
-        title: "CHATHISTORY AFTER".into(),
-        args: vec![
-            Argument {
-                text: "target".into(),
-                kind: ArgumentKind::Required,
-                tooltip: None,
-            },
-            Argument {
-                text: "timestamp | msgid".into(),
-                kind: ArgumentKind::Required,
-                tooltip: Some(String::from(
-                    "timestamp format: timestamp=YYYY-MM-DDThh:mm:ss.sssZ",
-                )),
-            },
-            Argument {
-                text: "limit".into(),
-                kind: ArgumentKind::Required,
-                tooltip: limit_tooltip,
-            },
-        ],
-        subcommands: None,
-    }
-}
-
-fn chathistory_around_command(maximum_limit: Option<u16>) -> Command {
-    let limit_tooltip = maximum_limit.map(|maximum_limit| {
-        if maximum_limit == 1 {
-            String::from("up to 1 message")
-        } else {
-            format!("up to {maximum_limit} messages")
-        }
-    });
-
-    Command {
-        title: "CHATHISTORY AROUND".into(),
-        args: vec![
-            Argument {
-                text: "target".into(),
-                kind: ArgumentKind::Required,
-                tooltip: None,
-            },
-            Argument {
-                text: "timestamp | msgid".into(),
-                kind: ArgumentKind::Required,
-                tooltip: Some(String::from(
-                    "timestamp format: timestamp=YYYY-MM-DDThh:mm:ss.sssZ",
-                )),
-            },
-            Argument {
-                text: "limit".into(),
-                kind: ArgumentKind::Required,
-                tooltip: limit_tooltip,
-            },
-        ],
-        subcommands: None,
-    }
-}
-
-fn chathistory_before_command(maximum_limit: Option<u16>) -> Command {
-    let limit_tooltip = maximum_limit.map(|maximum_limit| {
-        if maximum_limit == 1 {
-            String::from("up to 1 message")
-        } else {
-            format!("up to {maximum_limit} messages")
-        }
-    });
-
-    Command {
-        title: "CHATHISTORY BEFORE".into(),
-        args: vec![
-            Argument {
-                text: "target".into(),
-                kind: ArgumentKind::Required,
-                tooltip: None,
-            },
-            Argument {
-                text: "timestamp | msgid".into(),
-                kind: ArgumentKind::Required,
-                tooltip: Some(String::from(
-                    "timestamp format: timestamp=YYYY-MM-DDThh:mm:ss.sssZ",
-                )),
-            },
-            Argument {
-                text: "limit".into(),
-                kind: ArgumentKind::Required,
-                tooltip: limit_tooltip,
-            },
-        ],
-        subcommands: None,
-    }
-}
-
-fn chathistory_between_command(maximum_limit: Option<u16>) -> Command {
-    let limit_tooltip = maximum_limit.map(|maximum_limit| {
-        if maximum_limit == 1 {
-            String::from("up to 1 message")
-        } else {
-            format!("up to {maximum_limit} messages")
-        }
-    });
-
-    Command {
-        title: "CHATHISTORY BETWEEN".into(),
-        args: vec![
-            Argument {
-                text: "target".into(),
-                kind: ArgumentKind::Required,
-                tooltip: None,
-            },
-            Argument {
-                text: "timestamp | msgid".into(),
-                kind: ArgumentKind::Required,
-                tooltip: Some(String::from(
-                    "timestamp format: timestamp=YYYY-MM-DDThh:mm:ss.sssZ",
-                )),
-            },
-            Argument {
-                text: "timestamp | msgid".into(),
-                kind: ArgumentKind::Required,
-                tooltip: Some(String::from(
-                    "timestamp format: timestamp=YYYY-MM-DDThh:mm:ss.sssZ",
-                )),
-            },
-            Argument {
-                text: "limit".into(),
-                kind: ArgumentKind::Required,
-                tooltip: limit_tooltip,
-            },
-        ],
-        subcommands: None,
-    }
-}
-
-fn chathistory_latest_command(maximum_limit: Option<u16>) -> Command {
-    let limit_tooltip = maximum_limit.map(|maximum_limit| {
-        if maximum_limit == 1 {
-            String::from("up to 1 message")
-        } else {
-            format!("up to {maximum_limit} messages")
-        }
-    });
-
-    Command {
-        title: "CHATHISTORY LATEST".into(),
-        args: vec![
-            Argument {
-                text: "target".into(),
-                kind: ArgumentKind::Required,
-                tooltip: None,
-            },
-            Argument {
-                text: "* | timestamp | msgid".into(),
-                kind: ArgumentKind::Required,
-                tooltip: Some(String::from(
-                    "               *: no restriction on returned messages\
-                   \ntimestamp format: timestamp=YYYY-MM-DDThh:mm:ss.sssZ",
-                )),
-            },
-            Argument {
-                text: "limit".into(),
-                kind: ArgumentKind::Required,
-                tooltip: limit_tooltip,
-            },
-        ],
-        subcommands: None,
-    }
-}
-
-fn chathistory_targets_command(maximum_limit: Option<u16>) -> Command {
-    let limit_tooltip = maximum_limit.map(|maximum_limit| {
-        if maximum_limit == 1 {
-            String::from("up to 1 target")
-        } else {
-            format!("up to {maximum_limit} targets")
-        }
-    });
-
-    Command {
-        title: "CHATHISTORY TARGETS".into(),
-        args: vec![
-            Argument {
-                text: "timestamp".into(),
-                kind: ArgumentKind::Required,
-                tooltip: Some(String::from(
-                    "timestamp format: timestamp=YYYY-MM-DDThh:mm:ss.sssZ",
-                )),
-            },
-            Argument {
-                text: "timestamp".into(),
-                kind: ArgumentKind::Required,
-                tooltip: Some(String::from(
-                    "timestamp format: timestamp=YYYY-MM-DDThh:mm:ss.sssZ",
-                )),
-            },
-            Argument {
-                text: "limit".into(),
-                kind: ArgumentKind::Required,
-                tooltip: limit_tooltip,
-            },
-        ],
-        subcommands: None,
-    }
-}
-
-fn detach_command(
-    default: Option<String>,
-    channel_len: Option<u16>,
-) -> Command {
-    let mut channels_tooltip = String::from("comma-separated");
-
-    if let Some(channel_len) = channel_len {
-        channels_tooltip.push_str(
-            format!("\nmaximum length of each: {channel_len}").as_str(),
-        );
-    }
-
-    if let Some(default) = &default {
-        channels_tooltip.push_str(
-            format!("\nmay be skipped (default: {default})").as_str(),
-        );
-    }
-
-    Command {
-        title: "DETACH".into(),
-        args: vec![Argument {
-            text: "channels".into(),
-            kind: if default.is_some() {
-                ArgumentKind::Optional { skipped: false }
-            } else {
-                ArgumentKind::Required
-            },
-            tooltip: Some(channels_tooltip),
-        }],
-        subcommands: None,
-    }
-}
-
-fn invite_command(default: Option<String>) -> Command {
-    Command {
-        title: "INVITE".into(),
-        args: vec![
-            Argument {
-                text: "nickname".into(),
-                kind: ArgumentKind::Required,
-                tooltip: None,
-            },
-            Argument {
-                text: "channel".into(),
-                kind: if default.is_some() {
-                    ArgumentKind::Optional { skipped: false }
-                } else {
-                    ArgumentKind::Required
-                },
-                tooltip: default.map(|default| {
-                    format!("may be omitted (default: {default})")
-                }),
-            },
-        ],
-        subcommands: None,
-    }
-}
-
-fn join_command(
-    default: Option<String>,
-    channel_len: Option<u16>,
-    channel_limits: Option<&Vec<isupport::ChannelLimit>>,
-    key_len: Option<u16>,
-) -> Command {
-    let mut channels_tooltip = String::from("comma-separated");
-
-    if let Some(channel_len) = channel_len {
-        channels_tooltip.push_str(
-            format!("\nmaximum length of each: {channel_len}").as_str(),
-        );
-    }
-
-    if let Some(default) = &default {
-        channels_tooltip.push_str(
-            format!("\nmay be skipped (default: {default})").as_str(),
-        );
-    }
-
-    if let Some(channel_limits) = channel_limits {
-        channel_limits.iter().for_each(|channel_limit| {
-            if let Some(limit) = channel_limit.limit {
-                channels_tooltip.push_str(
-                    format!(
-                        "\nup to {limit} {} channels per client",
-                        channel_limit.prefix
-                    )
-                    .as_str(),
-                );
-            } else {
-                channels_tooltip.push_str(
-                    format!(
-                        "\nunlimited {} channels per client",
-                        channel_limit.prefix
-                    )
-                    .as_str(),
-                );
-            }
-        });
-    }
-
-    let mut keys_tooltip = String::from("comma-separated");
-
-    if let Some(key_len) = key_len {
-        keys_tooltip
-            .push_str(format!("\nmaximum length of each: {key_len}").as_str());
-    }
-
-    Command {
-        title: "JOIN".into(),
-        args: vec![
-            Argument {
-                text: "channels".into(),
-                kind: if default.is_some() {
-                    ArgumentKind::Optional { skipped: false }
-                } else {
-                    ArgumentKind::Required
-                },
-                tooltip: Some(channels_tooltip),
-            },
-            Argument {
-                text: "keys".into(),
-                kind: ArgumentKind::Optional { skipped: false },
-                tooltip: Some(keys_tooltip),
-            },
-        ],
-        subcommands: None,
-    }
-}
-
-fn kick_command(
-    default: Option<String>,
-    target_limit: Option<u16>,
-    max_len: Option<u16>,
-) -> Command {
-    let mut users_tooltip = String::from("comma-separated");
-
-    if let Some(target_limit) = target_limit {
-        users_tooltip.push_str(format!("\nup to {target_limit} user").as_str());
-        if target_limit != 1 {
-            users_tooltip.push('s');
-        }
-    }
-
-    let comment_tooltip =
-        max_len.map(|max_len| format!("maximum length: {max_len}"));
-
-    Command {
-        title: "KICK".into(),
-        args: vec![
-            Argument {
-                text: "channel".into(),
-                kind: if default.is_some() {
-                    ArgumentKind::Optional { skipped: false }
-                } else {
-                    ArgumentKind::Required
-                },
-                tooltip: default.map(|default| {
-                    format!("may be skipped (default: {default})")
-                }),
-            },
-            Argument {
-                text: "users".into(),
-                kind: ArgumentKind::Required,
-                tooltip: Some(users_tooltip),
-            },
-            Argument {
-                text: "comment".into(),
-                kind: ArgumentKind::Optional { skipped: false },
-                tooltip: comment_tooltip,
-            },
-        ],
-        subcommands: None,
-    }
-}
-
-fn monitor_command(target_limit: Option<u16>) -> Command {
-    Command {
-        title: "MONITOR".into(),
-        args: vec![Argument {
-            text: "subcommand".into(),
-            kind: ArgumentKind::Required,
-            tooltip: Some(String::from(
-                "+: Add user(s) to list being monitored\n\
-                 -: Remove user(s) from list being monitored\n\
-                 C: Clear the list of users being monitored\n\
-                 L: Get list of users being monitored\n\
-                 S: For each user in the list being monitored, get their current status",
-            )),
-        }],
-        subcommands: Some(vec![
-            monitor_add_command(target_limit),
-            MONITOR_REMOVE_COMMAND.clone(),
-            MONITOR_CLEAR_COMMAND.clone(),
-            MONITOR_LIST_COMMAND.clone(),
-            MONITOR_STATUS_COMMAND.clone(),
-        ]),
-    }
-}
-
-fn monitor_add_command(target_limit: Option<u16>) -> Command {
-    let mut targets_tooltip = String::from("comma-separated users");
-
-    if let Some(target_limit) = target_limit {
-        targets_tooltip
-            .push_str(format!("\nup to {target_limit} target").as_str());
-        if target_limit != 1 {
-            targets_tooltip.push('s');
-        }
-        targets_tooltip.push_str(" in total");
-    }
-
-    Command {
-        title: "MONITOR +".into(),
-        args: vec![Argument {
-            text: "targets".into(),
-            kind: ArgumentKind::Required,
-            tooltip: Some(targets_tooltip),
-        }],
-        subcommands: None,
-    }
-}
-
-static MONITOR_REMOVE_COMMAND: LazyLock<Command> = LazyLock::new(|| Command {
-    title: "MONITOR -".into(),
-    args: vec![Argument {
-        text: "targets".into(),
-        kind: ArgumentKind::Required,
-        tooltip: Some(String::from("comma-separated")),
-    }],
-    subcommands: None,
-});
-
-static MONITOR_CLEAR_COMMAND: LazyLock<Command> = LazyLock::new(|| Command {
-    title: "MONITOR C".into(),
-    args: vec![],
-    subcommands: None,
-});
-
-static MONITOR_LIST_COMMAND: LazyLock<Command> = LazyLock::new(|| Command {
-    title: "MONITOR L".into(),
-    args: vec![],
-    subcommands: None,
-});
-
-static MONITOR_STATUS_COMMAND: LazyLock<Command> = LazyLock::new(|| Command {
-    title: "MONITOR S".into(),
-    args: vec![],
-    subcommands: None,
-});
-
-fn mode_channel_command(
-    chanmodes: &[isupport::ModeKind],
-    prefix: &[isupport::PrefixMap],
-    mode_limit: Option<u16>,
-) -> Command {
-    let mut modestring_tooltip = String::new();
-
-    let mut unknown_modes = String::new();
-
-    for chanmode in chanmodes.iter() {
-        if !chanmode.modes.is_empty() {
-            if !modestring_tooltip.is_empty() {
-                modestring_tooltip.push('\n');
-            }
-
-            modestring_tooltip +=
-                &format!("Type {} Modes ({chanmode})", chanmode.kind);
-
-            for mode in chanmode.modes.chars() {
-                let channel_mode = mode::Channel::from(mode);
-
-                match channel_mode {
-                    mode::Channel::Unknown(_) => unknown_modes.push(mode),
-                    _ => {
-                        modestring_tooltip +=
-                            &format!("\n  {mode}: {channel_mode}");
-                    }
-                }
-            }
-
-            if let Some(unknown_mode) = unknown_modes.chars().next() {
-                let unknown_mode = mode::Channel::from(unknown_mode);
-
-                modestring_tooltip +=
-                    &format!("\n  {unknown_modes}: {unknown_mode}");
-                if unknown_modes.len() > 1 {
-                    modestring_tooltip.push('s');
-                }
-            }
-
-            unknown_modes.clear();
-        }
-    }
-
-    if !prefix.is_empty() {
-        if !modestring_tooltip.is_empty() {
-            modestring_tooltip.push('\n');
-        }
-
-        modestring_tooltip +=
-            "Membership Modes (requires nickname as argument)";
-    }
-
-    for prefix_map in prefix.iter() {
-        modestring_tooltip += &format!(
-            "\n  {}: {} ({})",
-            prefix_map.mode,
-            mode::Channel::from(prefix_map.prefix),
-            prefix_map.prefix
-        );
-    }
-
-    if !modestring_tooltip.is_empty() {
-        modestring_tooltip += "\nmode descriptions are standard and/or well-used meanings, and may be inaccurate\n";
-    }
-
-    if let Some(mode_limit) = mode_limit {
-        modestring_tooltip
-            .push_str(format!("up to {mode_limit} channel mode").as_str());
-        if mode_limit != 1 {
-            modestring_tooltip.push('s');
-        }
-    } else {
-        modestring_tooltip.push_str("unlimited channel modes");
-    }
-
-    Command {
-        title: concatcp!(
-            "MODE ",
-            REQUIRED_ARG_PREFIX,
-            "channel",
-            REQUIRED_ARG_SUFFIX
-        )
-        .into(),
-        args: vec![
-            Argument {
-                text: "modestring".into(),
-                kind: ArgumentKind::Optional { skipped: false },
-                tooltip: Some(modestring_tooltip),
-            },
-            Argument {
-                text: "arguments".into(),
-                kind: ArgumentKind::Optional { skipped: false },
-                tooltip: None,
-            },
-        ],
-        subcommands: None,
-    }
-}
-
-fn mode_user_command(mode_limit: Option<u16>) -> Command {
-    let mut modestring_tooltip = String::new();
-
-    if let Some(mode_limit) = mode_limit {
-        modestring_tooltip
-            .push_str(format!("up to {mode_limit} user mode").as_str());
-        if mode_limit != 1 {
-            modestring_tooltip.push('s');
-        }
-    } else {
-        modestring_tooltip.push_str("unlimited user modes");
-    }
-
-    Command {
-        title: concatcp!(
-            "MODE ",
-            REQUIRED_ARG_PREFIX,
-            "user",
-            REQUIRED_ARG_SUFFIX
-        )
-        .into(),
-        args: vec![Argument {
-            text: "modestring".into(),
-            kind: ArgumentKind::Optional { skipped: false },
-            tooltip: Some(modestring_tooltip),
-        }],
-        subcommands: None,
-    }
-}
-
-fn msg_command(
-    formatting: Formatting,
-    channel_membership_prefixes: &[char],
-    target_limit: Option<u16>,
-) -> Command {
-    let mut targets_tooltip = String::from(
-        "comma-separated\n    {user}: user directly\n {channel}: all users in channel",
-    );
-
-    for channel_membership_prefix in channel_membership_prefixes {
-        match *channel_membership_prefix {
-            proto::FOUNDER_PREFIX => targets_tooltip
-                .push_str("\n~{channel}: all founders in channel"),
-            proto::PROTECTED_PREFIX_STD | proto::PROTECTED_PREFIX_ALT => targets_tooltip
-                .push_str("\n{channel_membership_prefix}{channel}: all protected users in channel"),
-            proto::OPERATOR_PREFIX => targets_tooltip
-                .push_str("\n@{channel}: all operators in channel"),
-            proto::HALF_OPERATOR_PREFIX => targets_tooltip
-                .push_str("\n%{channel}: all half-operators in channel"),
-            proto::VOICED_PREFIX => targets_tooltip
-                .push_str("\n+{channel}: all voiced users in channel"),
-            _ => (),
-        }
-    }
-
-    if let Some(target_limit) = target_limit {
-        targets_tooltip
-            .push_str(format!("\nup to {target_limit} target").as_str());
-        if target_limit != 1 {
-            targets_tooltip.push('s');
-        }
-    }
-
-    Command {
-        title: match formatting {
-            Formatting::Default => "MSG".into(),
-            Formatting::Format => "FORMAT-MSG".into(),
-            Formatting::Plain => "PLAIN-MSG".into(),
-        },
-        args: vec![
-            Argument {
-                text: "targets".into(),
-                kind: ArgumentKind::Required,
-                tooltip: Some(targets_tooltip),
-            },
-            Argument {
-                text: "text".into(),
-                kind: ArgumentKind::Optional { skipped: false },
-                tooltip: matches!(formatting, Formatting::Format).then_some(
-                    include_str!("./format_tooltip.txt").trim_end().to_string(),
-                ),
-            },
-        ],
-        subcommands: None,
-    }
-}
-
-fn names_command(target_limit: Option<u16>) -> Command {
-    let mut channels_tooltip = String::from("comma-separated");
-
-    if let Some(target_limit) = target_limit {
-        channels_tooltip
-            .push_str(format!("\nup to {target_limit} channel").as_str());
-
-        if target_limit != 1 {
-            channels_tooltip.push('s');
-        }
-    }
-
-    Command {
-        title: "NAMES".into(),
-        args: vec![Argument {
-            text: "channels".into(),
-            kind: ArgumentKind::Required,
-            tooltip: Some(channels_tooltip),
-        }],
-        subcommands: None,
-    }
-}
-
-fn nick_command(max_len: Option<u16>) -> Command {
-    let tooltip = max_len.map(|max_len| format!("maximum length: {max_len}"));
-
-    Command {
-        title: "NICK".into(),
-        args: vec![Argument {
-            text: "nickname".into(),
-            kind: ArgumentKind::Required,
-            tooltip,
-        }],
-        subcommands: None,
-    }
-}
-
-fn notice_command(
-    formatting: Formatting,
-    channel_membership_prefixes: &[char],
-    target_limit: Option<u16>,
-) -> Command {
-    let mut targets_tooltip = String::from(
-        "comma-separated\n    {user}: user directly\n {channel}: all users in channel",
-    );
-
-    for channel_membership_prefix in channel_membership_prefixes {
-        match *channel_membership_prefix {
-            proto::FOUNDER_PREFIX => targets_tooltip
-                .push_str("\n~{channel}: all founders in channel"),
-            proto::PROTECTED_PREFIX_STD | proto::PROTECTED_PREFIX_ALT => targets_tooltip
-                .push_str("\n{channel_membership_prefix}{channel}: all protected users in channel"),
-            proto::OPERATOR_PREFIX => targets_tooltip
-                .push_str("\n@{channel}: all operators in channel"),
-            proto::HALF_OPERATOR_PREFIX => targets_tooltip
-                .push_str("\n%{channel}: all half-operators in channel"),
-            proto::VOICED_PREFIX => targets_tooltip
-                .push_str("\n+{channel}: all voiced users in channel"),
-            _ => (),
-        }
-    }
-
-    if let Some(target_limit) = target_limit {
-        targets_tooltip
-            .push_str(format!("\nup to {target_limit} target").as_str());
-        if target_limit != 1 {
-            targets_tooltip.push('s');
-        }
-    }
-
-    Command {
-        title: match formatting {
-            Formatting::Default => "NOTICE".into(),
-            Formatting::Format => "FORMAT-NOTICE".into(),
-            Formatting::Plain => "PLAIN-NOTICE".into(),
-        },
-        args: vec![
-            Argument {
-                text: "targets".into(),
-                kind: ArgumentKind::Required,
-                tooltip: Some(targets_tooltip),
-            },
-            Argument {
-                text: "text".into(),
-                kind: ArgumentKind::Optional { skipped: false },
-                tooltip: matches!(formatting, Formatting::Format).then_some(
-                    include_str!("./format_tooltip.txt").trim_end().to_string(),
-                ),
-            },
-        ],
-        subcommands: None,
-    }
-}
-
-fn part_command(default: Option<String>, max_len: Option<u16>) -> Command {
-    let mut targets_tooltip =
-        String::from("channels and/or queries, comma-separated");
-
-    if let Some(max_len) = max_len {
-        targets_tooltip.push_str(
-            format!("\nmaximum length of each channel: {max_len}").as_str(),
-        );
-    }
-
-    if let Some(ref default) = default {
-        targets_tooltip.push_str(
-            format!("\nmay be omitted (default: {default})").as_str(),
-        );
-    }
-
-    Command {
-        title: "PART".into(),
-        args: vec![
-            Argument {
-                text: "targets".into(),
-                kind: if default.is_some() {
-                    ArgumentKind::Optional { skipped: false }
-                } else {
-                    ArgumentKind::Required
-                },
-                tooltip: Some(targets_tooltip),
-            },
-            Argument {
-                text: "reason".into(),
-                kind: ArgumentKind::Optional { skipped: false },
-                tooltip: None,
-            },
-        ],
-        subcommands: None,
-    }
-}
-
-fn setname_command(max_len: Option<u16>) -> Command {
-    Command {
-        title: "SETNAME".into(),
-        args: vec![Argument {
-            text: "realname".into(),
-            kind: ArgumentKind::Required,
-            tooltip: max_len
-                .map(|max_len| format!("maximum length: {max_len}")),
-        }],
-        subcommands: None,
-    }
-}
-
-fn topic_command(default: Option<String>, max_len: Option<u16>) -> Command {
-    let mut topic_tooltip =
-        String::from("if omitted then the current topic is requested");
-
-    if let Some(max_len) = max_len {
-        topic_tooltip.push_str(format!("\nmaximum length: {max_len}").as_str());
-    }
-
-    Command {
-        title: "TOPIC".into(),
-        args: vec![
-            Argument {
-                text: "channel".into(),
-                kind: if default.is_some() {
-                    ArgumentKind::Optional { skipped: false }
-                } else {
-                    ArgumentKind::Required
-                },
-                tooltip: default.map(|default| {
-                    format!("may be skipped (default: {default})")
-                }),
-            },
-            Argument {
-                text: "topic".into(),
-                kind: ArgumentKind::Optional { skipped: false },
-                tooltip: Some(topic_tooltip),
-            },
-        ],
-        subcommands: None,
-    }
-}
-
-fn whox_command() -> Command {
-    Command {
-        title: "WHO".into(),
-        args: vec![
-            Argument {
-                text: "target".into(),
-                kind: ArgumentKind::Required,
-                tooltip: None,
-            },
-            Argument {
-                text: "fields".into(),
-                kind: ArgumentKind::Optional { skipped: false },
-                tooltip: Some(String::from(
-                    "t: token\n\
-                     c: channel\n\
-                     u: username\n\
-                     i: IP address\n\
-                     h: hostname\n\
-                     s: server name\n\
-                     n: nickname\n\
-                     f: WHO flags\n\
-                     d: hop count\n\
-                     l: idle seconds\n\
-                     a: account name\n\
-                     o: channel op level\n\
-                     r: realname",
-                )),
-            },
-            Argument {
-                text: "token".into(),
-                kind: ArgumentKind::Optional { skipped: false },
-                tooltip: Some(String::from("1-3 digits")),
-            },
-        ],
-        subcommands: None,
-    }
-}
-
-fn who_command() -> Command {
-    Command {
-        title: "WHO".into(),
-        args: vec![Argument {
-            text: "target".into(),
-            kind: ArgumentKind::Required,
-            tooltip: None,
-        }],
-        subcommands: None,
-    }
-}
-
-fn whois_command(target_limit: Option<u16>) -> Command {
-    let mut nicks_tooltip = String::from("comma-separated");
-
-    let nicks_text = if let Some(target_limit) = target_limit {
-        nicks_tooltip.push_str(format!("\nup to {target_limit} nick").as_str());
-        if target_limit != 1 {
-            nicks_tooltip.push('s');
-            "nicks"
-        } else {
-            "nick"
-        }
-    } else {
-        "nick"
-    };
-
-    Command {
-        title: "WHOIS".into(),
-        args: vec![
-            Argument {
-                text: "server".into(),
-                kind: ArgumentKind::Optional { skipped: false },
-                tooltip: Some(String::from(
-                    "may be skipped (default: the connected server)",
-                )),
-            },
-            Argument {
-                text: nicks_text.into(),
-                kind: ArgumentKind::Required,
-                tooltip: Some(nicks_tooltip),
-            },
-        ],
-        subcommands: None,
     }
 }
 
@@ -3449,17 +529,10 @@ impl Emojis {
         }
     }
 
-    fn tab_candidate_count(&self) -> Option<usize> {
-        match self {
-            Self::Selecting { filtered, .. } => Some(filtered.len()),
-            _ => None,
-        }
-    }
-
     fn view<'a, Message: Clone + 'a>(
         &self,
         config: &Config,
-        on_select_command: impl Fn(usize) -> Message + Copy + 'a,
+        on_select: impl Fn(usize) -> Message + Copy + 'a,
     ) -> Option<Element<'a, Message>> {
         match self {
             Self::Idle | Self::Selected { .. } => None,
@@ -3468,11 +541,7 @@ impl Emojis {
                 filtered,
             } => {
                 let skip = {
-                    let index = if let Some(index) = highlighted {
-                        *index
-                    } else {
-                        0
-                    };
+                    let index = highlighted.unwrap_or(0);
 
                     let to = index.max(MAX_SHOWN_EMOJI_ENTRIES - 1);
                     to.saturating_sub(MAX_SHOWN_EMOJI_ENTRIES - 1)
@@ -3508,7 +577,7 @@ impl Emojis {
                                         theme, status, selected,
                                     )
                                 })
-                                .on_press(on_select_command(*index)),
+                                .on_press(on_select(*index)),
                         )
                     }))
                 };
@@ -3523,197 +592,6 @@ impl Emojis {
                         .width(Length::Shrink)
                         .into()
                 })
-            }
-        }
-    }
-}
-
-#[derive(Debug, Clone, Default)]
-enum Paths {
-    #[default]
-    Idle,
-    Selecting {
-        filtered: Vec<String>,
-        highlighted: Option<usize>,
-    },
-}
-
-impl Paths {
-    fn process(&mut self, input: &str) {
-        use std::path::Path;
-
-        let Some((_, path)) = input.split_once(' ') else {
-            *self = Self::default();
-            return;
-        };
-
-        // Expand leading ~ to user's home directory
-        let expanded = if let Some(rest) =
-            path.strip_prefix("~/").or((path == "~").then_some(""))
-        {
-            dirs_next::home_dir().map_or_else(
-                || path.to_string(),
-                |h| format!("{}/{rest}", h.to_string_lossy()),
-            )
-        } else {
-            path.to_string()
-        };
-
-        // Split into the directory prefix and the filename prefix being type
-        let (dir_prefix, file_prefix) =
-            expanded.rfind('/').map_or(("", expanded.as_str()), |pos| {
-                (&expanded[..=pos], &expanded[pos + 1..])
-            });
-
-        let dir = if dir_prefix.is_empty() {
-            Path::new(".")
-        } else {
-            Path::new(dir_prefix)
-        };
-
-        let Ok(read_dir) = std::fs::read_dir(dir) else {
-            *self = Self::default();
-            return;
-        };
-
-        // Only show hidden entries on leading dot
-        let show_hidden = file_prefix.starts_with('.');
-
-        *self = Self::Selecting {
-            filtered: read_dir
-                .filter_map(std::result::Result::ok)
-                .filter(|e| {
-                    e.file_name().to_str().is_some_and(|name| {
-                        name.starts_with(file_prefix)
-                            && (show_hidden || !name.starts_with('.'))
-                    })
-                })
-                .map(|e| {
-                    let name = e.file_name().to_string_lossy().into_owned();
-                    let trailing = if e.file_type().is_ok_and(|t| t.is_dir()) {
-                        "/"
-                    } else {
-                        ""
-                    };
-                    format!("{dir_prefix}{name}{trailing}")
-                })
-                .sorted()
-                .collect(),
-            highlighted: None,
-        };
-    }
-
-    fn tab(&mut self, reverse: bool) -> Option<Entry> {
-        match self {
-            Self::Idle => None,
-            Self::Selecting {
-                filtered,
-                highlighted,
-                ..
-            } => {
-                if !filtered.is_empty() {
-                    if let Some(index) = highlighted {
-                        if reverse {
-                            if *index > 0 {
-                                *index -= 1;
-                            } else {
-                                *highlighted = None;
-                            }
-                        } else if *index < filtered.len() - 1 {
-                            *index += 1;
-                        } else {
-                            *highlighted = None;
-                        }
-                    } else {
-                        *highlighted =
-                            Some(if reverse { filtered.len() - 1 } else { 0 });
-                    }
-                }
-
-                highlighted
-                    .and_then(|index| filtered.get(index).cloned())
-                    .map(Entry::Path)
-            }
-        }
-    }
-
-    fn tab_candidate_count(&self) -> Option<usize> {
-        match self {
-            Self::Selecting { filtered, .. } => Some(filtered.len()),
-            _ => None,
-        }
-    }
-
-    fn select_at(&mut self, index: usize) -> Option<String> {
-        match self {
-            Self::Idle => None,
-            Self::Selecting {
-                filtered,
-                highlighted,
-                ..
-            } => {
-                let item = filtered.get(index).cloned()?;
-
-                *highlighted = Some(index);
-
-                Some(item)
-            }
-        }
-    }
-
-    fn view<'a, Message: Clone + 'a>(
-        &'a self,
-        on_select: impl Fn(usize) -> Message + Copy + 'a,
-    ) -> Option<Element<'a, Message>> {
-        match self {
-            Self::Idle => None,
-            Self::Selecting {
-                filtered,
-                highlighted,
-                ..
-            } => {
-                let skip = {
-                    let index = highlighted.unwrap_or(0);
-                    let to = index.max(MAX_SHOWN_PATH_ENTRIES - 1);
-                    to.saturating_sub(MAX_SHOWN_PATH_ENTRIES - 1)
-                };
-
-                let entries: Vec<_> = filtered
-                    .iter()
-                    .enumerate()
-                    .skip(skip)
-                    .take(MAX_SHOWN_PATH_ENTRIES)
-                    .collect();
-
-                let content = |width| {
-                    column(entries.iter().map(|(index, path)| {
-                        let highlighted = Some(*index) == *highlighted;
-                        Element::from(
-                            button(text(path.as_str()))
-                                .width(width)
-                                .padding(6)
-                                .style(move |theme, status| {
-                                    theme::button::picker(
-                                        theme,
-                                        status,
-                                        highlighted,
-                                    )
-                                })
-                                .on_press(on_select(*index)),
-                        )
-                    }))
-                };
-
-                Some(
-                    container(double_pass(
-                        content(Length::Shrink),
-                        content(Length::Fill),
-                    ))
-                    .padding(4)
-                    .style(theme::container::tooltip)
-                    .width(Length::Shrink)
-                    .into(),
-                )
             }
         }
     }
@@ -3934,10 +812,4 @@ fn get_word_bounds(
     }
 
     None
-}
-
-enum Formatting {
-    Default,
-    Format,
-    Plain,
 }

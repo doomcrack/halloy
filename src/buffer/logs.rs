@@ -1,8 +1,4 @@
-use chrono::{DateTime, Utc};
-use data::{
-    Config, Image, Preview, Server, client, history, message, metadata,
-    preview, target,
-};
+use data::{Config, history, message};
 use iced::widget::{container, row};
 use iced::{Length, Size, Task};
 
@@ -17,12 +13,8 @@ pub enum Message {
 
 pub enum Event {
     ContextMenu(context_menu::Event),
-    History(Task<history::manager::Message>),
     MarkAsRead,
     OpenUrl(String),
-    ImagePreview(Image),
-    ExpandMessage(DateTime<Utc>, message::Hash),
-    ContractMessage(DateTime<Utc>, message::Hash),
 }
 
 pub fn view<'a>(
@@ -30,18 +22,12 @@ pub fn view<'a>(
     history: &'a history::Manager,
     config: &'a Config,
     theme: &'a Theme,
-    channel_is_focused: impl Fn(&Server, &target::Channel) -> bool + Copy + 'a,
-    channel_is_open: impl Fn(&Server, &target::Channel) -> bool + Copy + 'a,
 ) -> Element<'a, Message> {
     let messages = container(
         scroll_view::view(
             &state.scroll_view,
             scroll_view::Kind::Logs,
             history,
-            None,
-            Option::<fn(&Preview, &message::Source) -> bool>::None,
-            None,
-            0.0,
             config,
             theme,
             move |message: &'a data::Message, _, _, _| match message
@@ -55,18 +41,12 @@ pub fn view<'a>(
                         .buffer
                         .format_timestamp(&message.server_time)
                         .map(|timestamp| {
-                            context_menu::timestamp(
-                                selectable_text(timestamp)
-                                    .style(theme::selectable_text::timestamp)
-                                    .font_maybe(
-                                        theme::font_style::timestamp(theme)
-                                            .map(font::get),
-                                    ),
-                                &message.server_time,
-                                config,
-                                theme,
-                            )
-                            .map(scroll_view::Message::ContextMenu)
+                            selectable_text(timestamp)
+                                .style(theme::selectable_text::timestamp)
+                                .font_maybe(
+                                    theme::font_style::timestamp(theme)
+                                        .map(font::get),
+                                )
                         });
 
                     let log_level_style = move |message_theme: &Theme| {
@@ -74,8 +54,8 @@ pub fn view<'a>(
                     };
                     let log_level = selectable_text(
                         // Infer left or right alignment preference from
-                        // nickname alignment setting
-                        if config.buffer.nickname.alignment.is_right() {
+                        // sender alignment setting
+                        if config.buffer.sender.alignment.is_right() {
                             format!("{level: >5}")
                         } else {
                             format!("{level: <5}")
@@ -106,9 +86,6 @@ pub fn view<'a>(
                 }
                 _ => None,
             },
-            metadata::EMPTY,
-            channel_is_focused,
-            channel_is_open,
         )
         .map(Message::ScrollView),
     )
@@ -137,45 +114,23 @@ impl Logs {
         &mut self,
         message: Message,
         history: &mut history::Manager,
-        clients: &mut client::Map,
-        previews: &preview::Collection,
         config: &Config,
     ) -> (Task<Message>, Option<Event>) {
         match message {
             Message::ScrollView(message) => {
                 let (command, event) = self.scroll_view.update(
                     message,
-                    false,
                     scroll_view::Kind::Logs,
-                    None,
                     history,
-                    clients,
-                    previews,
                     config,
                 );
 
-                let event = event.and_then(|event| match event {
+                let event = event.map(|event| match event {
                     scroll_view::Event::ContextMenu(event) => {
-                        Some(Event::ContextMenu(event))
+                        Event::ContextMenu(event)
                     }
-                    scroll_view::Event::OpenBuffer(_, _, _) => None,
-                    scroll_view::Event::GoToMessage(..) => None,
-                    scroll_view::Event::RequestOlderChatHistory => None,
-                    scroll_view::Event::PreviewChanged => None,
-                    scroll_view::Event::HidePreview(..) => None,
-                    scroll_view::Event::MarkAsRead => Some(Event::MarkAsRead),
-                    scroll_view::Event::OpenUrl(url) => {
-                        Some(Event::OpenUrl(url))
-                    }
-                    scroll_view::Event::ImagePreview(image) => {
-                        Some(Event::ImagePreview(image))
-                    }
-                    scroll_view::Event::ExpandMessage(server_time, hash) => {
-                        Some(Event::ExpandMessage(server_time, hash))
-                    }
-                    scroll_view::Event::ContractMessage(server_time, hash) => {
-                        Some(Event::ContractMessage(server_time, hash))
-                    }
+                    scroll_view::Event::MarkAsRead => Event::MarkAsRead,
+                    scroll_view::Event::OpenUrl(url) => Event::OpenUrl(url),
                 });
 
                 (command.map(Message::ScrollView), event)

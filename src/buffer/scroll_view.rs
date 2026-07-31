@@ -1,24 +1,15 @@
-use std::borrow::Cow;
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 use std::time::Duration;
 
 use chrono::{DateTime, Local, NaiveDate, Utc};
 use data::buffer::RightAlignmentWidths;
-use data::command::Irc;
-use data::config::actions::{ImageClickAction, NicknameClickAction};
-use data::config::buffer::{CondensationIcon, HideConsecutiveEnabled};
-use data::dashboard::BufferAction;
-use data::isupport::ChatHistoryState;
-use data::message::{self, Limit};
-use data::preview::{self, Previews};
-use data::rate_limit::TokenPriority;
-use data::reaction::Reaction;
-use data::server::Server;
-use data::target::{self, Target};
-use data::{Config, Image, Preview, client, history, metadata, reaction};
+use data::config::buffer::HideConsecutiveEnabled;
+use data::conversation::ConvoId;
+use data::message::{self, Limit, Source};
+use data::{Config, history};
 use iced::widget::{
-    self, Scrollable, button, column, container, row, rule, scrollable, sensor,
-    space, text,
+    self, Scrollable, column, container, row, rule, scrollable, sensor, space,
+    text,
 };
 use iced::{Length, Size, Task, padding};
 use tokio::time;
@@ -26,9 +17,9 @@ use tokio::time;
 use self::correct_viewport::correct_viewport;
 use self::keyed::keyed;
 use super::context_menu;
-use crate::widget::user_display::UserDisplay;
-use crate::widget::{Element, notify_visibility};
-use crate::{Theme, buffer, font, theme};
+use crate::widget::Element;
+use crate::widget::message_content::Link;
+use crate::{Theme, font, theme};
 
 const SCROLL_TO_TIMEOUT: Duration = Duration::from_millis(200);
 /// Pages of off-screen messages to keep rendered above and below the viewport
@@ -36,7 +27,6 @@ const BUFFER_PAGES: usize = 3;
 
 const HIGHLIGHT_HOLD_MS: u64 = 2000;
 const HIGHLIGHT_ALPHA_START: f32 = 1.0;
-const HOVER_HIGHLIGHT_ALPHA: f32 = 0.4;
 const HIGHLIGHT_ALPHA_TICK_MS: u64 = 20;
 const HIGHLIGHT_ALPHA_STEP: f32 =
     HIGHLIGHT_ALPHA_START / (400.0 / HIGHLIGHT_ALPHA_TICK_MS as f32);
@@ -52,32 +42,13 @@ pub enum Message {
         viewport: scrollable::Viewport,
     },
     ContextMenu(context_menu::Message),
-    Link(message::Link),
-    ImagePreview(Image),
+    Link(Link),
     ScrollTo(keyed::Hit),
-    RequestOlderChatHistory,
-    EnteringViewport(message::Hash, Vec<url::Url>),
-    ExitingViewport(message::Hash),
-    ReplyPreviewHovered(message::Hash, message::Hash, Vec<url::Url>),
-    ReplyPreviewUnhovered(message::Hash),
-    EnteredViewport(message::Hash),
-    ExitedViewport(message::Hash),
-    PreviewHovered(message::Hash, usize),
-    PreviewUnhovered(message::Hash, usize),
-    HidePreview(message::Hash, url::Url),
     MarkAsRead,
     ContentResized(Size),
     PendingScrollTo,
     FadeHighlight(message::Hash, u64),
     HeightsCollected(Vec<(keyed::Key, f32)>),
-    Reacted {
-        msgid: message::Id,
-        text: Cow<'static, str>,
-    },
-    Unreacted {
-        msgid: message::Id,
-        text: Cow<'static, str>,
-    },
 }
 
 impl From<context_menu::Message> for Message {
@@ -89,76 +60,42 @@ impl From<context_menu::Message> for Message {
 #[derive(Debug, Clone)]
 pub enum Event {
     ContextMenu(context_menu::Event),
-    OpenBuffer(Server, Target, BufferAction),
-    GoToMessage(Server, target::Channel, message::Hash, BufferAction),
-    RequestOlderChatHistory,
-    PreviewChanged,
-    HidePreview(history::Kind, message::Hash, url::Url),
     MarkAsRead,
     OpenUrl(String),
-    ImagePreview(Image),
-    ExpandMessage(DateTime<Utc>, message::Hash),
-    ContractMessage(DateTime<Utc>, message::Hash),
 }
 
 #[derive(Debug, Clone, Copy)]
 pub enum Kind<'a> {
-    Server(&'a Server),
-    Channel(&'a Server, &'a target::Channel),
-    Query(&'a Server, &'a target::Query),
+    Conversation(&'a ConvoId),
     Logs,
-    Highlights,
-    ChannelMonitor,
-}
-
-impl Kind<'_> {
-    fn server(&self) -> Option<&Server> {
-        match self {
-            Kind::Server(server)
-            | Kind::Channel(server, _)
-            | Kind::Query(server, _) => Some(server),
-            Kind::Logs | Kind::Highlights | Kind::ChannelMonitor => None,
-        }
-    }
 }
 
 impl From<Kind<'_>> for history::Kind {
     fn from(value: Kind<'_>) -> Self {
         match value {
-            Kind::Server(server) => history::Kind::Server(server.clone()),
-            Kind::Channel(server, channel) => {
-                history::Kind::Channel(server.clone(), channel.clone())
-            }
-            Kind::Query(server, nick) => {
-                history::Kind::Query(server.clone(), nick.clone())
+            Kind::Conversation(convo_id) => {
+                history::Kind::Conversation(convo_id.clone())
             }
             Kind::Logs => history::Kind::Logs,
-            Kind::Highlights => history::Kind::Highlights,
-            Kind::ChannelMonitor => history::Kind::ChannelMonitor,
         }
     }
 }
 
 pub trait LayoutMessage<'a> {
-    fn should_track_reply_target_visibility(&self) -> bool {
-        false
-    }
-
     fn format(
         &self,
         message: &'a data::Message,
         right_alignment_widths: Option<RightAlignmentWidths>,
         hide_timestamp: bool,
-        hide_nickname: bool,
-        visible_for_source: Option<
-            &impl Fn(&Preview, &message::Source) -> bool,
-        >,
-        visible_url_messages: &HashMap<message::Hash, Vec<url::Url>>,
-        hovered_preview: Option<(message::Hash, usize)>,
-        hovered_reply: Option<message::Hash>,
-        channel_is_focused: impl Fn(&Server, &target::Channel) -> bool + Copy + 'a,
-        channel_is_open: impl Fn(&Server, &target::Channel) -> bool + Copy + 'a,
+        hide_sender: bool,
     ) -> Option<Element<'a, Message>>;
+
+    /// Whether the layout names a sender only at the head of a run of
+    /// theirs whatever `hide_consecutive` is set to. A conversation
+    /// thread does (QML `sameSenderAsPrevious`), the log does not.
+    fn collapses_sender_runs(&self) -> bool {
+        false
+    }
 }
 
 impl<'a, T> LayoutMessage<'a> for T
@@ -175,109 +112,80 @@ where
         message: &'a data::Message,
         right_alignment_widths: Option<RightAlignmentWidths>,
         hide_timestamp: bool,
-        hide_nickname: bool,
-        _visible_for_source: Option<
-            &impl Fn(&Preview, &message::Source) -> bool,
-        >,
-        _visible_url_messages: &HashMap<message::Hash, Vec<url::Url>>,
-        _hovered_preview: Option<(message::Hash, usize)>,
-        _hovered_reply: Option<message::Hash>,
-        _channel_is_focused: impl Fn(&Server, &target::Channel) -> bool + Copy + 'a,
-        _channel_is_open: impl Fn(&Server, &target::Channel) -> bool + Copy + 'a,
+        hide_sender: bool,
     ) -> Option<Element<'a, Message>> {
-        self(
-            message,
-            right_alignment_widths,
-            hide_timestamp,
-            hide_nickname,
-        )
+        self(message, right_alignment_widths, hide_timestamp, hide_sender)
     }
 }
 
-/// Check if a message has a visible image preview
-fn has_visible_preview(
-    message: &data::Message,
-    state: &State,
-    previews: Option<Previews>,
-    visible_for_source: &Option<impl Fn(&Preview, &message::Source) -> bool>,
-) -> bool {
-    if let message::Content::Fragments(fragments) = &message.content
-        && let Some(previews) = previews
-        && let Some(visible_urls) =
-            state.visible_url_messages.get(&message.hash)
-    {
-        return fragments.iter().filter_map(message::Fragment::url).any(
-            |url| {
-                // Check if URL is hidden by user
-                if message.hidden_urls.contains(url) {
-                    return false;
-                }
-
-                // Check if URL is in visible URLs list
-                if !visible_urls.contains(url) {
-                    return false;
-                }
-
-                // Check if preview is loaded and visible for source
-                if let Some(preview::State::Loaded(preview)) = previews.get(url)
-                {
-                    let is_visible_for_source =
-                        if let Some(visible_for_source) = visible_for_source {
-                            visible_for_source(preview, message.target.source())
-                        } else {
-                            true
-                        };
-
-                    return is_visible_for_source;
-                }
-
-                false
-            },
-        );
-    }
-    false
-}
-
-fn is_consecutive_user_message(
+/// Consecutive-sender detection: same [`Source`] (Peer with equal address,
+/// or Yourself) within the optional duration window.
+fn is_consecutive_message(
     message: &data::Message,
     prev_message: Option<&data::Message>,
     duration: Option<chrono::TimeDelta>,
-    config: &Config,
 ) -> bool {
-    matches!(message.target.source(), message::Source::User(_))
+    matches!(message.target.source(), Source::Peer(_) | Source::Yourself)
         && prev_message.is_some_and(|prev_message| {
-            if duration.is_none_or(|duration| {
+            duration.is_none_or(|duration| {
                 message.server_time - prev_message.server_time < duration
-            }) && message.is_rerouted() == prev_message.is_rerouted()
-                && let message::Source::User(user) = message.target.source()
-                && let message::Source::User(prev_user) =
-                    prev_message.target.source()
-            {
-                user.has_matching_display(
-                    prev_user,
-                    config.buffer.nickname.show_access_levels,
-                    config.buffer.nickname.show_bot_icon,
-                )
-            } else {
-                false
-            }
+            }) && message.target.source() == prev_message.target.source()
         })
+}
+
+/// Whether a message continues the run its predecessor belongs to, mirroring
+/// QML `MessageListModel::SameSenderAsPreviousRole`: same sender *and* the
+/// same local calendar day, so the message heading a new day is always named
+/// even when the day before ended with one of theirs.
+fn continues_sender_run(
+    message: &data::Message,
+    prev_message: Option<&data::Message>,
+    duration: Option<chrono::TimeDelta>,
+) -> bool {
+    is_consecutive_message(message, prev_message, duration)
+        && prev_message.is_some_and(|prev_message| {
+            message.server_time.with_timezone(&Local).date_naive()
+                == prev_message.server_time.with_timezone(&Local).date_naive()
+        })
+}
+
+/// Whether a message's sender label is suppressed. A layout that collapses
+/// runs (a conversation thread, QML `startsRun`) names a sender only where
+/// their run begins whatever the alignment; `hide_consecutive` then only
+/// widens that to layouts which do not, and narrows it to a time window.
+fn hide_sender(
+    message: &data::Message,
+    prev_message: Option<&data::Message>,
+    hide_consecutive: HideConsecutiveEnabled,
+    collapses_sender_runs: bool,
+) -> bool {
+    match hide_consecutive {
+        HideConsecutiveEnabled::Enabled(duration) => {
+            continues_sender_run(message, prev_message, duration)
+        }
+        HideConsecutiveEnabled::Disabled => {
+            collapses_sender_runs
+                && continues_sender_run(message, prev_message, None)
+        }
+    }
+}
+
+/// The visible width of a message's sender label, for right alignment.
+pub fn sender_label(message: &data::Message) -> Option<&str> {
+    match message.target.source() {
+        Source::Peer(address) => Some(address.short_label()),
+        Source::Yourself => Some("you"),
+        Source::Status(_) | Source::Internal(_) => None,
+    }
 }
 
 pub fn view<'a>(
     state: &State,
     kind: Kind,
     history: &'a history::Manager,
-    previews: Option<Previews<'a>>,
-    visible_for_source: Option<impl Fn(&Preview, &message::Source) -> bool>,
-    chathistory_state: Option<ChatHistoryState>,
-    reserved_bottom_padding: f32,
     config: &'a Config,
     theme: &'a Theme,
     formatter: impl LayoutMessage<'a> + 'a,
-    registry: &'a dyn metadata::Registry,
-    channel_is_focused: impl Fn(&Server, &target::Channel) -> bool + Copy + 'a,
-    channel_is_open: impl Fn(&Server, &target::Channel) -> bool + Copy + 'a,
 ) -> Element<'a, Message> {
     let divider_font_size =
         config.font.size.map_or(theme::TEXT_SIZE, f32::from) - 1.0;
@@ -287,43 +195,11 @@ pub fn view<'a>(
         has_more_newer_messages,
         old_messages,
         new_messages,
-        cleared,
+        cleared: _,
         ..
-    }) = history.get_messages(&kind.into(), Some(state.limit), config)
+    }) = history.get_messages(&kind.into(), Some(state.limit))
     else {
         return column![].into();
-    };
-
-    let top_row = if !cleared
-        && let (false, Some(chathistory_state)) =
-            (has_more_older_messages, chathistory_state)
-    {
-        let (content, message) = match chathistory_state {
-            ChatHistoryState::Exhausted => {
-                ("No Older Chat History Messages Available", None)
-            }
-            ChatHistoryState::PendingRequest => ("...", None),
-            ChatHistoryState::Ready => (
-                "Request Older Chat History Messages",
-                Some(Message::RequestOlderChatHistory),
-            ),
-        };
-
-        let top_row_button = button(text(content).size(divider_font_size))
-            .padding([3, 5])
-            .style(|theme, status| {
-                theme::button::secondary(theme, status, false)
-            })
-            .on_press_maybe(message);
-
-        Some(
-            row![space::horizontal(), top_row_button, space::horizontal()]
-                .padding(padding::top(4).bottom(6))
-                .width(Length::Fill)
-                .align_y(iced::Alignment::Center),
-        )
-    } else {
-        None
     };
 
     let count = old_messages.len() + new_messages.len();
@@ -335,113 +211,30 @@ pub fn view<'a>(
     let status = state.status;
 
     let right_alignment_widths =
-        config.buffer.nickname.alignment.is_right().then_some({
-            let max_prefixes_width = old_messages
-                .iter()
-                .chain(&new_messages)
-                .filter_map(|message| prefixes_width(message, config))
-                .fold(0.0, f32::max);
-
+        config.buffer.sender.alignment.is_right().then_some({
             let max_timestamp_width = old_messages
                 .iter()
                 .chain(&new_messages)
                 .filter_map(|message| timestamp_width(message, config))
                 .fold(0.0, f32::max);
 
-            let max_nick_width = old_messages
+            let max_sender_width = old_messages
                 .iter()
                 .chain(&new_messages)
-                .filter_map(|message| match message.target.source() {
-                    message::Source::User(user) => {
-                        let user_display = UserDisplay::new(
-                            user,
-                            config.buffer.nickname.show_access_levels,
-                            config.buffer.nickname.show_bot_icon,
-                            message.is_rerouted(),
-                            registry,
-                            &config.display.nickname,
-                            config.buffer.nickname.truncate,
-                            config.display.truncation_character,
-                            Some(&config.buffer.nickname.brackets),
-                            true,
-                        );
-
-                        Some(user_display.width(config) + 1.0)
-                    }
-                    _ => None,
+                .filter_map(|message| {
+                    sender_label(message).map(|label| {
+                        font::width_from_str(label, &config.font) + 1.0
+                    })
                 })
                 .fold(0.0, f32::max);
-
-            let range_end_timestamp_width =
-                if config.buffer.server_messages.condense.any() {
-                    old_messages
-                        .iter()
-                        .chain(&new_messages)
-                        .filter_map(|message| {
-                            if let message::Source::Internal(
-                                message::source::Internal::Condensed(
-                                    end_server_time,
-                                ),
-                            ) = message.target.source()
-                                && message.server_time != *end_server_time
-                            {
-                                config
-                                    .buffer
-                                    .format_range_end_timestamp(end_server_time)
-                                    .map(|(dash, end_timestamp)| {
-                                        let condensation_icon = !matches!(
-                                            config
-                                                .buffer
-                                                .server_messages
-                                                .condense
-                                                .icon,
-                                            CondensationIcon::None
-                                        );
-
-                                        let range_end_timestamp_width =
-                                            font::width_from_str(
-                                                &(if condensation_icon {
-                                                    format!(
-                                                        "{dash}{end_timestamp} "
-                                                    )
-                                                } else {
-                                                    format!(
-                                                        "{dash}{end_timestamp}"
-                                                    )
-                                                }),
-                                                &config.font,
-                                            );
-
-                                        range_end_timestamp_width
-                                            + if condensation_icon {
-                                                font::width_of_message_marker(
-                                                    &config.font,
-                                                )
-                                            } else {
-                                                0.0
-                                            }
-                                            + 1.0
-                                    })
-                            } else {
-                                None
-                            }
-                        })
-                        .fold(0.0, f32::max)
-                } else {
-                    0.0
-                };
 
             let message_marker_width =
                 font::width_of_message_marker(&config.font) + 1.0;
 
-            let max_middle_width = max_nick_width
-                .max(range_end_timestamp_width)
-                .max(message_marker_width);
-
             RightAlignmentWidths {
-                prefixes: max_prefixes_width,
+                prefixes: 0.0,
                 timestamp: max_timestamp_width,
-                middle: max_middle_width,
+                middle: max_sender_width.max(message_marker_width),
             }
         });
 
@@ -454,46 +247,17 @@ pub fn view<'a>(
                     if let HideConsecutiveEnabled::Enabled(duration) =
                         config.buffer.timestamp.hide_consecutive.enabled
                     {
-                        message.reply_to.is_none()
-                            && is_consecutive_user_message(
-                                message,
-                                *prev_message,
-                                duration,
-                                config,
-                            )
+                        is_consecutive_message(message, *prev_message, duration)
                     } else {
                         false
                     };
 
-                let hide_nickname =
-                    if let HideConsecutiveEnabled::Enabled(duration) =
-                        config.buffer.nickname.hide_consecutive.enabled
-                    {
-                        !config.buffer.nickname.alignment.is_top()
-                        && message.reply_to.is_none()
-                        && is_consecutive_user_message(
-                            message,
-                            *prev_message,
-                            duration,
-                            config
-                        )
-                        // don't hide if prev message has visible preview (when show_after_previews is enabled)
-                        && !(config
-                            .buffer
-                            .nickname
-                            .hide_consecutive
-                            .show_after_previews
-                            && prev_message.is_some_and(|prev_msg| {
-                                has_visible_preview(
-                                    prev_msg,
-                                    state,
-                                    previews,
-                                    &visible_for_source,
-                                )
-                            }))
-                    } else {
-                        false
-                    };
+                let hide_sender = hide_sender(
+                    message,
+                    *prev_message,
+                    config.buffer.sender.hide_consecutive.enabled,
+                    formatter.collapses_sender_runs(),
+                );
 
                 *prev_message = Some(message);
 
@@ -503,15 +267,16 @@ pub fn view<'a>(
                             message,
                             right_alignment_widths,
                             hide_timestamp,
-                            hide_nickname,
-                            visible_for_source.as_ref(),
-                            &state.visible_url_messages,
-                            state.hovered_preview,
-                            state.hover_highlighted_message,
-                            channel_is_focused,
-                            channel_is_open,
+                            hide_sender,
                         )
-                        .map(|element| (message, element)),
+                        .map(|element| {
+                            (
+                                message,
+                                context_menu::message(
+                                    element, message, config, theme,
+                                ),
+                            )
+                        }),
                 )
             })
             .flatten()
@@ -533,78 +298,44 @@ pub fn view<'a>(
                             theme::container::highlighted_message(theme, alpha)
                         })
                         .into()
-                } else if state.hover_highlighted_message == Some(message.hash)
-                {
-                    container(element)
-                        .width(Length::Fill)
-                        .style(move |theme| {
-                            theme::container::highlighted_message(
-                                theme,
-                                HOVER_HIGHLIGHT_ALPHA,
-                            )
-                        })
-                        .into()
                 } else {
                     element
                 };
 
-                // this prevents flicker when a message sits right at the edge
-                let element =
-                    if formatter.should_track_reply_target_visibility() {
-                        let is_visible =
-                            state.visible_messages.contains(&message.hash);
-                        if is_visible {
-                            notify_visibility(
-                                element,
-                                0.0,
-                                notify_visibility::When::NotContained,
-                                message.hash,
-                                Message::ExitedViewport(message.hash),
+                let content =
+                    if is_new_day && config.buffer.date_separators.show {
+                        // The day a run belongs to rides on a chip floating
+                        // over the thread, not a rule cutting it in two (QML
+                        // `DayChip`); only dates the relative labels have no
+                        // word for fall back to the configured format.
+                        let label = data::time::day_chip_label(date)
+                            .unwrap_or_else(|| {
+                                config.buffer.format_date_separator(&date)
+                            });
+
+                        column![
+                            container(
+                                container(
+                                    text(label)
+                                        .size(divider_font_size)
+                                        .style(theme::text::date_separator)
+                                        .font_maybe(
+                                            theme::font_style::secondary(theme)
+                                                .map(font::get)
+                                        )
+                                )
+                                .padding([2, 10])
+                                .style(theme::container::day_chip)
                             )
-                        } else {
-                            notify_visibility(
-                                element,
-                                0.0,
-                                notify_visibility::When::Contained,
-                                message.hash,
-                                Message::EnteredViewport(message.hash),
-                            )
-                        }
+                            .width(Length::Fill)
+                            .padding(padding::top(4).bottom(4))
+                            .align_x(iced::Alignment::Center),
+                            element
+                        ]
+                        .into()
                     } else {
                         element
                     };
-
-                let content = if is_new_day
-                    && config.buffer.date_separators.show
-                {
-                    column![
-                        row![
-                            container(
-                                rule::horizontal(1).style(theme::rule::date)
-                            )
-                            .width(Length::Fill)
-                            .padding(padding::right(6)),
-                            text(config.buffer.format_date_separator(&date))
-                                .size(divider_font_size)
-                                .style(theme::text::date_separator)
-                                .font_maybe(
-                                    theme::font_style::secondary(theme)
-                                        .map(font::get)
-                                ),
-                            container(
-                                rule::horizontal(1).style(theme::rule::date)
-                            )
-                            .width(Length::Fill)
-                            .padding(padding::left(6))
-                        ]
-                        .padding(2)
-                        .align_y(iced::Alignment::Center),
-                        element
-                    ]
-                    .into()
-                } else {
-                    element
-                };
 
                 Some(keyed(keyed::Key::message(message), content))
             })
@@ -779,13 +510,7 @@ pub fn view<'a>(
     // claims a `spacing(line_spacing)` gap. Once a buffer is marked as read the
     // divider and the `new` column both empty out, stranding that spacing at
     // the end as blank space above the input.
-    let mut content_column = widget::Column::new()
-        .padding(padding::bottom(reserved_bottom_padding))
-        .spacing(line_spacing);
-
-    if let Some(top_row) = top_row {
-        content_column = content_column.push(top_row);
-    }
+    let mut content_column = widget::Column::new().spacing(line_spacing);
 
     if let Some(top_spacer) = top_spacer {
         content_column = content_column.push(top_spacer);
@@ -846,13 +571,7 @@ pub struct State {
     pending_scroll_to: Option<keyed::Key>,
     is_scrolling_to: bool,
     highlighted_message: Option<(message::Hash, f32)>,
-    hover_highlighted_message: Option<message::Hash>,
     highlight_generation: u64,
-    visible_url_messages: HashMap<message::Hash, Vec<url::Url>>,
-    visible_messages: HashSet<message::Hash>,
-    pending_preview_exits: HashSet<message::Hash>,
-    reply_preview_urls: HashMap<message::Hash, Vec<url::Url>>,
-    hovered_preview: Option<(message::Hash, usize)>,
 }
 
 impl State {
@@ -870,26 +589,15 @@ impl State {
             pending_scroll_to: None,
             is_scrolling_to: false,
             highlighted_message: None,
-            hover_highlighted_message: None,
             highlight_generation: 0,
-
-            visible_url_messages: HashMap::new(),
-            visible_messages: HashSet::new(),
-            pending_preview_exits: HashSet::new(),
-            reply_preview_urls: HashMap::new(),
-            hovered_preview: None,
         }
     }
 
     pub fn update(
         &mut self,
         message: Message,
-        infinite_scroll: bool,
         kind: Kind,
-        buffer: Option<&buffer::Upstream>,
         history: &mut history::Manager,
-        clients: &mut client::Map,
-        previews: &preview::Collection,
         config: &Config,
     ) -> (Task<Message>, Option<Event>) {
         match message {
@@ -979,55 +687,37 @@ impl State {
                                 old_messages,
                                 new_messages,
                                 ..
-                            }) = history.get_messages(
-                                &kind.into(),
-                                Some(self.limit),
-                                config,
-                            ) && let Some(oldest) =
-                                old_messages.iter().chain(&new_messages).next()
+                            }) = history
+                                .get_messages(&kind.into(), Some(self.limit))
+                                && let Some(oldest) = old_messages
+                                    .iter()
+                                    .chain(&new_messages)
+                                    .next()
                             {
                                 self.limit = Limit::Since(oldest.server_time);
                             }
                         }
                     }
-                    // Hit top
+                    // Hit top, anchor it
                     _ if old_status.is_top(relative_offset) => {
-                        // If we're infinite scroll & out of messages, load more via chathistory
-                        if let Some(server) = kind.server().filter(|_| {
-                            infinite_scroll && !has_more_older_messages
-                        }) {
-                            // Load more history & ensure scrollable is unlocked
-                            event = Some(Event::RequestOlderChatHistory);
-                            self.status = Status::Unlocked;
-                            self.limit = Limit::Top(
-                                clients.get_server_chathistory_limit(server)
-                                    as usize
-                                    + step_messages(height, config),
-                            );
-                        } else {
-                            // Anchor it
-                            self.status = Status::Unlocked;
+                        self.status = Status::Unlocked;
 
-                            if matches!(self.limit, Limit::Top(_)) {
-                                if old_status.is_page_from_bottom(
-                                    absolute_offset,
-                                    height,
-                                    self.content_size.height,
-                                ) && has_more_newer_messages
-                                {
-                                    self.limit = Limit::Top(
-                                        count + step_messages(height, config),
-                                    );
-                                }
-                            } else if matches!(self.limit, Limit::Around(_, _))
+                        if matches!(self.limit, Limit::Top(_)) {
+                            if old_status.is_page_from_bottom(
+                                absolute_offset,
+                                height,
+                                self.content_size.height,
+                            ) && has_more_newer_messages
                             {
-                                self.limit = Limit::Since(oldest);
-                            } else {
-                                self.limit = Limit::Top(step_messages(
-                                    2.0 * height,
-                                    config,
-                                ));
+                                self.limit = Limit::Top(
+                                    count + step_messages(height, config),
+                                );
                             }
+                        } else if matches!(self.limit, Limit::Around(_, _)) {
+                            self.limit = Limit::Since(oldest);
+                        } else {
+                            self.limit =
+                                Limit::Top(step_messages(2.0 * height, config));
                         }
                     }
                     // Move away from bottom
@@ -1075,89 +765,11 @@ impl State {
             Message::ContextMenu(message) => {
                 return (
                     Task::none(),
-                    context_menu::update(message).map(Event::ContextMenu),
+                    Some(Event::ContextMenu(context_menu::update(message))),
                 );
             }
-            Message::Link(message::Link::Channel(
-                server,
-                channel,
-                buffer_action,
-            )) => {
-                return (
-                    Task::none(),
-                    buffer_action.map(|buffer_action| {
-                        Event::OpenBuffer(
-                            server,
-                            Target::Channel(channel),
-                            buffer_action,
-                        )
-                    }),
-                );
-            }
-            Message::Link(message::Link::Url(url)) => {
-                let event = match config.actions.buffer.click_image_url {
-                    ImageClickAction::OpenUrl => Event::OpenUrl(url),
-                    ImageClickAction::Preview => {
-                        let image =
-                            url::Url::parse(&url).ok().and_then(|url| {
-                                previews.get(&url).and_then(|state| match state
-                                {
-                                    preview::State::Loaded(
-                                        data::Preview::Image(image),
-                                    ) => Some(image.clone()),
-                                    _ => None,
-                                })
-                            });
-
-                        image.map_or_else(
-                            || Event::OpenUrl(url),
-                            Event::ImagePreview,
-                        )
-                    }
-                };
-
-                return (Task::none(), Some(event));
-            }
-            Message::Link(message::Link::User(server, user)) => {
-                let event = match config.actions.buffer.click_username {
-                    NicknameClickAction::OpenQuery(buffer_action) => {
-                        let query = target::Query::from(user);
-
-                        Some(Event::OpenBuffer(
-                            server,
-                            Target::Query(query),
-                            buffer_action,
-                        ))
-                    }
-                    NicknameClickAction::InsertNickname => {
-                        Some(Event::ContextMenu(
-                            context_menu::Event::InsertNickname(
-                                user.nickname().to_owned(),
-                            ),
-                        ))
-                    }
-                    NicknameClickAction::Noop => None,
-                };
-
-                return (Task::none(), event);
-            }
-            Message::Link(message::Link::GoToMessage(
-                server,
-                channel,
-                message,
-                buffer_action,
-            )) => {
-                return (
-                    Task::none(),
-                    buffer_action.map(|buffer_action| {
-                        Event::GoToMessage(
-                            server,
-                            channel,
-                            message,
-                            buffer_action,
-                        )
-                    }),
-                );
+            Message::Link(Link::Url(url)) => {
+                return (Task::none(), Some(Event::OpenUrl(url)));
             }
             Message::ScrollTo(keyed::Hit {
                 key,
@@ -1232,104 +844,11 @@ impl State {
                     );
                 }
             }
-            Message::Link(message::Link::ExpandMessage(
-                server_time,
-                hash,
-                _,
-            )) => {
-                return (
-                    Task::none(),
-                    Some(Event::ExpandMessage(server_time, hash)),
-                );
-            }
-            Message::Link(message::Link::ContractMessage(
-                server_time,
-                hash,
-                _,
-            )) => {
-                return (
-                    Task::none(),
-                    Some(Event::ContractMessage(server_time, hash)),
-                );
-            }
-            Message::RequestOlderChatHistory => {
-                if let Some(server) = kind.server() {
-                    self.status = Status::Unlocked;
-                    self.limit = Limit::Top(
-                        clients.get_server_chathistory_limit(server) as usize
-                            + step_messages(self.pane_size.height, config),
-                    );
-
-                    return (
-                        Task::none(),
-                        Some(Event::RequestOlderChatHistory),
-                    );
-                }
-            }
-            Message::EnteringViewport(hash, urls) => {
-                self.pending_preview_exits.remove(&hash);
-                self.visible_url_messages.insert(hash, urls);
-                return (Task::none(), Some(Event::PreviewChanged));
-            }
-            Message::ExitingViewport(hash) => {
-                if self.visible_url_messages.contains_key(&hash) {
-                    self.pending_preview_exits.insert(hash);
-                }
-                return (Task::none(), None);
-            }
-            Message::EnteredViewport(hash) => {
-                self.visible_messages.insert(hash);
-            }
-            Message::ExitedViewport(hash) => {
-                self.visible_messages.remove(&hash);
-            }
-            Message::ReplyPreviewHovered(hash, reply_hash, urls) => {
-                if config.buffer.reply.highlight_hovered_message
-                    && self.visible_messages.contains(&reply_hash)
-                {
-                    self.hover_highlighted_message = Some(reply_hash);
-                } else {
-                    self.hover_highlighted_message = None;
-                    if !urls.is_empty() {
-                        let prev = self.reply_preview_urls.insert(hash, urls);
-                        if prev.is_none() {
-                            return (Task::none(), Some(Event::PreviewChanged));
-                        }
-                    }
-                }
-            }
-            Message::ReplyPreviewUnhovered(hash) => {
-                self.hover_highlighted_message = None;
-                if self.reply_preview_urls.remove(&hash).is_some() {
-                    return (Task::none(), Some(Event::PreviewChanged));
-                }
-            }
-            Message::PreviewHovered(hash, idx) => {
-                self.hovered_preview = Some((hash, idx));
-            }
-            Message::PreviewUnhovered(hash, idx) => {
-                // Remove if its the one currently hovered
-                if self
-                    .hovered_preview
-                    .is_some_and(|(a, b)| a == hash && b == idx)
-                {
-                    self.hovered_preview = None;
-                }
-            }
-            Message::HidePreview(message, url) => {
-                return (
-                    Task::none(),
-                    Some(Event::HidePreview(kind.into(), message, url)),
-                );
-            }
             Message::MarkAsRead => {
                 return (Task::none(), Some(Event::MarkAsRead));
             }
             Message::ContentResized(size) => {
                 self.content_size = size;
-            }
-            Message::ImagePreview(image) => {
-                return (Task::none(), Some(Event::ImagePreview(image)));
             }
             Message::PendingScrollTo => {
                 if let Some(key) = &self.pending_scroll_to {
@@ -1371,44 +890,6 @@ impl State {
                     self.height_cache.insert(*key, *height);
                 }
 
-                let mut preview_changed = false;
-
-                if !self.pending_preview_exits.is_empty()
-                    || !self.visible_messages.is_empty()
-                {
-                    let rendered_hashes = heights
-                        .iter()
-                        .filter_map(|(key, _)| {
-                            if let keyed::Key::Message(hash) = key {
-                                Some(*hash)
-                            } else {
-                                None
-                            }
-                        })
-                        .collect::<HashSet<_>>();
-
-                    let mut still_pending = HashSet::new();
-
-                    for hash in self.pending_preview_exits.drain() {
-                        if rendered_hashes.contains(&hash) {
-                            still_pending.insert(hash);
-                        } else if self
-                            .visible_url_messages
-                            .remove(&hash)
-                            .is_some()
-                        {
-                            preview_changed = true;
-                        }
-                    }
-
-                    self.pending_preview_exits = still_pending;
-
-                    self.visible_messages
-                        .retain(|hash| rendered_hashes.contains(hash));
-                }
-
-                let event = preview_changed.then_some(Event::PreviewChanged);
-
                 if let Some(key) = &self.pending_scroll_to {
                     let scroll_to = keyed::find(self.scrollable.clone(), *key)
                         .map(Message::ScrollTo);
@@ -1416,18 +897,8 @@ impl State {
                     self.pending_scroll_to = None;
                     self.is_scrolling_to = true;
 
-                    return (scroll_to, event);
+                    return (scroll_to, None);
                 }
-
-                if let Some(event) = event {
-                    return (Task::none(), Some(event));
-                }
-            }
-            Message::Reacted { msgid, text } => {
-                send_reaction(clients, buffer, history, msgid, text, false);
-            }
-            Message::Unreacted { msgid, text } => {
-                send_reaction(clients, buffer, history, msgid, text, true);
             }
         }
         (Task::none(), None)
@@ -1515,7 +986,7 @@ impl State {
             old_messages,
             new_messages,
             ..
-        }) = history.get_messages(&kind.into(), None, config)
+        }) = history.get_messages(&kind.into(), None)
         else {
             // We're still loading history, which will trigger scroll_to_backlog
             // after loading. If this is set, we will scroll_to_message
@@ -1559,7 +1030,7 @@ impl State {
             old_messages,
             new_messages,
             ..
-        }) = history.get_messages(&kind.into(), None, config)
+        }) = history.get_messages(&kind.into(), None)
         else {
             return Task::none();
         };
@@ -1605,7 +1076,7 @@ impl State {
             old_messages,
             new_messages,
             ..
-        }) = history.get_messages(&kind.into(), None, config)
+        }) = history.get_messages(&kind.into(), None)
         else {
             return Task::none();
         };
@@ -1641,67 +1112,6 @@ impl State {
         keyed::collect_heights(self.scrollable.clone())
             .map(Message::HeightsCollected)
     }
-
-    pub fn visible_urls(&self) -> impl Iterator<Item = &url::Url> {
-        self.visible_url_messages
-            .values()
-            .flatten()
-            .chain(self.reply_preview_urls.values().flatten())
-    }
-}
-
-fn send_reaction(
-    clients: &mut client::Map,
-    buffer: Option<&buffer::Upstream>,
-    history: &mut history::Manager,
-    msgid: message::Id,
-    text: Cow<'static, str>,
-    unreact: bool,
-) -> Option<()> {
-    let buffer = buffer?;
-    let server = buffer.server();
-    let target = buffer.target()?;
-    let command = match unreact {
-        true => Irc::Unreact {
-            target: target.to_string(),
-            msgid: msgid.clone(),
-            text: text.clone(),
-        },
-        false => Irc::React {
-            target: target.to_string(),
-            msgid: msgid.clone(),
-            text: text.clone(),
-        },
-    };
-
-    let encoded = message::Encoded::try_from(command).ok()?;
-    let labeled_response_context =
-        clients.send(buffer, encoded, TokenPriority::User);
-
-    if !clients.get_server_supports_echoes(server) {
-        let nick = clients.nickname(server)?;
-        history.record_reaction(
-            server,
-            reaction::Context {
-                inner: Reaction {
-                    sender: nick.to_owned(),
-                    text: text.into_owned(),
-                    unreact,
-                    id: labeled_response_context
-                        .map(|context| context.label_as_id),
-                    server_time: Utc::now(),
-                },
-                target,
-                in_reply_to: msgid,
-                is_echo: false,
-                deduplicate: false,
-            },
-            false,
-            None,
-        );
-    }
-
-    Some(())
 }
 
 #[derive(Debug, Clone, Copy, Default)]
@@ -1784,6 +1194,13 @@ fn step_messages(height: f32, config: &Config) -> usize {
     let line_height = theme::resolve_line_height(&config.font);
 
     (height / line_height).max(8.0) as usize
+}
+
+fn timestamp_width(message: &data::Message, config: &Config) -> Option<f32> {
+    config
+        .buffer
+        .format_timestamp(&message.server_time)
+        .map(|timestamp| font::width_from_str(&timestamp, &config.font) + 1.0)
 }
 
 pub mod keyed {
@@ -2416,25 +1833,148 @@ mod correct_viewport {
     }
 }
 
-fn prefixes_width(message: &data::Message, config: &Config) -> Option<f32> {
-    message.target.prefixes().map(|prefixes| {
-        font::width_from_str(
-            &format!(
-                "{} ",
-                config
-                    .buffer
-                    .status_message_prefix
-                    .brackets
-                    .format(prefixes.iter().collect::<String>())
-            ),
-            &config.font,
-        ) + 1.0
-    })
-}
+#[cfg(test)]
+mod tests {
+    use chrono::TimeZone;
 
-fn timestamp_width(message: &data::Message, config: &Config) -> Option<f32> {
-    config
-        .buffer
-        .format_timestamp(&message.server_time)
-        .map(|timestamp| font::width_from_str(&timestamp, &config.font) + 1.0)
+    use super::*;
+
+    fn at_local(date: NaiveDate, hour: u32, minute: u32) -> i64 {
+        Local
+            .from_local_datetime(
+                &date
+                    .and_hms_opt(hour, minute, 0)
+                    .expect("valid wall clock time"),
+            )
+            .earliest()
+            .expect("wall clock time exists locally")
+            .timestamp_millis()
+    }
+
+    fn from_peer(timestamp_ms: i64) -> data::Message {
+        data::Message::received(
+            ConvoId::from("c1"),
+            Some(data::Address::from("deadbeef")),
+            "hello".to_string(),
+            timestamp_ms,
+        )
+    }
+
+    fn from_other_peer(timestamp_ms: i64) -> data::Message {
+        data::Message::received(
+            ConvoId::from("c1"),
+            Some(data::Address::from("cafebabe")),
+            "hello".to_string(),
+            timestamp_ms,
+        )
+    }
+
+    /// QML `SameSenderAsPreviousRole` compares the calendar day too, so the
+    /// message sitting under a day chip always carries its sender's name.
+    #[test]
+    fn sender_run_breaks_at_local_midnight() {
+        let monday = NaiveDate::from_ymd_opt(2024, 6, 17).expect("valid date");
+        let tuesday = NaiveDate::from_ymd_opt(2024, 6, 18).expect("valid date");
+
+        let before = from_peer(at_local(monday, 23, 50));
+        let last_of_day = from_peer(at_local(monday, 23, 58));
+        let first_of_day = from_peer(at_local(tuesday, 0, 3));
+
+        assert!(continues_sender_run(&last_of_day, Some(&before), None));
+
+        assert!(
+            is_consecutive_message(&first_of_day, Some(&last_of_day), None),
+            "same sender, minutes apart: consecutive for timestamp hiding"
+        );
+        assert!(
+            !continues_sender_run(&first_of_day, Some(&last_of_day), None),
+            "a new local day heads a new run"
+        );
+
+        for hide_consecutive in [
+            HideConsecutiveEnabled::Disabled,
+            HideConsecutiveEnabled::Enabled(None),
+            HideConsecutiveEnabled::Enabled(chrono::TimeDelta::try_hours(1)),
+        ] {
+            assert!(!hide_sender(
+                &first_of_day,
+                Some(&last_of_day),
+                hide_consecutive,
+                true
+            ));
+        }
+    }
+
+    /// Alignment is deliberately not a factor: a thread collapses runs
+    /// whether the sender sits beside the message or above it, and turning
+    /// `hide_consecutive` on never restores a label it was hiding while off.
+    #[test]
+    fn hide_sender_collapses_runs_in_both_branches() {
+        let day = NaiveDate::from_ymd_opt(2024, 6, 17).expect("valid date");
+        let first = from_peer(at_local(day, 10, 0));
+        let second = from_peer(at_local(day, 10, 1));
+        let stranger = from_other_peer(at_local(day, 10, 2));
+
+        assert!(hide_sender(
+            &second,
+            Some(&first),
+            HideConsecutiveEnabled::Disabled,
+            true
+        ));
+        assert!(hide_sender(
+            &second,
+            Some(&first),
+            HideConsecutiveEnabled::Enabled(None),
+            true
+        ));
+
+        // A layout that names every sender (the log) only collapses on request
+        assert!(!hide_sender(
+            &second,
+            Some(&first),
+            HideConsecutiveEnabled::Disabled,
+            false
+        ));
+        assert!(hide_sender(
+            &second,
+            Some(&first),
+            HideConsecutiveEnabled::Enabled(None),
+            false
+        ));
+
+        // Someone else's message always heads its own run
+        assert!(!hide_sender(
+            &stranger,
+            Some(&second),
+            HideConsecutiveEnabled::Disabled,
+            true
+        ));
+        // ... and so does the first message in the thread
+        assert!(!hide_sender(
+            &first,
+            None,
+            HideConsecutiveEnabled::Disabled,
+            true
+        ));
+    }
+
+    #[test]
+    fn hide_sender_honors_the_configured_window() {
+        let day = NaiveDate::from_ymd_opt(2024, 6, 17).expect("valid date");
+        let first = from_peer(at_local(day, 10, 0));
+        let much_later = from_peer(at_local(day, 14, 0));
+
+        assert!(hide_sender(
+            &much_later,
+            Some(&first),
+            HideConsecutiveEnabled::Enabled(chrono::TimeDelta::try_hours(5)),
+            true
+        ));
+        assert!(!hide_sender(
+            &much_later,
+            Some(&first),
+            HideConsecutiveEnabled::Enabled(chrono::TimeDelta::try_minutes(5)),
+            true
+        ));
+    }
 }
