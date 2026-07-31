@@ -1,0 +1,32 @@
+[package]
+name = "logos-chat"
+description = "Typed chat_module contract + the backend session state machine"
+version = "0.1.0"
+license.workspace = true
+edition.workspace = true
+
+[features]
+# Not a default: `ffi` pulls in logos-sys, and anything that LINKS then
+# needs liblogos_protocol from LOGOS_PROTOCOL_ROOT. CI runners have no
+# dylib, so `cargo test --workspace` must not turn it on implicitly.
+# `cargo check`/`clippy` never link — the ffi paths are type-checked with
+# `--features ffi` (see .github/workflows/build.yml).
+default = []
+ffi = ["logos-client/ffi"]
+
+[dependencies]
+logos-client = { version = "0.1.0", path = "../client", default-features = false }
+logos-daemon = { version = "0.1.0", path = "../daemon" }
+futures = { workspace = true }
+tokio = { workspace = true, features = ["sync", "time", "rt", "macros"] }
+serde = { workspace = true }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+log = { workspace = true }
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["rt-multi-thread", "macros", "time", "test-util"] }
+tempfile = "3"
+
+[lints]
+workspace = true

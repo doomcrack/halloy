@@ -21,6 +21,7 @@ members = [
     "logos/sys",
     "logos/daemon",
     "logos/client",
+    "logos/chat",
 ]
 
 [workspace.package]
