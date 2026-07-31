@@ -1,0 +1,28 @@
+[package]
+name = "logos-client"
+description = "Qt-free lp_* client: dedicated logos thread, core_service gateway, module_event pump"
+version = "0.1.0"
+license.workspace = true
+edition.workspace = true
+
+[features]
+default = ["ffi"]
+ffi = ["dep:logos-sys"]
+
+[dependencies]
+logos-sys = { version = "0.1.0", path = "../sys", optional = true }
+tokio = { workspace = true, features = ["sync", "time", "rt", "macros"] }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+log = { workspace = true }
+
+[dev-dependencies]
+tokio = { workspace = true, features = [
+    "rt-multi-thread",
+    "macros",
+    "time",
+    "test-util",
+] }
+
+[lints]
+workspace = true
