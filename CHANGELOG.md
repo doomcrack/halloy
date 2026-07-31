@@ -1,18 +1,24 @@
 # Unreleased
 
+Frigicom forked halloy and replaced the IRC stack with the Logos backend.
+
 Added:
 
-- CTCP actions to private message context menus
-- Remember sidebar visibility
-- Expanded `servers.<name>.max_connection_attempts` to allow unlimited attempts
+- Logos backend: a private `logoscore` daemon, `chat_module` over one
+  `lp_client`, and the session state machine driving the UI
+- `[logos]` configuration section (`delivery_preset`, `daemon_path`,
+  `modules_dir`, `instance_dir`, `installation_name`, `use_wildcard_watch`,
+  `mock`)
+- `/dm`, `/group`, and `/add` for starting conversations by address
 
-Fixed:
+Removed:
 
-- Remove blank space above the input after marking a buffer as read
+- The IRC stack in full: servers, channels, nicks, modes, CTCP, DCC, file
+  transfer and upload, channel discovery, highlights, metadata, proxies,
+  and the `irc://` / `ircs://` URL schemes
 
-Thanks:
-
-- Contributions: @rollecode, @luca020400
+Everything below this line is upstream halloy's changelog, kept as the
+history frigicom inherited.
 
 # 2026.8 (2026-07-24)
 

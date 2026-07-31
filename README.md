@@ -1,94 +1,67 @@
-# Halloy - IRC Client
+# frigicom
 
-<img src="./assets/banner.png" alt="banner" title="Icon by Rune Seir">
+A standalone desktop chat client for the Logos network. It talks to
+`logos-chat-module` through a **private `logoscore` daemon** that it starts and
+stops with the app — there are no servers to configure and nothing to log into.
 
-![halloy](./assets/animation.gif)
+frigicom is a fork of [halloy](https://github.com/squidowl/halloy), an IRC
+client by Casper Rogild Storm, Cory Forsstrom, and Andrew Baldwin. It keeps
+halloy's chrome — panes, sidebar, themes, keyboard navigation — and replaces the
+IRC stack underneath with the Logos backend.
 
-Halloy is an open-source IRC client for Mac, Windows, and Linux, focused on being simple and fast.
+## Status
 
-Documentation: [halloy.chat](https://halloy.chat)
+**Pre-alpha.** Usable end to end against a live daemon, but:
 
-Join **#halloy** on libera.chat if you have questions or need help.
+- **Identity is ephemeral upstream.** `chat_module` mints a new address on every
+  `init` and its persistence is compiled off, so your address, conversations,
+  and messages do not survive a restart.
+- No attachments, reactions, replies, receipts, typing indicators, or history
+  pagination — none of them exist in the module contract.
+- Group membership changes take up to a minute to commit.
+- No packaging: build and run from source.
 
-## Installation
+## Quickstart
 
-[Installation documentation](https://halloy.chat/installation.html)
+The Logos artifacts (`liblogos_protocol`, the `logoscore` binary, the staged
+modules directory) come from nix:
 
-<a href="https://repology.org/project/halloy/versions">
-    <img src="https://repology.org/badge/vertical-allrepos/halloy.svg" alt="Packaging status">
-</a>
+```sh
+nix develop            # or:  . scripts/dev-env.sh
+cargo run --features live
+```
 
-Halloy is also available from [Flathub](https://flathub.org/apps/org.squidowl.halloy) and [Snap Store](https://snapcraft.io/halloy).
+`live` is **not** a default feature — it links `liblogos_protocol` and needs
+`LOGOS_PROTOCOL_ROOT` at build time. For UI work, no daemon, dylib, or nix is
+needed: set `mock = true` under `[logos]` in your `config.toml` and
 
-## IRCv3 Capabilities
+```sh
+cargo run
+```
 
-We strive to be a leading irc client with a rich IRCv3 feature set. Currently supported capabilities:
+drives the UI from a scripted in-process mock instead.
 
-- [account-notify](https://ircv3.net/specs/extensions/account-notify)
-- [away-notify](https://ircv3.net/specs/extensions/away-notify)
-- [batch](https://ircv3.net/specs/extensions/batch)
-- [bot mode](https://ircv3.net/specs/extensions/bot-mode)
-- [cap-notify](https://ircv3.net/specs/extensions/capability-negotiation.html#cap-notify)
-- [channel-context](https://ircv3.net/specs/client-tags/channel-context)
-- [chathistory](https://ircv3.net/specs/extensions/chathistory)
-- [chghost](https://ircv3.net/specs/extensions/chghost)
-- [echo-message](https://ircv3.net/specs/extensions/echo-message)
-- [extended-join](https://ircv3.net/specs/extensions/extended-join)
-- [invite-notify](https://ircv3.net/specs/extensions/invite-notify)
-- [labeled-response](https://ircv3.net/specs/extensions/labeled-response)
-- [message-redaction](https://ircv3.net/specs/extensions/message-redaction)
-- [message-tags](https://ircv3.net/specs/extensions/message-tags)
-- [metadata](https://ircv3.net/specs/extensions/metadata)
-  - `display-name`
-  - `avatar`
-  - `pronouns`
-  - `homepage`
-  - `color`
-  - `status`
-- [Monitor](https://ircv3.net/specs/extensions/monitor)
-- [msgid](https://ircv3.net/specs/extensions/message-ids)
-- [multi-prefix](https://ircv3.net/specs/extensions/multi-prefix)
-- [multiline](https://ircv3.net/specs/extensions/multiline)
-- [network-icon](https://ircv3.net/specs/extensions/network-icon)
-- [no-implicit-names](https://ircv3.net/specs/extensions/no-implicit-names)
-- [react](https://ircv3.net/specs/client-tags/react.html)
-- [read-marker](https://ircv3.net/specs/extensions/read-marker)
-- [reply](https://ircv3.net/specs/client-tags/reply)
-- [sasl-3.1](https://ircv3.net/specs/extensions/sasl-3.1)
-- [server-time](https://ircv3.net/specs/extensions/server-time)
-- [setname](https://ircv3.net/specs/extensions/setname.html)
-- [Standard Replies](https://ircv3.net/specs/extensions/standard-replies)
-- [typing](https://ircv3.net/specs/client-tags/typing)
-- [userhost-in-names](https://ircv3.net/specs/extensions/userhost-in-names)
-- [`UTF8ONLY`](https://ircv3.net/specs/extensions/utf8-only)
-- [`WHOX`](https://ircv3.net/specs/extensions/whox)
-- [`soju.im/bouncer-networks`](https://soju.im/bouncer-networks)
-- [`soju.im/filehost`](https://soju.im/filehost)
+Configuration lives in `config.toml`; see `docs/configuration/logos.md` for the
+`[logos]` section and the dev-shell environment variables.
 
-## Why?
+## Architecture
 
-<a href="https://xkcd.com/1782/">
-  <img src="https://imgs.xkcd.com/comics/team_chat.png" title="2078: He announces that he's finally making the jump from screen+irssi to tmux+weechat.">
-</a>
+The backend crates live under [`logos/`](logos/README.md) — that README covers
+the crate map, the daemon recipe, and the threading rules the FFI imposes
+(one dedicated thread per `lp_client`, synchronous invokes only, subscribe
+before watching, dead links that report success). `data/` folds the backend's
+`Update` stream into domain state; `src/` is the iced UI.
 
-## Contributing
+## Licensing and attribution
 
-See the [contributing guide](https://halloy.chat/contributing) to get started.
+frigicom is released under **GPL-3.0-or-later**, inherited from halloy. See
+[LICENSE](LICENSE).
 
-## License
+Based on [halloy](https://github.com/squidowl/halloy) (GPL-3.0-or-later),
+copyright its authors, who are retained in `[workspace.package] authors`.
+Upstream's theme format is unchanged, so halloy themes and the
+`halloy:///theme` deep link still work.
 
-Halloy is released under the GPL-3.0 License. For more details, see the [LICENSE](LICENSE) file.
-
-## Code signing policy
-
-Read our [code signing policy](./CODE_SIGNING_POLICY.md).
-
-Free code signing provided by [SignPath.io](https://signpath.io/), certificate by [SignPath Foundation](https://signpath.org/?utm_source=foundation&utm_medium=github&utm_campaign=gitextension).
-
-## Contact
-
-For any questions, suggestions, or issues, please open an issue on the [GitHub repository](https://github.com/squidowl/halloy/issues).
-
-<a href="https://github.com/iced-rs/iced">
-  <img src="https://gist.githubusercontent.com/hecrj/ad7ecd38f6e47ff3688a38c79fd108f0/raw/74384875ecbad02ae2a926425e9bcafd0695bade/color.svg" width="130px">
-</a>
+The workspace pins [`squidowl/iced`](https://github.com/squidowl/iced) via
+`[patch.crates-io]` — halloy's iced fork, a handful of patches on iced master.
+That pin is inherited from upstream and moves when upstream moves it.
