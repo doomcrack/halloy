@@ -322,6 +322,50 @@ Three consequences:
   (no reachable peers) should not abort the process. The panic-during-panic
   also means the real error is partly lost.
 
+### The abort corrupts the node's state directory
+
+Observed later, and it settles a question this section previously left open.
+An abort taken mid-sync leaves the node's storage unusable: starting again
+against the same instance directory fails immediately and repeatedly, with the
+node emitting a hot loop of `logos_blockchain_chain_service` warnings rather
+than progressing.
+
+`SIGABRT` skips destructors, so the databases the node had open are closed
+uncleanly. The recovery is to delete the instance directory —
+`<daemon config dir>/data/blockchain_module` — which the next `load-module`
+recreates. Nothing else in the daemon's state needs touching; chat, delivery
+and capability keep their own directories and are unaffected.
+
+Practical consequence for the app: **quitting while the node is syncing is
+enough to break the next run.** Any UI that offers to start the node should be
+prepared for the start to fail on state left by a previous session, and the
+remedy is a wipe rather than a retry.
+
+### An abort can take the whole daemon with it
+
+Also observed, and **not** reconciled with the earlier run.
+
+When the node was started inside the app's supervised daemon, its abort killed
+the **daemon**, not merely the module. The app's supervisor caught it and
+rebuilt the backend from scratch — `backend phase: Restarting { attempt: 1 }`
+through the full ladder, recovering in about four seconds — and, because the
+supervisor opens the combined log with `File::create`, the respawn **truncated
+away every line proving the crash had happened**.
+
+The standalone run in §5 above behaved differently: there the daemon survived
+and simply reported the module `not_loaded`. Both observations are first-hand.
+**UNDETERMINED: what differs between the two paths.** Candidates worth checking
+are the module-loader configuration the app passes versus the CLI's defaults,
+and whether the abort arrived during `start` rather than after it.
+
+Two consequences the UI must live with either way:
+
+- **A module crash and a backend restart can arrive as one event**, so they
+  cannot be treated as independent signals. The module most likely to crash is
+  also the one that takes everything else down with it.
+- **The log is not a durable record of a crash.** Anything that infers a crash
+  from log content has to survive the truncation that the crash itself causes.
+
 ## 6. Why `master` could not sync — RESOLVED, and why the tag is mandatory
 
 Connectivity is **not** the problem, which resolves an open question from
