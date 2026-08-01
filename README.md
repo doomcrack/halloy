@@ -19,7 +19,9 @@ IRC stack underneath with the Logos backend.
 - No attachments, reactions, replies, receipts, typing indicators, or history
   pagination — none of them exist in the module contract.
 - Group membership changes take up to a minute to commit.
-- No packaging: build and run from source.
+- Packaging is macOS-only and Apple Silicon only, because the Logos artifacts
+  are arm64 and there is no x86_64 half to pair them with. Everywhere else
+  builds from source.
 
 ## Quickstart
 
@@ -43,6 +45,35 @@ drives the UI from a scripted in-process mock instead.
 
 Configuration lives in `config.toml`; see `docs/configuration/logos.md` for the
 `[logos]` section and the dev-shell environment variables.
+
+## Handing it to someone else
+
+```sh
+nix build .#modules        # the module set, recording where it came from
+. scripts/dev-env.sh
+scripts/package-macos-dmg.sh
+```
+
+produces `target/release/frigicom.dmg`: an Apple Silicon `Frigicom.app` that
+runs on macOS 12 or later with no nix, no dev shell and no checkout. The
+bundle carries its own `logoscore`, its own module set, and about 200 dylib
+references the two of them pull in, all rewritten off the nix store by
+`scripts/macos-bundle-libs.py` — see `docs/packaging-macos.md` for what that
+involves and what is known to break.
+
+**One of the four bundled modules is our fork** — `chat_module` carries a
+libchat patch upstream does not have — so the image declares what it
+contains in `MODULES.txt`, per module, with the revision each was built
+from. Package from a hand-staged module tree instead of `.#modules` and it
+says so rather than pretending to know.
+
+The build is signed ad-hoc, so **whoever opens it must run**
+
+```sh
+xattr -dr com.apple.quarantine /Applications/Frigicom.app
+```
+
+once, or macOS will report the app as damaged. The disk image says so too.
 
 ## Architecture
 
