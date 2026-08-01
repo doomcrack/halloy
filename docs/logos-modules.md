@@ -322,24 +322,44 @@ Three consequences:
   (no reachable peers) should not abort the process. The panic-during-panic
   also means the real error is partly lost.
 
-### The abort corrupts the node's state directory
+### The node resumes if and only if it was stopped through `stop()`
 
-Observed later, and it settles a question this section previously left open.
-An abort taken mid-sync leaves the node's storage unusable: starting again
-against the same instance directory fails immediately and repeatedly, with the
-node emitting a hot loop of `logos_blockchain_chain_service` warnings rather
-than progressing.
+This settles a question the section previously left open, and the answer is
+sharper than "an abort corrupts state" — that was the first reading, and it is
+wrong. The distinction is not clean-versus-unclean *shutdown*; it is whether
+the module's own `stop()` ran.
 
-`SIGABRT` skips destructors, so the databases the node had open are closed
-uncleanly. The recovery is to delete the instance directory —
+Measured directly, all four legs:
+
+| how the node ended | starting again against that state |
+|---|---|
+| `stop()` called | **resumes** — picks up at the height it left, and keeps advancing |
+| process killed without `stop()` | **fails** — `start` times out, no chain is reported |
+| daemon torn down under it | fails, same signature |
+| state directory deleted | starts fine, syncs from genesis |
+
+The resume case was checked end to end: synced to height 4895, `stop()`,
+restarted, and the node reported height 4898 and climbed from there — not a
+resync from zero. State is genuinely durable.
+
+The failure signature is unmistakable and worth recognising: `start` returns
+`RPC_FAILED`, `get_cryptarchia_info` returns `METHOD_FAILED`, and the log fills
+with `logos_blockchain_chain_service: No new-block subscribers to notify:
+channel closed` **thousands of times a second**. A healthy resumed node emits
+that line about once. A tight repeat of it is the tell that the node came up
+against state it cannot use.
+
+Recovery is to delete the instance directory —
 `<daemon config dir>/data/blockchain_module` — which the next `load-module`
-recreates. Nothing else in the daemon's state needs touching; chat, delivery
-and capability keep their own directories and are unaffected.
+recreates. Nothing else needs touching; chat, delivery and capability keep
+their own directories and are unaffected. The cost is a full resync.
 
-Practical consequence for the app: **quitting while the node is syncing is
-enough to break the next run.** Any UI that offers to start the node should be
-prepared for the start to fail on state left by a previous session, and the
-remedy is a wipe rather than a retry.
+**The consequence for anything that supervises this module is a requirement,
+not a caveat: call `stop()` before going away.** A node that is merely killed
+loses its entire chain, so an app that quits without stopping it charges the
+user a full resync on every launch — about 20 minutes at the time of writing.
+Since the daemon dying takes its modules with it, the supervisor's own
+shutdown path is where this has to be honoured.
 
 ### An abort can take the whole daemon with it
 
