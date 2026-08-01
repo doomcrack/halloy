@@ -223,7 +223,11 @@ chmod -R u+w "$APP"
 # ----------------------------------------------------------------- relocate
 
 step "rewriting load commands off the nix store"
-python3 scripts/macos-bundle-libs.py "$APP" "$STAGE/origins.txt" || \
+# Origins land outside the stage: everything under it is handed to
+# hdiutil verbatim, so scratch written there ships inside the image.
+ORIGINS_FILE="target/$PROFILE/origins.txt"
+
+python3 scripts/macos-bundle-libs.py "$APP" "$ORIGINS_FILE" || \
     die "relocation left the bundle dependent on this machine"
 
 # ------------------------------------------------------------------ declare
@@ -250,7 +254,7 @@ fi
 
 MODULES_DIR="$LOGOS_MODULES_DIR" \
 PROVENANCE="$TREE/provenance.json" \
-ORIGINS="$STAGE/origins.txt" \
+ORIGINS="$ORIGINS_FILE" \
 REPO=$(sed -n 's/^repository = "\(.*\)"/\1/p' Cargo.toml | head -1) \
 python3 - "$RESOURCES" <<'DECLARE'
 import json, os, sys, textwrap
