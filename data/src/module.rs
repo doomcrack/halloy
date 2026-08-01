@@ -115,16 +115,30 @@ impl From<String> for ModuleId {
 
 /// Load state.
 ///
-/// `status --json` only ever reports `loaded` / `not_loaded`. `Crashed` is
-/// ours: a module that aborts is reported as `not_loaded` on the very next
-/// poll, which is indistinguishable from "never started" and would silently
-/// render an idle row where a restart should be offered. We learn it from the
-/// log instead (a `critical` line naming the crash) and hold it until the
-/// module is loaded again.
+/// `status --json` only ever reports `loaded` / `not_loaded`. Two of these
+/// are therefore ours, and both exist because that two-word vocabulary
+/// collapses states a person watching a module needs told apart:
+///
+/// - `Crashed`, because a module that aborts is reported as `not_loaded` on
+///   the very next poll, which is indistinguishable from "never started" and
+///   would silently render an idle row where a restart should be offered.
+/// - `Loading`, because a module the app is bringing up — or one the backend
+///   is rebuilding after a restart — also reads `not_loaded` until it
+///   finishes, and "not loaded" reads as *off* where the truth is *not yet*.
+///
+/// Neither can be inferred from a poll alone, which is exactly why
+/// [`Status::from_daemon`] cannot produce them: they are held by
+/// [`crate::Session`], which is the only place that also sees the backend
+/// phase and the log.
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum Status {
     Loaded,
+    /// A load we know is in flight, because we watched it start. Never
+    /// guessed from a poll: a module an operator loaded behind our back is
+    /// only ever seen already-`Loaded`, and claiming we saw it loading would
+    /// be a lie told to look informative.
+    Loading,
     NotLoaded,
     Crashed,
     /// A value the daemon reported that we do not recognise. Kept verbatim
@@ -136,6 +150,11 @@ pub enum Status {
 impl Status {
     /// Maps the daemon's `status --json` vocabulary. Anything else is kept as
     /// `Unknown` — this is a wire boundary, not a closed set.
+    ///
+    /// `Loading` is deliberately unreachable from here. Should a daemon ever
+    /// report the word, `Unknown("loading")` renders the same label without
+    /// letting a wire value masquerade as the client-side state the UI
+    /// reasons about.
     pub fn from_daemon(status: &str) -> Self {
         match status {
             "loaded" => Self::Loaded,
@@ -151,6 +170,7 @@ impl Status {
     pub fn label(&self) -> &str {
         match self {
             Self::Loaded => "loaded",
+            Self::Loading => "loading",
             Self::NotLoaded => "not loaded",
             Self::Crashed => "crashed",
             Self::Unknown(raw) => raw,
@@ -297,5 +317,18 @@ mod tests {
         assert_eq!(status, Status::Unknown("reloading".to_owned()));
         assert_eq!(status.label(), "reloading");
         assert!(!status.is_loaded());
+    }
+
+    /// `Loading` is a claim about something we watched happen, so no wire
+    /// value may mint one. A daemon that grows the word still reads as
+    /// "loading" on screen — through `Unknown`, which promises nothing.
+    #[test]
+    fn the_wire_cannot_mint_a_loading_status() {
+        assert_eq!(
+            Status::from_daemon("loading"),
+            Status::Unknown("loading".to_owned()),
+        );
+        assert_eq!(Status::Loading.label(), "loading");
+        assert!(!Status::Loading.is_loaded());
     }
 }

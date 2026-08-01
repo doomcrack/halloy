@@ -110,6 +110,17 @@ pub fn circle<'a>() -> TextColorSvg<'a, Theme> {
     ))
 }
 
+/// The same disc with its middle taken out — a state on its way to being
+/// [`circle`] rather than a different kind of thing. Used where a colour
+/// alone would have to carry the difference and cannot: a dim filled dot is
+/// how "not loaded" already reads.
+pub fn circle_empty<'a>() -> TextColorSvg<'a, Theme> {
+    text_color_svg(svg::Handle::from_memory(
+        include_bytes!("../assets/fontello/fontawesome-circle-empty.svg")
+            .as_slice(),
+    ))
+}
+
 pub fn quit<'a>() -> TextColorSvg<'a, Theme> {
     text_color_svg(svg::Handle::from_memory(
         include_bytes!("../assets/fontello/mfg-labs-logout.svg").as_slice(),

@@ -419,6 +419,7 @@ async fn the_sidebar_tells_a_crashed_module_from_an_idle_one() {
     app.backend(build::modules(&[
         ("blockchain_module", "not_loaded"),
         ("delivery_module", "loaded"),
+        ("capability_module", "not_loaded"),
     ]));
 
     assert_eq!(
@@ -446,11 +447,13 @@ async fn the_sidebar_tells_a_crashed_module_from_an_idle_one() {
         "one module's crash moved another module's row",
     );
 
-    // The poll that follows: the daemon calls the dead module and the idle
-    // one by the same word. Only the log knows the difference.
+    // The poll that follows: the daemon calls the dead module and the one
+    // that was never started by the same word. Only what we already knew
+    // tells them apart.
     app.backend(build::modules(&[
         ("blockchain_module", "not_loaded"),
-        ("delivery_module", "not_loaded"),
+        ("delivery_module", "loaded"),
+        ("capability_module", "not_loaded"),
     ]));
 
     assert_eq!(
@@ -459,7 +462,7 @@ async fn the_sidebar_tells_a_crashed_module_from_an_idle_one() {
         "a crash was forgotten the moment the daemon called it not_loaded\n{}",
         app.screen(),
     );
-    assert_eq!(app.module_status("delivery_module"), "not loaded");
+    assert_eq!(app.module_status("capability_module"), "not loaded");
 }
 
 /// Read-only is structural, not a disabled widget: the composer is built in
@@ -569,4 +572,401 @@ async fn interleaved_lines_land_on_the_module_that_emitted_them() {
         app.module_lines(data::module::DAEMON),
         vec!["Module loaded: blockchain_module".to_owned()],
     );
+}
+
+/// `listModules` has two words and the row has to say more than two things.
+/// The app loads chat itself, so while the ladder is at that step chat and
+/// the dependency the daemon auto-loads with it are genuinely in flight —
+/// and reporting them `not_loaded`, which is what the wire says, would read
+/// as *off* rather than *not yet*.
+#[tokio::test(start_paused = true)]
+async fn the_module_the_app_is_loading_says_so_instead_of_reading_off() {
+    let mut app = App::fresh();
+
+    app.online(&[]);
+    app.backend(build::modules(&[
+        ("chat_module", "loaded"),
+        ("delivery_module", "loaded"),
+        ("blockchain_module", "not_loaded"),
+    ]));
+
+    app.script(build::loading_module());
+    app.backend(build::modules(&[
+        ("chat_module", "not_loaded"),
+        ("delivery_module", "not_loaded"),
+        ("blockchain_module", "not_loaded"),
+    ]));
+
+    assert_eq!(app.module_status("chat_module"), "loading");
+    assert_eq!(app.module_status("delivery_module"), "loading");
+    assert_eq!(
+        app.module_status("blockchain_module"),
+        "not loaded",
+        "a module nothing is loading was claimed to be loading\n{}",
+        app.screen(),
+    );
+    assert_eq!(
+        app.alarmed_modules(),
+        Vec::<String>::new(),
+        "a restart in progress is not a sidebar full of crashes\n{}",
+        app.screen(),
+    );
+
+    app.backend(build::modules(&[
+        ("chat_module", "loaded"),
+        ("delivery_module", "loaded"),
+        ("blockchain_module", "not_loaded"),
+    ]));
+
+    assert_eq!(app.module_status("chat_module"), "loaded");
+}
+
+/// The lie the state must not tell. A module an operator loaded by hand is
+/// something we only ever hear about afterwards, in a poll — so it goes from
+/// idle straight to running, and is never dressed up as a load we watched.
+#[tokio::test(start_paused = true)]
+async fn a_module_loaded_outside_the_app_is_never_shown_loading() {
+    let mut app = App::fresh();
+
+    app.online(&[]);
+    app.backend(build::modules(&[("blockchain_module", "not_loaded")]));
+
+    assert_eq!(app.module_status("blockchain_module"), "not loaded");
+
+    // `logoscore load-module blockchain_module`, from a terminal we know
+    // nothing about. The next poll is the whole of our evidence.
+    app.backend(build::modules(&[("blockchain_module", "loaded")]));
+
+    assert_eq!(
+        app.module_status("blockchain_module"),
+        "loaded",
+        "a poll result was reported as a load we were performing\n{}",
+        app.screen(),
+    );
+}
+
+/// The session this whole increment exists for. The blockchain module
+/// aborted, took the daemon with it, and the respawn truncated the log its
+/// `critical` line was written to — so by the time anyone looked, the only
+/// artefact left was a row reading "not loaded". It has to read `crashed`,
+/// on the strength of the transition alone.
+#[tokio::test(start_paused = true)]
+async fn a_crash_survives_the_restart_that_destroyed_its_log() {
+    let mut app = App::fresh();
+
+    app.online(&[]);
+    app.backend(build::modules(&[
+        ("chat_module", "loaded"),
+        ("delivery_module", "loaded"),
+        ("blockchain_module", "loaded"),
+    ]));
+
+    // Everything below the truncation: the log lines are gone with the
+    // file, so nothing here tells the app a module died.
+    app.script(build::restart(
+        &["chat_module", "delivery_module", "blockchain_module"],
+        &[
+            ("chat_module", "loaded"),
+            ("delivery_module", "loaded"),
+            ("blockchain_module", "not_loaded"),
+        ],
+    ));
+
+    assert_eq!(
+        app.module_status("blockchain_module"),
+        "crashed",
+        "the module that took the daemon down reads as merely idle\n{}",
+        app.screen(),
+    );
+    assert_eq!(
+        app.alarmed_modules(),
+        vec!["Blockchain".to_owned()],
+        "\nscreen:\n{}\n",
+        app.screen(),
+    );
+    assert_eq!(app.module_status("chat_module"), "loaded");
+    assert_eq!(app.module_status("delivery_module"), "loaded");
+}
+
+/// The other side of the same rule, and the one that keeps it usable. A
+/// restart takes every module away at once — legitimately, and as a *known*
+/// event — so the modules that come back may not be mistaken for four
+/// simultaneous deaths, and a module that was idle before it must not be
+/// buried by it either.
+#[tokio::test(start_paused = true)]
+async fn a_restart_everything_survives_leaves_no_module_looking_crashed() {
+    let mut app = App::fresh();
+
+    app.online(&[]);
+    app.backend(build::modules(&[
+        ("chat_module", "loaded"),
+        ("delivery_module", "loaded"),
+        ("blockchain_module", "not_loaded"),
+    ]));
+
+    app.script(build::restart(
+        &["chat_module", "delivery_module", "blockchain_module"],
+        &[
+            ("chat_module", "loaded"),
+            ("delivery_module", "loaded"),
+            ("blockchain_module", "not_loaded"),
+        ],
+    ));
+
+    assert_eq!(
+        app.alarmed_modules(),
+        Vec::<String>::new(),
+        "an ordinary restart painted the sidebar red\n{}",
+        app.screen(),
+    );
+    assert_eq!(app.module_status("chat_module"), "loaded");
+    assert_eq!(
+        app.module_status("blockchain_module"),
+        "not loaded",
+        "a module that was already idle was buried by the restart\n{}",
+        app.screen(),
+    );
+}
+
+/// A restart is otherwise invisible: it takes about four seconds, the fresh
+/// daemon reports an unremarkable module set, and the log that would have
+/// explained it has been truncated by the respawn. The user is left to
+/// account for a sidebar that emptied and refilled on its own — so the strip
+/// says what happened, quietly, and can be dismissed.
+#[tokio::test(start_paused = true)]
+async fn a_backend_that_restarted_underneath_the_user_says_so() {
+    let mut app = App::fresh();
+
+    app.online(&[]);
+    app.backend(build::modules(&[("chat_module", "loaded")]));
+
+    assert!(
+        !app.shows("restarted"),
+        "nothing has restarted yet\n{}",
+        app.screen(),
+    );
+
+    app.script(build::restart(
+        &["chat_module"],
+        &[("chat_module", "loaded")],
+    ));
+
+    assert!(
+        app.shows("The backend restarted"),
+        "a restart the user lived through left no trace\n{}",
+        app.screen(),
+    );
+
+    app.script(build::restart(
+        &["chat_module"],
+        &[("chat_module", "loaded")],
+    ));
+
+    assert!(
+        app.shows("The backend restarted 2 times"),
+        "the second restart in a session says less than the first\n{}",
+        app.screen(),
+    );
+
+    app.dismiss_restart_notice();
+
+    assert!(
+        !app.shows("The backend restarted"),
+        "a dismissed notice came back\n{}",
+        app.screen(),
+    );
+
+    // Dismissing is per restart, not for good: the next one is news again.
+    app.script(build::restart(
+        &["chat_module"],
+        &[("chat_module", "loaded")],
+    ));
+
+    assert!(
+        app.shows("The backend restarted 3 times"),
+        "{}",
+        app.screen()
+    );
+}
+
+/// The crash the sidebar exists to show, arriving during the one event that
+/// used to switch the whole inference off. `logos-chat` re-emits
+/// `Phase(InitialisingChat)` for every live `delivery_state_changed`
+/// carrying `initialising` — an ordinary blip on a backend that is up and
+/// answering polls — so treating that phase as "the stack is being
+/// assembled" let a real death be reported as `not loaded` and then lost for
+/// the rest of the run.
+#[tokio::test(start_paused = true)]
+async fn a_delivery_blip_does_not_hide_a_module_dying_behind_it() {
+    let mut app = App::fresh();
+
+    app.online(&[]);
+    app.backend(build::modules(&[
+        ("chat_module", "loaded"),
+        ("delivery_module", "loaded"),
+        ("blockchain_module", "loaded"),
+    ]));
+
+    app.script(build::delivery_blip());
+
+    // Nothing restarted; the daemon serves this poll itself.
+    app.backend(build::modules(&[
+        ("chat_module", "loaded"),
+        ("delivery_module", "loaded"),
+        ("blockchain_module", "not_loaded"),
+    ]));
+
+    assert_eq!(
+        app.module_status("blockchain_module"),
+        "crashed",
+        "a delivery blip was read as a rebuild and swallowed a death\n{}",
+        app.screen(),
+    );
+    assert_eq!(
+        app.module_status("logoscore"),
+        "loaded",
+        "the daemon answered this very poll and was called loading\n{}",
+        app.screen(),
+    );
+    assert_eq!(
+        app.module_status("chat_module"),
+        "loaded",
+        "a delivery blip is not chat being reloaded\n{}",
+        app.screen(),
+    );
+
+    app.script(build::delivery_recovered());
+    app.backend(build::modules(&[
+        ("chat_module", "loaded"),
+        ("delivery_module", "loaded"),
+        ("blockchain_module", "not_loaded"),
+    ]));
+
+    assert_eq!(
+        app.alarmed_modules(),
+        vec!["Blockchain".to_owned()],
+        "the crash was forgotten once delivery came back\n{}",
+        app.screen(),
+    );
+}
+
+/// `Loading` is a claim about work the app is doing, and the app loads
+/// exactly chat's closure. A module an operator loaded by hand is carried
+/// across a restart only so its absence can be read afterwards — nothing
+/// will reload it, so a row promising "not yet" could never be kept.
+#[tokio::test(start_paused = true)]
+async fn a_module_nothing_reloads_is_not_called_loading_by_the_restart() {
+    let mut app = App::fresh();
+
+    app.online(&[]);
+
+    // `logoscore load-module blockchain_module`, from a terminal we know
+    // nothing about.
+    app.backend(build::modules(&[
+        ("chat_module", "loaded"),
+        ("delivery_module", "loaded"),
+        ("blockchain_module", "loaded"),
+    ]));
+
+    app.script(build::loading_module());
+    app.backend(build::modules(&[
+        ("chat_module", "not_loaded"),
+        ("delivery_module", "not_loaded"),
+        ("blockchain_module", "not_loaded"),
+    ]));
+
+    assert_eq!(app.module_status("chat_module"), "loading");
+    assert_eq!(
+        app.module_status("blockchain_module"),
+        "not loaded",
+        "the app claimed to be loading a module it never loads\n{}",
+        app.screen(),
+    );
+
+    // Carrying it was still the point: it was up, and it did not come back.
+    app.script(build::startup_ladder());
+    app.backend(build::modules(&[
+        ("chat_module", "loaded"),
+        ("delivery_module", "loaded"),
+        ("blockchain_module", "not_loaded"),
+    ]));
+
+    assert_eq!(
+        app.module_status("blockchain_module"),
+        "crashed",
+        "\nscreen:\n{}\n",
+        app.screen(),
+    );
+}
+
+/// The end of the road, and the one place the inference has nowhere else to
+/// run: when the ladder gives up there is no daemon left to poll, so
+/// whatever the rows say now is final. A module that was running when the
+/// backend went down has to be left looking dead rather than merely idle —
+/// "not loaded" is the exact row text the original report complained about.
+#[tokio::test(start_paused = true)]
+async fn a_backend_that_gave_up_leaves_the_module_that_died_looking_dead() {
+    let mut app = App::fresh();
+
+    app.online(&[]);
+    app.backend(build::modules(&[
+        ("chat_module", "loaded"),
+        ("delivery_module", "loaded"),
+        ("blockchain_module", "loaded"),
+        ("capability_module", "not_loaded"),
+    ]));
+
+    app.script(build::restart_exhausted(3));
+
+    assert_eq!(
+        app.module_status("blockchain_module"),
+        "crashed",
+        "the backend gave up and the row went back to reading idle\n{}",
+        app.screen(),
+    );
+    assert_eq!(
+        app.module_status("capability_module"),
+        "not loaded",
+        "a module that was already idle was buried by the failure\n{}",
+        app.screen(),
+    );
+    assert_eq!(
+        app.alarmed_modules(),
+        vec![
+            "Chat".to_owned(),
+            "Delivery".to_owned(),
+            "Blockchain".to_owned(),
+        ],
+        "\nscreen:\n{}\n",
+        app.screen(),
+    );
+}
+
+/// The other half of the same rule, so the fix cannot be "call everything
+/// crashed". A first run that never gets a daemon up has modules that were
+/// asked to load and never appeared — they failed to load, which is not the
+/// same fact as having died, and a sidebar full of error marks on a backend
+/// that has never been up is a lie about processes that never ran.
+#[tokio::test(start_paused = true)]
+async fn a_first_run_that_never_starts_accuses_nothing_of_dying() {
+    let mut app = App::fresh();
+
+    app.script(build::loading_module());
+    app.backend(build::modules(&[
+        ("chat_module", "not_loaded"),
+        ("delivery_module", "not_loaded"),
+        ("blockchain_module", "not_loaded"),
+    ]));
+
+    assert_eq!(app.module_status("chat_module"), "loading");
+
+    app.script(build::restart_exhausted(3));
+
+    assert_eq!(
+        app.alarmed_modules(),
+        Vec::<String>::new(),
+        "modules that never ran were accused of crashing\n{}",
+        app.screen(),
+    );
+    assert_eq!(app.module_status("chat_module"), "not loaded");
 }

@@ -84,13 +84,21 @@ pub fn view<'a>(
         )
         .map(Message::ScrollView),
     )
+    .width(Length::Fill)
     .height(Length::Fill);
 
     let banner = (module.map(|module| &module.status)
         == Some(&module::Status::Crashed))
     .then(|| crash_banner(state, theme));
 
-    container(column![banner, messages])
+    // Both the column and the scrollback it holds must be told to fill.
+    // A `column!` is `Shrink` by default, and a `Shrink` parent resolves its
+    // children against their *intrinsic* width — which, for a scrollback of
+    // wrappable text, collapses to about one character and renders every log
+    // line as a vertical column of letters. The logs pane never hit this
+    // because it puts the scrollback straight into a filling container; this
+    // pane grew a column to carry the crash banner and inherited the trap.
+    container(column![banner, messages].width(Length::Fill))
         .width(Length::Fill)
         .height(Length::Fill)
         .padding(8)
@@ -100,7 +108,7 @@ pub fn view<'a>(
 /// What to show instead of an empty scrollback.
 ///
 /// A module log has no backlog to fetch, so "nothing here" is a fact about
-/// the world rather than a load in progress — and the four worlds it can mean
+/// the module rather than a pane still fetching — and the worlds it can mean
 /// are worth telling apart. A crashed module never lands here: its lines are
 /// the reason to look, so it keeps the log and gets a banner over it.
 fn placeholder<'a>(
@@ -125,6 +133,9 @@ fn placeholder<'a>(
             format!("{name} crashed before it logged anything")
         }
         Some(module::Status::Loaded) => "No log output yet".to_owned(),
+        // A load in flight is the one empty pane that is about to stop
+        // being empty, so it says so rather than reporting the module off.
+        Some(module::Status::Loading) => format!("{name} is loading…"),
         Some(module::Status::NotLoaded) => format!("{name} is not loaded"),
         Some(module::Status::Unknown(raw)) => {
             format!("{name} is {raw}")

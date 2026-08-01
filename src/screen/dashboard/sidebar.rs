@@ -1059,6 +1059,12 @@ fn pulse<'a>(
 /// `Crashed` breaks the pattern deliberately, in both shape and colour, on
 /// the strength of `logos-modules.md` §5 — a module really does abort, and a row that
 /// merely dims is indistinguishable from one that was never started.
+///
+/// `Loading` breaks it the other way, and only in shape: an outlined disc
+/// that fills in when the module is up. It is deliberately not a colour
+/// change, because the colour it would have to take is the dim one
+/// `NotLoaded` already owns — and telling "not yet" from "off" is the entire
+/// reason the state exists.
 fn module_button<'a>(
     config: &'a Config,
     panes: &'a Panes,
@@ -1089,18 +1095,23 @@ fn module_button<'a>(
     let has_unread = history.has_unread(&kind);
     let crashed = module.status == data::module::Status::Crashed;
 
-    let icon: Element<'a, Message> = if crashed {
-        icon::error().style(theme::text::error).into()
-    } else {
-        icon::circle()
-            .style(match module.status {
-                data::module::Status::Loaded => theme::text::success,
-                data::module::Status::NotLoaded => theme::text::tertiary,
-                // A status we cannot read is not evidence of health.
-                data::module::Status::Crashed
-                | data::module::Status::Unknown(_) => theme::text::secondary,
-            })
-            .into()
+    let icon: Element<'a, Message> = match &module.status {
+        data::module::Status::Crashed => {
+            icon::error().style(theme::text::error).into()
+        }
+        data::module::Status::Loading => {
+            icon::circle_empty().style(theme::text::secondary).into()
+        }
+        data::module::Status::Loaded => {
+            icon::circle().style(theme::text::success).into()
+        }
+        data::module::Status::NotLoaded => {
+            icon::circle().style(theme::text::tertiary).into()
+        }
+        // A status we cannot read is not evidence of health.
+        data::module::Status::Unknown(_) => {
+            icon::circle().style(theme::text::secondary).into()
+        }
     };
 
     let title_style = if crashed {

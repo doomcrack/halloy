@@ -13,6 +13,23 @@ use crate::conversation::{self, Conversation, ConvoId, Kind, Member};
 use crate::delivery::{Delivery, DeliveryState, Identity};
 use crate::module::{self, Module, ModuleId, Status};
 
+/// How many reports a ladder may go on claiming to be running for.
+///
+/// The bound exists because the phase that ends a ladder — `Online` — is
+/// published by the delivery module, not by the ladder, and a delivery that
+/// never comes online never publishes it. Without a bound the rows the
+/// ladder claimed would read "loading" for the rest of the run, which is the
+/// original complaint ("stuck at not-loaded") wearing a nicer word.
+///
+/// It is counted in reports rather than seconds because this is a pure fold
+/// with no clock, and because reports are the signal that says what the
+/// bound is really about: the backend polls modules only from its main loop,
+/// so a report arriving is evidence the ladder has handed off. One report is
+/// expected during a ladder (the backend reseeds its own set on the way
+/// down); everything past that is the main loop running. Three ≈ 15s at the
+/// 5s poll, i.e. two polls of slack past the reseed before we stop promising.
+const LADDER_GRACE_POLLS: u32 = 3;
+
 #[derive(Debug, Clone, Default)]
 pub struct Session {
     pub delivery: Delivery,
@@ -25,14 +42,96 @@ pub struct Session {
     /// modules" and "not asked yet" are indistinguishable, and a placeholder
     /// would flicker on every launch.
     pub modules: Vec<Module>,
-    /// Modules the log has caught dying.
+    /// How many times the backend has restarted under this run.
+    ///
+    /// A restart is invisible by construction: it takes about four seconds,
+    /// the daemon log is truncated when the new process opens it, and the
+    /// fresh daemon reports a perfectly ordinary module set — so a user who
+    /// blinked has no way to tell that everything they were watching died
+    /// and came back. The count is the trace, and it is a count rather than
+    /// a flag because the second restart in a minute means something the
+    /// first does not.
+    pub restarts: u32,
+    /// Modules the log has caught dying, plus those a report caught
+    /// vanishing.
     ///
     /// Held apart from `modules` because the two facts arrive on different
     /// clocks: the crash is a log line, the status is a 5s poll, and either
     /// can land first. `listModules` never says `crashed` — it reports a
     /// dead module as `not_loaded`, exactly like one that never started —
     /// so without this the pane would go quiet and the row would look idle.
+    ///
+    /// It deliberately outlives a restart. The crash that *caused* the
+    /// restart is the one whose evidence the restart destroys, so forgetting
+    /// it here is forgetting it everywhere; a module that comes back clears
+    /// its own flag by loading.
     crashed: HashSet<ModuleId>,
+    /// Modules **the app is loading right now**.
+    ///
+    /// This is the whole warrant for [`Status::Loading`], and it is why the
+    /// state is never guessed from a poll: the set is chat's dependency
+    /// closure and nothing else, because `load_module(chat_module)` is the
+    /// only load the app performs. A module an operator loaded by hand is
+    /// never in it — nobody is loading that, so calling it "loading" would
+    /// be a plausible lie about work no one is doing.
+    ///
+    /// Membership is granted by the ladder and resolved by the first report
+    /// after the ladder ends. Membership alone is *not* evidence of death:
+    /// a module that was asked to load and never appeared failed to load; it
+    /// did not die. That inference belongs to [`Session::carried`].
+    loading: HashSet<ModuleId>,
+    /// Modules that **were running when a ladder tore the stack down**.
+    ///
+    /// Held apart from [`Session::loading`] because it answers a different
+    /// question and is used for exactly one thing: if such a module does not
+    /// come back, it died. It is never rendered — a module nothing is
+    /// loading may not read "loading" merely because it used to be up — so
+    /// the operator-loaded module that crashed and took the daemon with it
+    /// ends up `Crashed` without ever having claimed to be in flight.
+    ///
+    /// It is equally where a death *seen during* a ladder waits, since the
+    /// question is the same one: was it running, and did it come back? That
+    /// is what lets the fold defer such a verdict instead of discarding it.
+    carried: HashSet<ModuleId>,
+    /// Whether the backend's startup ladder is running.
+    ///
+    /// "The ladder is running" and nothing else: see [`Session::apply_phase`]
+    /// for which phases may say so. While it holds, a report describes a
+    /// stack that is still being assembled, so a module missing from it is
+    /// the rebuild talking rather than a death.
+    starting: bool,
+    /// Reports folded since the current ladder began.
+    ///
+    /// Bounds the claim a stalled ladder would otherwise make forever: the
+    /// `Loading` rows, via [`LADDER_GRACE_POLLS`].
+    ladder_polls: u32,
+    /// Whether anything has proved the daemon is answering since the last
+    /// time we were told it is being started.
+    ///
+    /// The daemon's own row is the one row no report contains, so it is
+    /// inferred — and the only report that is *not* evidence of a live
+    /// daemon is the one the backend publishes on its own behalf while the
+    /// process is down (`reset_modules`, on the way into a ladder). Which
+    /// report that is cannot be read off an arrival count: the restart path
+    /// publishes it between `Restarting` and `StartingDaemon`, the first-boot
+    /// path publishes it before the ladder opens at all. So the question is
+    /// asked of the evidence instead: the last rung is emitted from the far
+    /// side of a round trip the daemon served, and a second report can only
+    /// have come through the poll — either settles it, and both land before
+    /// the first poll of either path.
+    daemon_live: bool,
+}
+
+/// Chat's dependency closure: `chat_module` plus the `delivery_module` the
+/// daemon auto-loads with it.
+///
+/// The only modules the app itself ever loads, and therefore the only ones
+/// it may honestly call [`Status::Loading`].
+fn chat_closure() -> impl Iterator<Item = ModuleId> {
+    module::catalog()
+        .into_iter()
+        .filter(|module| module.protected)
+        .map(|module| module.id)
 }
 
 impl Session {
@@ -147,12 +246,44 @@ impl Session {
     /// open. Answering the poll at all is what makes it `Loaded`, and
     /// `protected` states the obvious: there is no sense in which the process
     /// hosting every module could be unloaded from under them.
+    ///
+    /// The daemon's own row reads `Loading` for the backend's reseed and for
+    /// nothing else. The reseed is a set the backend published on its own
+    /// behalf while the daemon was down, so calling the process we are still
+    /// starting `Loaded` is the one claim this row cannot make. Every other
+    /// report reached us through the module poll, which only a live daemon
+    /// can answer — so a ladder that stalls short of `Online` must not go on
+    /// calling the process that is demonstrably serving us "loading". Which
+    /// report is the reseed is decided by [`Session::daemon_live`] rather
+    /// than by counting arrivals, because the two startup paths publish it at
+    /// different points in the phase stream.
     fn apply_modules(&mut self, report: &[ModuleState]) {
         let staged = module::catalog();
+        let previous = std::mem::take(&mut self.modules);
+
+        // A report is the backend's main loop talking, and the main loop
+        // does not run while a ladder does. Past the reseed, one arriving
+        // with the ladder still unfinished means the ladder stalled — so the
+        // claims it made are withdrawn rather than left standing.
+        if self.starting {
+            self.ladder_polls += 1;
+            self.starting = self.ladder_polls <= LADDER_GRACE_POLLS;
+        }
+
+        let daemon = if self.starting && !self.daemon_live {
+            Status::Loading
+        } else {
+            Status::Loaded
+        };
+
+        // The backend publishes one set per teardown on its own behalf, so
+        // whatever this report was, a further one cannot be that seed: it
+        // came through the poll, and a poll is served by a live daemon.
+        self.daemon_live = true;
 
         self.modules = std::iter::once(Module {
             id: ModuleId::daemon(),
-            status: Status::Loaded,
+            status: daemon,
             version: None,
             dependencies: vec![],
             protected: true,
@@ -161,19 +292,14 @@ impl Session {
         .chain(report.iter().map(|state| {
             let id = ModuleId::from(state.name.as_str());
             let entry = staged.iter().find(|module| module.id == id);
-            let reported = Status::from_daemon(&state.status);
-
-            // A load clears the crash: the module is running again, and
-            // holding the flag would keep a healthy row red forever.
-            if reported.is_loaded() {
-                self.crashed.remove(&id);
-            }
-
-            let status = if self.crashed.contains(&id) {
-                Status::Crashed
-            } else {
-                reported
-            };
+            let status = self.resolve_status(
+                &id,
+                Status::from_daemon(&state.status),
+                previous
+                    .iter()
+                    .find(|module| module.id == id)
+                    .map(|module| &module.status),
+            );
 
             Module {
                 status,
@@ -192,13 +318,248 @@ impl Session {
         .collect();
     }
 
+    /// What one reported module is really doing, given what it was doing a
+    /// moment ago and whether the stack is mid-restart.
+    ///
+    /// The rule the daemon cannot express: a module we saw `Loaded` that
+    /// comes back `not_loaded` **died**. Nothing else can move it — the app
+    /// has no unload control, so there is no benign path from running to
+    /// gone — and inferring it here is what keeps a crash visible when the
+    /// respawn has truncated the log the `critical` line was on.
+    ///
+    /// The restart is the one exception, and it is an exception we *know*
+    /// about rather than guess at: while the ladder runs, every module
+    /// legitimately goes away at once, so nothing is called dead for it.
+    /// What was up is remembered in [`Session::carried`], and the first
+    /// report after the ladder finishes decides which of them came back.
+    /// That is how a module whose crash took the daemon with it ends up
+    /// crashed rather than merely absent, without painting the sidebar red
+    /// for the modules that returned.
+    ///
+    /// It is an exception that *defers*, never one that discards. A ladder's
+    /// window outlasts its rungs — it ends at `Online`, which delivery
+    /// publishes when it is ready to, so the main loop can already be polling
+    /// while the flag still holds — and a module seen running and then gone
+    /// inside that window is evidence just the same. Dropping it would lose
+    /// the crash for good, because the row the rule reads next time has by
+    /// then been rewritten to the absence it was supposed to explain.
+    ///
+    /// The evidence of death is *having been up*, never *having been asked
+    /// to come up*. A module the ladder loads that never appears has failed
+    /// to load, which is a different fact from having died, and is reported
+    /// as the daemon reports it: `not loaded`.
+    fn resolve_status(
+        &mut self,
+        id: &ModuleId,
+        reported: Status,
+        previous: Option<&Status>,
+    ) -> Status {
+        // A load clears the crash: the module is running again, and holding
+        // the flag would keep a healthy row red forever.
+        if reported.is_loaded() {
+            self.crashed.remove(id);
+            self.loading.remove(id);
+            self.carried.remove(id);
+
+            return reported;
+        }
+
+        if self.crashed.contains(id) {
+            return Status::Crashed;
+        }
+
+        if self.starting {
+            // Nothing is *decided* while the stack is being assembled — but
+            // nothing is thrown away either. A module we watched running that
+            // a report now calls gone is the same evidence it always was;
+            // the ladder is only a reason to wait and see whether it comes
+            // back, which is exactly what `carried` remembers.
+            if reported == Status::NotLoaded
+                && previous == Some(&Status::Loaded)
+            {
+                self.carried.insert(id.clone());
+            }
+
+            // The rows the app is loading say so; everything else is passed
+            // through exactly as the daemon worded it.
+            return if self.loading.contains(id) {
+                Status::Loading
+            } else {
+                reported
+            };
+        }
+
+        self.loading.remove(id);
+
+        let was_running =
+            self.carried.remove(id) || previous == Some(&Status::Loaded);
+
+        if reported == Status::NotLoaded && was_running {
+            self.crashed.insert(id.clone());
+
+            return Status::Crashed;
+        }
+
+        reported
+    }
+
+    /// Opens a ladder: notes what was running so its absence can be read
+    /// later, and claims the closure the ladder is about to load.
+    ///
+    /// The rows are rewritten immediately rather than waiting for the
+    /// backend's reseeded report, which arrives a moment later and says
+    /// `not_loaded` for everything: between the two, a row reading `loaded`
+    /// describes a process that has already been killed. What the app is
+    /// reloading reads `Loading`; what it is not reads `NotLoaded`, because
+    /// nothing is loading it and the process really is gone.
+    ///
+    /// It also withdraws the daemon's proof of life: whatever we knew about
+    /// the process, the ladder is about to start a different one.
+    fn begin_ladder(&mut self) {
+        let daemon = ModuleId::daemon();
+
+        self.starting = true;
+        self.ladder_polls = 0;
+        self.daemon_live = false;
+        self.loading = chat_closure().collect();
+
+        for module in &mut self.modules {
+            if module.id == daemon {
+                module.status = Status::Loading;
+
+                continue;
+            }
+
+            if module.status.is_loaded() {
+                self.carried.insert(module.id.clone());
+                module.status = Status::NotLoaded;
+            }
+
+            if self.loading.contains(&module.id) {
+                module.status = Status::Loading;
+            }
+        }
+    }
+
+    /// Closes a ladder that reached a verdict. The sets survive: the first
+    /// report after this is the one that decides what came back.
+    fn end_ladder(&mut self) {
+        self.starting = false;
+        self.ladder_polls = 0;
+    }
+
+    /// The ladder exhausted its attempts. Nothing is coming back, and no
+    /// further report will arrive to correct a row — so the inference has to
+    /// be settled here or it is lost in the one case where it matters most.
+    ///
+    /// A module that was running when the backend went down and has now been
+    /// given up on is dead, and says so. A module that was merely being
+    /// loaded never ran, so it is not called dead: it failed to load, and
+    /// reads as the daemon would report it.
+    fn abandon_ladder(&mut self) {
+        self.starting = false;
+        self.ladder_polls = 0;
+        self.loading.clear();
+
+        let carried = std::mem::take(&mut self.carried);
+
+        for module in &mut self.modules {
+            if carried.contains(&module.id) {
+                module.status = Status::Crashed;
+            } else if module.status == Status::Loading {
+                module.status = Status::NotLoaded;
+            }
+        }
+
+        self.crashed.extend(carried);
+    }
+
+    /// We are quitting. A clean stop kills every module by design, so
+    /// nothing here is evidence of anything and no claim outlives it.
+    fn stop_ladder(&mut self) {
+        self.starting = false;
+        self.ladder_polls = 0;
+        self.loading.clear();
+        self.carried.clear();
+
+        for module in &mut self.modules {
+            if module.status == Status::Loading {
+                module.status = Status::NotLoaded;
+            }
+        }
+    }
+
+    /// Folds one backend phase.
+    ///
+    /// Which phases mean "a stack is being assembled" is the load-bearing
+    /// question here, and it is not answerable from the variant names — it
+    /// depends on where `logos-chat` emits each one. Read off
+    /// `logos/chat/src/session.rs`:
+    ///
+    /// | Phase | emitted from | mid-run, outside a ladder? |
+    /// |---|---|---|
+    /// | `StartingDaemon` | `start_stack` | no — it *is* the first rung |
+    /// | `Connecting` | `connect_stack` | no |
+    /// | `LoadingModule` | `connect_stack` | no |
+    /// | `InitialisingChat` | `connect_stack` **and** `handle_delivery` | **yes** |
+    /// | `Online` | `handle_delivery` | yes |
+    /// | `DeliveryError` | `handle_delivery` | yes |
+    /// | `DeliveryStopped` | `handle_delivery` | yes |
+    /// | `Restarting` | the restart loop | no — it *is* the first rung |
+    /// | `Failed` | `fatal`, terminal | no |
+    /// | `ShuttingDown` | `quit`, terminal | no |
+    ///
+    /// `handle_delivery` runs from the main loop's event pump and from the
+    /// `chat.status()` seed at the end of the ladder, so every phase it
+    /// emits means the ladder is no longer climbing. Three of those are safe
+    /// verdicts. The fourth, `InitialisingChat`, is the trap: it is emitted
+    /// once as a rung and again on **any** live `delivery_state_changed`
+    /// carrying `initialising`, which a healthy backend does whenever
+    /// delivery blips. It is therefore a *continuation* inside a ladder and a
+    /// *live event* outside one, and may neither set nor clear the ladder
+    /// flag — treating it as a ladder is what swallowed real crashes and made
+    /// the live daemon's own row read "loading". What it does settle is
+    /// narrower and never in doubt: the daemon is answering.
     fn apply_phase(&mut self, phase: &Phase) {
-        // A restart means a fresh daemon and fresh module processes, so a
-        // crash learned from the previous one describes something that no
-        // longer exists. The backend reseeds its own module set on the same
-        // event.
-        if matches!(phase, Phase::StartingDaemon | Phase::Restarting { .. }) {
-            self.crashed.clear();
+        match phase {
+            // A restart tears down the daemon and every module process with
+            // it. `StartingDaemon` is included because it is also the first
+            // phase of a fresh run, where there is nothing to carry.
+            Phase::StartingDaemon | Phase::Restarting { .. } => {
+                self.begin_ladder();
+            }
+            // Rungs. They cannot open a ladder — there is nothing to carry
+            // by the time they arrive — but they do prove one is climbing.
+            Phase::Connecting => self.starting = true,
+            // The rung at which the app performs its one load.
+            Phase::LoadingModule => {
+                self.starting = true;
+                self.loading.extend(chat_closure());
+            }
+            Phase::Online
+            | Phase::DeliveryError { .. }
+            | Phase::DeliveryStopped => self.end_ladder(),
+            Phase::Failed => self.abandon_ladder(),
+            Phase::ShuttingDown => self.stop_ladder(),
+            // Ambiguous about the ladder by construction; see the table
+            // above. It is not ambiguous about the daemon: both emitters sit
+            // behind a round trip the daemon served — `connect_stack`
+            // publishes it having already loaded a module over the link, and
+            // a live `delivery_state_changed` had to arrive from somewhere.
+            // It is also the last rung, so on either startup path it lands
+            // before the main loop can poll: whatever reports follow, none of
+            // them is the seed the backend published while the daemon was
+            // down.
+            Phase::InitialisingChat => self.daemon_live = true,
+        }
+
+        // Only the first attempt of an episode is a restart; the ones after
+        // it are this restart failing to take, and the status bar would be
+        // counting its own retries.
+        if let Phase::Restarting { attempt } = phase
+            && *attempt == 1
+        {
+            self.restarts += 1;
         }
 
         // The detail spells the phase out so the status bar can say more
@@ -655,22 +1016,743 @@ mod tests {
         assert_eq!(session.module(&id).unwrap().status, Status::Crashed);
     }
 
-    /// A restart hands us a fresh daemon and fresh module processes, so a
-    /// crash held from the previous one describes a process that no longer
-    /// exists.
+    /// The motivating session, in miniature: the module that aborted took
+    /// the daemon with it, the respawn truncated the log the crash was
+    /// written to, and the fresh daemon reports an unremarkable
+    /// `not_loaded`. If the restart clears the flag, the only surviving
+    /// evidence of the crash is gone — which is precisely what made a
+    /// crashed module read as one that was never started.
     #[test]
-    fn restarting_the_stack_forgets_the_previous_run_crash() {
+    fn a_crash_outlives_the_restart_it_caused() {
         let mut session = Session::default();
         let id = ModuleId::from("blockchain_module");
 
         session.note_module_crash(&id);
+        session.apply(&Update::Phase(Phase::Restarting { attempt: 1 }));
         session.apply(&Update::Phase(Phase::StartingDaemon));
+        session.apply(&Update::Phase(Phase::Online));
         session.apply(&Update::Modules(vec![reported(
             "blockchain_module",
             "not_loaded",
         )]));
 
+        assert_eq!(session.module(&id).unwrap().status, Status::Crashed);
+
+        // Loading it again is the only thing that clears it, restart or no
+        // restart: the module is running, so the row must not stay red.
+        session.apply(&Update::Modules(vec![reported(
+            "blockchain_module",
+            "loaded",
+        )]));
+
+        assert_eq!(session.module(&id).unwrap().status, Status::Loaded);
+    }
+
+    /// The rule the daemon's two-word vocabulary cannot state: a module we
+    /// watched run, which the next poll calls `not_loaded`, died. The app
+    /// has no unload control, so there is no innocent way to make that
+    /// transition — and it is the one piece of crash evidence a truncated
+    /// log cannot destroy.
+    #[test]
+    fn a_module_that_stops_being_loaded_on_its_own_is_a_crash() {
+        let mut session = Session::default();
+        let id = ModuleId::from("blockchain_module");
+
+        session.apply(&Update::Phase(Phase::Online));
+        session.apply(&Update::Modules(vec![reported(
+            "blockchain_module",
+            "loaded",
+        )]));
+        session.apply(&Update::Modules(vec![reported(
+            "blockchain_module",
+            "not_loaded",
+        )]));
+
+        assert_eq!(session.module(&id).unwrap().status, Status::Crashed);
+    }
+
+    /// A restart is the one time every module legitimately goes away at
+    /// once, and it is a *known* event rather than an inference — so it must
+    /// not be read as four simultaneous crashes. What was running is held as
+    /// coming back; what was idle stays idle and is claimed for nothing.
+    #[test]
+    fn a_restart_holds_what_was_running_instead_of_burying_it() {
+        let mut session = Session::default();
+        let chat = ModuleId::from("chat_module");
+        let blockchain = ModuleId::from("blockchain_module");
+
+        session.apply(&Update::Phase(Phase::Online));
+        session.apply(&Update::Modules(vec![
+            reported("chat_module", "loaded"),
+            reported("blockchain_module", "not_loaded"),
+        ]));
+
+        session.apply(&Update::Phase(Phase::Restarting { attempt: 1 }));
+
+        assert_eq!(
+            session.module(&chat).unwrap().status,
+            Status::Loading,
+            "a row still reading loaded describes a killed process",
+        );
+        assert_eq!(
+            session.module(&ModuleId::daemon()).unwrap().status,
+            Status::Loading,
+            "the daemon is the process being restarted",
+        );
+
+        // The backend reseeds its own set on the way back up, and says
+        // `not_loaded` for everything. None of that is a death.
+        session.apply(&Update::Phase(Phase::StartingDaemon));
+        session.apply(&Update::Modules(vec![
+            reported("chat_module", "not_loaded"),
+            reported("blockchain_module", "not_loaded"),
+        ]));
+
+        assert_eq!(session.module(&chat).unwrap().status, Status::Loading);
+        assert_eq!(
+            session.module(&blockchain).unwrap().status,
+            Status::NotLoaded,
+            "a module that was not running is not coming back either",
+        );
+
+        session.apply(&Update::Phase(Phase::Online));
+        session.apply(&Update::Modules(vec![
+            reported("chat_module", "loaded"),
+            reported("blockchain_module", "not_loaded"),
+        ]));
+
+        assert_eq!(session.module(&chat).unwrap().status, Status::Loaded);
+        assert_eq!(
+            session.module(&blockchain).unwrap().status,
+            Status::NotLoaded,
+        );
+        assert_eq!(session.restarts, 1);
+    }
+
+    /// The other half of the restart rule. Everything went away together,
+    /// but only one of them failed to come back — and "absent after a
+    /// restart it caused" is the same fact as "crashed", stated by the one
+    /// signal the truncation left us.
+    #[test]
+    fn a_module_that_does_not_come_back_from_a_restart_reads_crashed() {
+        let mut session = Session::default();
+        let chat = ModuleId::from("chat_module");
+        let blockchain = ModuleId::from("blockchain_module");
+
+        session.apply(&Update::Phase(Phase::Online));
+        session.apply(&Update::Modules(vec![
+            reported("chat_module", "loaded"),
+            reported("blockchain_module", "loaded"),
+        ]));
+
+        session.apply(&Update::Phase(Phase::Restarting { attempt: 1 }));
+        session.apply(&Update::Phase(Phase::StartingDaemon));
+        session.apply(&Update::Phase(Phase::LoadingModule));
+        session.apply(&Update::Phase(Phase::Online));
+
+        session.apply(&Update::Modules(vec![
+            reported("chat_module", "loaded"),
+            reported("blockchain_module", "not_loaded"),
+        ]));
+
+        assert_eq!(session.module(&chat).unwrap().status, Status::Loaded);
+        assert_eq!(
+            session.module(&blockchain).unwrap().status,
+            Status::Crashed,
+        );
+    }
+
+    /// Honest ignorance beats a plausible lie. A module an operator loads by
+    /// hand is only ever seen after the fact, in a poll — we did not watch
+    /// it start, so it goes straight from idle to running and is never
+    /// dressed up as something we were doing.
+    #[test]
+    fn a_module_loaded_behind_our_back_is_never_called_loading() {
+        let mut session = Session::default();
+        let id = ModuleId::from("blockchain_module");
+
+        session.apply(&Update::Phase(Phase::Online));
+        session.apply(&Update::Modules(vec![reported(
+            "blockchain_module",
+            "not_loaded",
+        )]));
         assert_eq!(session.module(&id).unwrap().status, Status::NotLoaded);
+
+        session.apply(&Update::Modules(vec![reported(
+            "blockchain_module",
+            "loaded",
+        )]));
+        assert_eq!(session.module(&id).unwrap().status, Status::Loaded);
+    }
+
+    /// The ladder loads chat itself, so that is the one module set a first
+    /// run may honestly call `Loading` — chat and the dependency the daemon
+    /// auto-loads with it, and nothing else.
+    #[test]
+    fn the_module_the_ladder_loads_reads_loading_while_it_does() {
+        let mut session = Session::default();
+
+        session.apply(&Update::Phase(Phase::StartingDaemon));
+        session.apply(&Update::Phase(Phase::LoadingModule));
+        session.apply(&Update::Modules(vec![
+            reported("chat_module", "not_loaded"),
+            reported("delivery_module", "not_loaded"),
+            reported("blockchain_module", "not_loaded"),
+        ]));
+
+        assert_eq!(
+            session
+                .modules
+                .iter()
+                .map(|module| (module.id.to_string(), module.status.label()))
+                .collect::<Vec<_>>(),
+            vec![
+                ("logoscore".to_owned(), "loading"),
+                ("chat_module".to_owned(), "loading"),
+                ("delivery_module".to_owned(), "loading"),
+                ("blockchain_module".to_owned(), "not loaded"),
+            ],
+        );
+    }
+
+    /// A ladder that gave up is not a load in flight. There will be no
+    /// further report to correct the row, so the promise has to be withdrawn
+    /// here rather than left on screen for the rest of the run.
+    #[test]
+    fn a_failed_backend_stops_claiming_anything_is_loading() {
+        let mut session = Session::default();
+        let id = ModuleId::from("chat_module");
+
+        session.apply(&Update::Phase(Phase::LoadingModule));
+        session.apply(&Update::Modules(vec![reported(
+            "chat_module",
+            "not_loaded",
+        )]));
+        assert_eq!(session.module(&id).unwrap().status, Status::Loading);
+
+        session.apply(&Update::Phase(Phase::Failed));
+
+        assert_eq!(session.module(&id).unwrap().status, Status::NotLoaded);
+    }
+
+    /// The restart count is the only trace a recovered restart leaves, and
+    /// it counts episodes rather than the ladder's own retries — otherwise
+    /// one backend death that took three attempts to recover from would
+    /// report itself three times.
+    #[test]
+    fn the_restart_count_counts_episodes_not_attempts() {
+        let mut session = Session::default();
+
+        assert_eq!(session.restarts, 0);
+
+        session.apply(&Update::Phase(Phase::Restarting { attempt: 1 }));
+        session.apply(&Update::Phase(Phase::Restarting { attempt: 2 }));
+        session.apply(&Update::Phase(Phase::Restarting { attempt: 3 }));
+        assert_eq!(session.restarts, 1);
+
+        session.apply(&Update::Phase(Phase::Online));
+        session.apply(&Update::Phase(Phase::Restarting { attempt: 1 }));
+        assert_eq!(session.restarts, 2);
+    }
+
+    /// `Phase::InitialisingChat` is not a ladder. `logos-chat` re-emits it
+    /// for every live `delivery_state_changed("initialising")`, which a
+    /// healthy backend does whenever delivery blips — so reading it as "the
+    /// stack is being assembled" hands the whole crash inference an
+    /// off-switch that an ordinary wire event can flip. A module dying
+    /// during the blip was swallowed as merely `not_loaded`, and because
+    /// that rewrote its `previous`, the `Loaded -> NotLoaded` rule could
+    /// never fire for it again: the crash was lost for the rest of the run.
+    #[test]
+    fn a_live_delivery_blip_does_not_swallow_a_crash() {
+        let mut session = Session::default();
+        let blockchain = ModuleId::from("blockchain_module");
+
+        session.apply(&Update::Phase(Phase::Online));
+        session.apply(&Update::Modules(vec![
+            reported("chat_module", "loaded"),
+            reported("blockchain_module", "loaded"),
+        ]));
+
+        // No restart, no daemon death: delivery re-entered initialising and
+        // the backend said so the only way it can.
+        session.apply(&Update::Phase(Phase::InitialisingChat));
+
+        session.apply(&Update::Modules(vec![
+            reported("chat_module", "loaded"),
+            reported("blockchain_module", "not_loaded"),
+        ]));
+
+        assert_eq!(
+            session.module(&blockchain).unwrap().status,
+            Status::Crashed,
+            "a delivery blip was read as the stack being rebuilt",
+        );
+
+        // And it survives delivery recovering, which is where the old rule
+        // lost it for good.
+        session.apply(&Update::Phase(Phase::Online));
+        session.apply(&Update::Modules(vec![
+            reported("chat_module", "loaded"),
+            reported("blockchain_module", "not_loaded"),
+        ]));
+
+        assert_eq!(
+            session.module(&blockchain).unwrap().status,
+            Status::Crashed,
+        );
+    }
+
+    /// The row a user reads as "is the backend up" may not be fabricated.
+    /// The daemon answered the poll being folded, so it is up — and while
+    /// `InitialisingChat` counted as a ladder, an ordinary delivery blip put
+    /// the live daemon's own row into "loading".
+    #[test]
+    fn the_daemon_that_answered_the_poll_is_not_still_starting() {
+        let mut session = Session::default();
+
+        session.apply(&Update::Phase(Phase::Online));
+        session
+            .apply(&Update::Modules(vec![reported("chat_module", "loaded")]));
+        session.apply(&Update::Phase(Phase::InitialisingChat));
+        session
+            .apply(&Update::Modules(vec![reported("chat_module", "loaded")]));
+
+        assert_eq!(
+            session.module(&ModuleId::daemon()).unwrap().status,
+            Status::Loaded,
+            "the daemon served the very poll this row was built from",
+        );
+    }
+
+    /// The daemon's row is `Loading` for the one report that is not a daemon
+    /// speaking — the backend reseeding its staged set on the way down —
+    /// and `Loaded` for every report after it, because a report past the
+    /// reseed came through the module poll and only a live daemon answers
+    /// those. A ladder that stalls therefore cannot go on calling the
+    /// process that is serving us "loading".
+    #[test]
+    fn only_the_backends_own_reseed_leaves_the_daemon_row_loading() {
+        let mut session = Session::default();
+
+        session.apply(&Update::Phase(Phase::Restarting { attempt: 1 }));
+        session.apply(&Update::Modules(vec![reported(
+            "chat_module",
+            "not_loaded",
+        )]));
+
+        assert_eq!(
+            session.module(&ModuleId::daemon()).unwrap().status,
+            Status::Loading,
+            "the reseed is published while the daemon is down",
+        );
+
+        session.apply(&Update::Modules(vec![reported(
+            "chat_module",
+            "not_loaded",
+        )]));
+
+        assert_eq!(
+            session.module(&ModuleId::daemon()).unwrap().status,
+            Status::Loaded,
+            "a poll answered mid-ladder is a daemon that is up",
+        );
+    }
+
+    /// Whether a report is the backend's own seed or a daemon answering
+    /// cannot be read off its arrival number, because the two startup paths
+    /// publish the seed at different points in the phase stream: first boot
+    /// emits it before the ladder opens at all, a restart emits it between
+    /// `Restarting` and `StartingDaemon`. A count reset by the ladder is
+    /// therefore spent on a poll a live daemon served, and the row reads
+    /// "loading" for a process that just answered us.
+    #[test]
+    fn neither_startup_path_calls_a_poll_the_daemon_answered_loading() {
+        let daemon = |session: &Session| {
+            session.module(&ModuleId::daemon()).unwrap().status.clone()
+        };
+
+        // First boot: `start_stack` reseeds before it says a word.
+        let mut session = Session::default();
+        session.apply(&Update::Modules(vec![reported(
+            "chat_module",
+            "not_loaded",
+        )]));
+        session.apply(&Update::Phase(Phase::StartingDaemon));
+
+        assert_eq!(
+            daemon(&session),
+            Status::Loading,
+            "the process the ladder is starting is not up yet",
+        );
+
+        session.apply(&Update::Phase(Phase::Connecting));
+        session.apply(&Update::Phase(Phase::LoadingModule));
+        // Delivery is still syncing, so the seed at the end of the ladder
+        // publishes this instead of `Online` and the flag stays up.
+        session.apply(&Update::Phase(Phase::InitialisingChat));
+        session
+            .apply(&Update::Modules(vec![reported("chat_module", "loaded")]));
+
+        assert_eq!(
+            daemon(&session),
+            Status::Loaded,
+            "that report came through the poll, which only a live daemon \
+             answers",
+        );
+
+        // Restart: the reseed lands inside the ladder this time.
+        let mut session = Session::default();
+        session.apply(&Update::Phase(Phase::Online));
+        session
+            .apply(&Update::Modules(vec![reported("chat_module", "loaded")]));
+        session.apply(&Update::Phase(Phase::Restarting { attempt: 1 }));
+        session.apply(&Update::Modules(vec![reported(
+            "chat_module",
+            "not_loaded",
+        )]));
+
+        assert_eq!(
+            daemon(&session),
+            Status::Loading,
+            "the reseed is published while the daemon is down",
+        );
+
+        session.apply(&Update::Phase(Phase::StartingDaemon));
+        session.apply(&Update::Phase(Phase::Connecting));
+        session.apply(&Update::Phase(Phase::LoadingModule));
+        session.apply(&Update::Phase(Phase::InitialisingChat));
+        session
+            .apply(&Update::Modules(vec![reported("chat_module", "loaded")]));
+
+        assert_eq!(
+            daemon(&session),
+            Status::Loaded,
+            "the ladder's own reset spent the seed allowance on a real poll",
+        );
+    }
+
+    /// A ladder's window outlasts its rungs: `connect_stack` ends by seeding
+    /// `chat.status()`, and a delivery that has not finished syncing answers
+    /// `InitialisingChat` — no verdict at all — so the flag stays up while
+    /// the main loop is already polling every 5s. A module that dies in
+    /// there used to be discarded: the raw `not loaded` was rendered and
+    /// forgotten, and because that rewrote the row the rule reads, the crash
+    /// could never be re-derived afterwards. The ladder is a reason to defer
+    /// the verdict, never to drop the evidence.
+    #[test]
+    fn a_crash_inside_the_ladder_window_is_deferred_not_discarded() {
+        let mut session = Session::default();
+        let blockchain = ModuleId::from("blockchain_module");
+
+        session.apply(&Update::Phase(Phase::StartingDaemon));
+        session.apply(&Update::Phase(Phase::Connecting));
+        session.apply(&Update::Phase(Phase::LoadingModule));
+        session.apply(&Update::Phase(Phase::InitialisingChat));
+
+        session.apply(&Update::Modules(vec![
+            reported("chat_module", "loaded"),
+            reported("blockchain_module", "loaded"),
+        ]));
+        session.apply(&Update::Modules(vec![
+            reported("chat_module", "loaded"),
+            reported("blockchain_module", "not_loaded"),
+        ]));
+
+        session.apply(&Update::Phase(Phase::Online));
+        session.apply(&Update::Modules(vec![
+            reported("chat_module", "loaded"),
+            reported("blockchain_module", "not_loaded"),
+        ]));
+
+        assert_eq!(
+            session.module(&blockchain).unwrap().status,
+            Status::Crashed,
+            "a module was watched dying and the ladder swallowed it",
+        );
+        assert_eq!(
+            session
+                .module(&ModuleId::from("chat_module"))
+                .unwrap()
+                .status,
+            Status::Loaded,
+        );
+    }
+
+    /// The guard the deferral must not trample. Everything going away at
+    /// once is what a restart *is*, so a stack that comes back whole is not
+    /// four deaths — including when the modules blink through the ladder's
+    /// window, which is the same window a real crash is now deferred into.
+    #[test]
+    fn a_restart_that_returns_whole_leaves_nothing_looking_crashed() {
+        let mut session = Session::default();
+
+        session.apply(&Update::Phase(Phase::Online));
+        session.apply(&Update::Modules(vec![
+            reported("chat_module", "loaded"),
+            reported("blockchain_module", "loaded"),
+        ]));
+
+        session.apply(&Update::Phase(Phase::Restarting { attempt: 1 }));
+        session.apply(&Update::Phase(Phase::StartingDaemon));
+        session.apply(&Update::Phase(Phase::Connecting));
+        session.apply(&Update::Phase(Phase::LoadingModule));
+        session.apply(&Update::Phase(Phase::InitialisingChat));
+
+        // Still inside the window: the daemon is up and answering, and the
+        // modules are coming back one poll behind it.
+        session.apply(&Update::Modules(vec![
+            reported("chat_module", "not_loaded"),
+            reported("blockchain_module", "not_loaded"),
+        ]));
+        session.apply(&Update::Modules(vec![
+            reported("chat_module", "loaded"),
+            reported("blockchain_module", "loaded"),
+        ]));
+
+        session.apply(&Update::Phase(Phase::Online));
+        session.apply(&Update::Modules(vec![
+            reported("chat_module", "loaded"),
+            reported("blockchain_module", "loaded"),
+        ]));
+
+        assert!(
+            session
+                .modules
+                .iter()
+                .all(|module| module.status != Status::Crashed),
+            "an ordinary restart was read as the modules dying in it",
+        );
+        assert!(
+            session.crashed.is_empty(),
+            "and nothing is remembered as dead"
+        );
+    }
+
+    /// `Loading` means *the app is loading this*, and the app loads exactly
+    /// chat's closure. A module an operator loaded by hand is carried
+    /// through a restart only so its absence can be read afterwards — it is
+    /// never dressed up as work in flight, because nothing will ever reload
+    /// it and the promise could not be kept.
+    #[test]
+    fn a_module_nothing_is_loading_never_reads_loading_through_a_restart() {
+        let mut session = Session::default();
+        let blockchain = ModuleId::from("blockchain_module");
+
+        session.apply(&Update::Phase(Phase::Online));
+        session.apply(&Update::Modules(vec![
+            reported("chat_module", "loaded"),
+            reported("blockchain_module", "loaded"),
+        ]));
+
+        let ladder = [
+            Phase::Restarting { attempt: 1 },
+            Phase::StartingDaemon,
+            Phase::Connecting,
+            Phase::LoadingModule,
+            Phase::InitialisingChat,
+        ];
+
+        for phase in ladder {
+            session.apply(&Update::Phase(phase));
+
+            assert_ne!(
+                session.module(&blockchain).unwrap().status,
+                Status::Loading,
+                "claimed to be loading a module nothing loads",
+            );
+        }
+
+        session.apply(&Update::Modules(vec![
+            reported("chat_module", "not_loaded"),
+            reported("blockchain_module", "not_loaded"),
+        ]));
+
+        assert_eq!(
+            session
+                .module(&ModuleId::from("chat_module"))
+                .unwrap()
+                .status,
+            Status::Loading,
+            "the ladder really is loading chat",
+        );
+        assert_ne!(
+            session.module(&blockchain).unwrap().status,
+            Status::Loading,
+        );
+
+        // Carrying it was still the point: it was up, it did not come back.
+        session.apply(&Update::Phase(Phase::Online));
+        session.apply(&Update::Modules(vec![
+            reported("chat_module", "loaded"),
+            reported("blockchain_module", "not_loaded"),
+        ]));
+
+        assert_eq!(
+            session.module(&blockchain).unwrap().status,
+            Status::Crashed,
+        );
+    }
+
+    /// A promise of "not yet" that is never resolved is the original
+    /// complaint with a nicer word on it. `Online` is published by the
+    /// delivery module rather than by the ladder, so a delivery that never
+    /// comes online never ends the ladder — and the rows it claimed would
+    /// read "loading" for the rest of the run. Reports are the bound: the
+    /// backend polls modules only from its main loop, so one arriving past
+    /// the reseed says the ladder has handed off and stalled.
+    #[test]
+    fn a_stalled_ladder_stops_claiming_a_load_is_in_flight() {
+        let mut session = Session::default();
+        let chat = ModuleId::from("chat_module");
+
+        session.apply(&Update::Phase(Phase::Restarting { attempt: 1 }));
+        session.apply(&Update::Phase(Phase::StartingDaemon));
+        session.apply(&Update::Phase(Phase::Connecting));
+        session.apply(&Update::Phase(Phase::LoadingModule));
+        // The last phase this run will ever emit: delivery never reaches
+        // online and the backend never gives up either.
+        session.apply(&Update::Phase(Phase::InitialisingChat));
+
+        for _ in 0..50 {
+            session.apply(&Update::Modules(vec![reported(
+                "chat_module",
+                "not_loaded",
+            )]));
+        }
+
+        assert_eq!(
+            session.module(&chat).unwrap().status,
+            Status::NotLoaded,
+            "a load nobody is making was promised forever",
+        );
+        assert_eq!(
+            session.module(&ModuleId::daemon()).unwrap().status,
+            Status::Loaded,
+            "the daemon answered every one of those polls",
+        );
+    }
+
+    /// The grace is real, though: a ladder is allowed to be mid-flight while
+    /// the backend reseeds and polls again, and withdrawing the claim on the
+    /// first report would make `Loading` almost unobservable.
+    #[test]
+    fn the_ladders_claim_survives_the_reseed_that_follows_it() {
+        let mut session = Session::default();
+        let chat = ModuleId::from("chat_module");
+
+        session.apply(&Update::Phase(Phase::Restarting { attempt: 1 }));
+        session.apply(&Update::Modules(vec![reported(
+            "chat_module",
+            "not_loaded",
+        )]));
+
+        assert_eq!(session.module(&chat).unwrap().status, Status::Loading);
+
+        session.apply(&Update::Phase(Phase::StartingDaemon));
+        session.apply(&Update::Phase(Phase::LoadingModule));
+        session.apply(&Update::Modules(vec![reported(
+            "chat_module",
+            "not_loaded",
+        )]));
+
+        assert_eq!(session.module(&chat).unwrap().status, Status::Loading);
+    }
+
+    /// "Never came up" is not "died". A module the ladder was asked to load
+    /// and which never appeared has failed to load — claiming it crashed is
+    /// a statement about a process that never ran, and it would paint the
+    /// row red, glyph and crash banner included, on a healthy startup where
+    /// the daemon's dependency auto-load was one poll behind.
+    #[test]
+    fn a_module_that_never_came_up_did_not_crash() {
+        let mut session = Session::default();
+        let delivery = ModuleId::from("delivery_module");
+
+        session.apply(&Update::Phase(Phase::StartingDaemon));
+        session.apply(&Update::Phase(Phase::Connecting));
+        session.apply(&Update::Phase(Phase::LoadingModule));
+        session.apply(&Update::Phase(Phase::InitialisingChat));
+        session.apply(&Update::Phase(Phase::Online));
+
+        session.apply(&Update::Modules(vec![
+            reported("chat_module", "loaded"),
+            reported("delivery_module", "not_loaded"),
+        ]));
+
+        assert_eq!(
+            session.module(&delivery).unwrap().status,
+            Status::NotLoaded,
+            "a module that never ran was reported as having died",
+        );
+
+        // And it is not remembered as a crash either — the flag, once set,
+        // only a `loaded` report clears.
+        session.apply(&Update::Modules(vec![
+            reported("chat_module", "loaded"),
+            reported("delivery_module", "not_loaded"),
+        ]));
+
+        assert_eq!(
+            session.module(&delivery).unwrap().status,
+            Status::NotLoaded
+        );
+    }
+
+    /// The one case where the inference has nowhere else to run. When the
+    /// ladder exhausts its attempts there will be no further report, so a
+    /// module that was running when the backend went down has to be settled
+    /// here — and rewriting it to `not loaded` discards the crash in exactly
+    /// the situation where nothing is coming back to re-derive it.
+    #[test]
+    fn an_exhausted_ladder_leaves_what_died_looking_dead() {
+        let mut session = Session::default();
+        let blockchain = ModuleId::from("blockchain_module");
+        let capability = ModuleId::from("capability_module");
+
+        session.apply(&Update::Phase(Phase::Online));
+        session.apply(&Update::Modules(vec![
+            reported("blockchain_module", "loaded"),
+            reported("capability_module", "not_loaded"),
+        ]));
+
+        session.apply(&Update::Phase(Phase::Restarting { attempt: 1 }));
+        session.apply(&Update::Phase(Phase::Restarting { attempt: 2 }));
+        session.apply(&Update::Phase(Phase::Failed));
+
+        assert_eq!(
+            session.module(&blockchain).unwrap().status,
+            Status::Crashed,
+            "the module the user was watching die reads as merely off",
+        );
+        assert_eq!(
+            session.module(&capability).unwrap().status,
+            Status::NotLoaded,
+            "a module that was idle before the restart did not die in it",
+        );
+    }
+
+    /// A clean quit is the other terminal phase and it means the opposite:
+    /// every module is stopped on purpose, so nothing here is evidence of
+    /// anything and no row may be accused of dying.
+    #[test]
+    fn quitting_does_not_accuse_the_modules_it_stops() {
+        let mut session = Session::default();
+        let blockchain = ModuleId::from("blockchain_module");
+
+        session.apply(&Update::Phase(Phase::Online));
+        session.apply(&Update::Modules(vec![reported(
+            "blockchain_module",
+            "loaded",
+        )]));
+
+        session.apply(&Update::Phase(Phase::Restarting { attempt: 1 }));
+        session.apply(&Update::Phase(Phase::ShuttingDown));
+
+        assert_eq!(
+            session.module(&blockchain).unwrap().status,
+            Status::NotLoaded,
+        );
     }
 
     /// The daemon is the authority on what is running. A module we never

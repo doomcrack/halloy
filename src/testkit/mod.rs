@@ -235,6 +235,17 @@ impl App {
         self.open(data::Buffer::Internal(data::buffer::Internal::Logs));
     }
 
+    /// Clicking the status strip's restart notice away, which acknowledges
+    /// the restarts the session has counted so far — not restarts in
+    /// general, so a later one has to raise the notice again.
+    pub fn dismiss_restart_notice(&mut self) {
+        self.send(Message::Dashboard(screen::dashboard::Message::StatusBar(
+            screen::dashboard::status_bar::Message::AcknowledgeRestarts(
+                self.app.session.restarts,
+            ),
+        )));
+    }
+
     /// Clicking a sidebar row: opens `buffer`, or focuses the pane already
     /// showing it.
     pub fn open(&mut self, buffer: data::Buffer) {

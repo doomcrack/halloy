@@ -6,7 +6,7 @@ use data::pane::Axis;
 use data::{Buffer, Dashboard, Pane};
 
 use crate::stream::{
-    ActionError, ChatEvent, Conversation, ConvoId, Kind,
+    ActionError, ChatEvent, Conversation, ConvoId, DeliveryState, Kind,
     Message as WireMessage, ModuleState, Phase, Update,
 };
 
@@ -86,16 +86,100 @@ pub fn without_sidebar(mut dashboard: Dashboard) -> Dashboard {
 /// The phase ladder plus `Ready`, i.e. everything between the controller
 /// and the first snapshot.
 pub fn startup() -> Vec<Update> {
+    let mut updates = startup_ladder();
+
+    updates.push(Update::Ready {
+        my_address: "0xtestaddress".to_owned(),
+        installation_name: Some("testkit".to_owned()),
+    });
+
+    updates
+}
+
+/// The supervisor noticing the backend died and building it again, exactly
+/// as a real run emits it: the restart announcement, then the backend
+/// reseeding its own module set (`reset_modules` publishes `not_loaded` for
+/// everything it stages), then the ladder over again.
+///
+/// `staged` is what the reseeded report names — the modules the backend
+/// tracks, whatever they were doing before — and `restored` is what the
+/// daemon reports once it is up. A module missing from `restored` is one
+/// that did not come back.
+pub fn restart(staged: &[&str], restored: &[(&str, &str)]) -> Vec<Update> {
+    let mut updates = vec![Update::Phase(Phase::Restarting { attempt: 1 })];
+
+    updates.push(modules(
+        &staged
+            .iter()
+            .map(|name| (*name, "not_loaded"))
+            .collect::<Vec<_>>(),
+    ));
+    updates.extend(startup_ladder());
+    updates.push(modules(restored));
+
+    updates
+}
+
+/// The restart ladder running out of attempts: the backend tried, failed
+/// every time, and gave up. Nothing follows it — there is no daemon left to
+/// answer a poll, so whatever the rows say when this lands is what the user
+/// is left looking at.
+pub fn restart_exhausted(attempts: u32) -> Vec<Update> {
+    (1..=attempts)
+        .map(|attempt| Update::Phase(Phase::Restarting { attempt }))
+        .chain(std::iter::once(Update::Phase(Phase::Failed)))
+        .collect()
+}
+
+/// The phase ladder on its own — a (re)start with nothing else attached.
+pub fn startup_ladder() -> Vec<Update> {
     vec![
         Update::Phase(Phase::StartingDaemon),
         Update::Phase(Phase::Connecting),
         Update::Phase(Phase::LoadingModule),
         Update::Phase(Phase::InitialisingChat),
         Update::Phase(Phase::Online),
-        Update::Ready {
-            my_address: "0xtestaddress".to_owned(),
-            installation_name: Some("testkit".to_owned()),
-        },
+    ]
+}
+
+/// Delivery dropping back to `initialising` under a backend that is up and
+/// answering polls.
+///
+/// The shape that makes the phase ladder ambiguous, and it is an ordinary
+/// wire event rather than a fault: `handle_delivery` re-emits
+/// `Phase(InitialisingChat)` for **every** `delivery_state_changed`
+/// carrying `initialising`, so the same phase the ladder climbs also
+/// arrives mid-run with no restart behind it. The live event is forwarded
+/// first and the phase follows, exactly as the session machine orders them.
+pub fn delivery_blip() -> Vec<Update> {
+    vec![
+        Update::Event(ChatEvent::DeliveryStateChanged {
+            state: DeliveryState::Initialising,
+            detail: String::new(),
+        }),
+        Update::Phase(Phase::InitialisingChat),
+    ]
+}
+
+/// Delivery coming back from a blip, in the same order.
+pub fn delivery_recovered() -> Vec<Update> {
+    vec![
+        Update::Event(ChatEvent::DeliveryStateChanged {
+            state: DeliveryState::Online,
+            detail: String::new(),
+        }),
+        Update::Phase(Phase::Online),
+    ]
+}
+
+/// The ladder stopped part-way, at the phase the app loads chat in. What a
+/// module genuinely being loaded looks like from the UI's side.
+pub fn loading_module() -> Vec<Update> {
+    vec![
+        Update::Phase(Phase::Restarting { attempt: 1 }),
+        Update::Phase(Phase::StartingDaemon),
+        Update::Phase(Phase::Connecting),
+        Update::Phase(Phase::LoadingModule),
     ]
 }
 
