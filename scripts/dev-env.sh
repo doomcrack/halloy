@@ -87,8 +87,18 @@ export LOGOSCORE_BIN
 # far as `online` on it while the delivery node never starts. The narrower
 # dirs are the last resort: the daemon comes up on them but chat.init never
 # reaches delivery. Export LOGOS_MODULES_DIR to pin a different tree.
+#
+# v6 is preferred: it is the only tree carrying a blockchain_module that
+# can join the testnet (tag 0.2.0), so it is the one the module monitor
+# has anything interesting to show. v5 is deliberately absent from this
+# list — it carries a blockchain build from the upstream default branch,
+# which advertises an unsubstituted protocol name, fails to find a peer,
+# and aborts the module process on the way down (docs/logos-modules.md
+# §6). Pin it explicitly if you want to reproduce that.
 if [ -z "${LOGOS_MODULES_DIR:-}" ]; then
     for _frigicom_modules in \
+        "$_frigicom_artifacts/modules-live-v6" \
+        "$_frigicom_artifacts/modules-live-v4" \
         "$_frigicom_artifacts/modules-live-v3" \
         "$_frigicom_artifacts/modules-live-v2" \
         "$_frigicom_artifacts/modules-live" \
