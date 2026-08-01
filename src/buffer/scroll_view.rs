@@ -6,6 +6,7 @@ use data::buffer::RightAlignmentWidths;
 use data::config::buffer::HideConsecutiveEnabled;
 use data::conversation::ConvoId;
 use data::message::{self, Limit, Source};
+use data::module::ModuleId;
 use data::{Config, history};
 use iced::widget::{
     self, Scrollable, column, container, row, rule, scrollable, sensor, space,
@@ -67,6 +68,10 @@ pub enum Event {
 #[derive(Debug, Clone, Copy)]
 pub enum Kind<'a> {
     Conversation(&'a ConvoId),
+    /// One module's log. Borrowed like its conversation sibling — the kind is
+    /// rebuilt on every view pass and cloning the id per frame would be the
+    /// only allocation in the hot path.
+    Module(&'a ModuleId),
     Logs,
 }
 
@@ -76,6 +81,7 @@ impl From<Kind<'_>> for history::Kind {
             Kind::Conversation(convo_id) => {
                 history::Kind::Conversation(convo_id.clone())
             }
+            Kind::Module(module_id) => history::Kind::Module(module_id.clone()),
             Kind::Logs => history::Kind::Logs,
         }
     }

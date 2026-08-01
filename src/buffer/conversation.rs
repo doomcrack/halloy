@@ -1,11 +1,11 @@
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 use data::address::Address;
 use data::conversation::{ConvoId, Kind};
 use data::{Config, history};
 use iced::widget::{Space, column, container, row, text};
 use iced::{Length, Size, Task, alignment, padding};
-use tokio::time;
+use tokio::time::{self, Instant};
 
 use super::message_view::ConversationLayout;
 use super::{context_menu, input_view, scroll_view};
@@ -222,7 +222,10 @@ pub struct Conversation {
     pub show_details: bool,
     /// Copy-flash state for the details panel's copyable rows.
     pub details: details::State,
-    /// When this thread was opened, for the grace window.
+    /// When this thread was opened, for the grace window. A
+    /// `tokio::time::Instant` so the window and the redraw timer below sit
+    /// on the same clock: outside a runtime it is `std::time::Instant`,
+    /// under `#[tokio::test(start_paused = true)]` it is the virtual one.
     opened_at: Instant,
     /// When its messages landed, for the settle window; `None` while the
     /// module still owes them.

@@ -1835,6 +1835,52 @@ impl Dashboard {
         self.last_changed = Some(Instant::now());
     }
 
+    /// Reconciles every open pane — main window and popouts — against the
+    /// backend's conversation list, disposing of the ones whose
+    /// conversation is gone exactly as [`Self::conversation_deleted`] does.
+    ///
+    /// Conversation identity is ephemeral upstream: every backend run mints
+    /// fresh ids, so a restored `dashboard.json.gz` routinely names panes
+    /// nothing answers for. Left alone they request messages for dead ids
+    /// and settle into a permanently empty thread.
+    ///
+    /// The invariant it keeps: after any path that restores panes from disk,
+    /// no pane may name a conversation the backend does not have, and
+    /// nothing may be asked about a dead id. Its single caller is
+    /// `Frigicom::sync_histories`, which every such path goes through — the
+    /// first snapshot after launch and the screen rebuild a config reload
+    /// performs — and which reconciles before it tracks anything.
+    ///
+    /// Runs on EVERY snapshot, not just the first. A snapshot is only ever
+    /// emitted from a successful `list_conversations` — the startup ladder
+    /// aborts the whole stack when it fails, and the resync action skips
+    /// the emit on any error (`logos/chat/src/session.rs`) — so there is no
+    /// partial or placeholder snapshot to be fooled by, and an empty one
+    /// genuinely means zero conversations. Skipping later snapshots would
+    /// miss the case that motivates this the most: a backend restart
+    /// mid-session hands back a fresh daemon whose ids are all new.
+    ///
+    /// Focus needs no separate handling: it names a pane, and an emptied
+    /// pane persists as no `focus_buffer` at all rather than a dead id.
+    ///
+    /// Deliberately no special case for a conversation a `conversation_created`
+    /// push added since the snapshot was taken: `Session::apply` already drops
+    /// it on the same `replace_all`, so the pane and the sidebar entry agree,
+    /// and merging pushes forward across a snapshot belongs there, not here.
+    pub fn reconcile_conversations(&mut self, session: &data::Session) {
+        let vanished: HashSet<ConvoId> = self
+            .panes
+            .iter()
+            .filter_map(|(_, _, pane)| pane.buffer.convo_id())
+            .filter(|convo_id| !session.conversations.contains(convo_id))
+            .cloned()
+            .collect();
+
+        for convo_id in &vanished {
+            self.conversation_deleted(convo_id);
+        }
+    }
+
     /// Restores a failed send's text into the conversation's composer.
     /// The stored draft is written too (it was cleared at send time), so
     /// the text survives a pane switch — and lands at all when no pane
@@ -1940,6 +1986,16 @@ impl Dashboard {
 
     pub fn record_log(&mut self, record: data::log::Record) {
         self.history.record_log(record);
+    }
+
+    /// Files one tailed daemon-log line under the module it belongs to.
+    ///
+    /// Recorded whether or not a pane is open on that module: the history is
+    /// what a pane opened later reads, and dropping lines until someone looks
+    /// would make every module pane start empty at the moment it is most
+    /// wanted — right after something went wrong.
+    pub fn record_module_log(&mut self, line: data::module::tail::Line) {
+        self.history.record_module_log(line);
     }
 
     pub fn get_focused(&self) -> Option<(window::Id, pane_grid::Pane, &Pane)> {
@@ -2736,6 +2792,7 @@ impl Dashboard {
                         data::Conversation::display_name,
                     ),
                 ),
+                Buffer::Module(state) => Some(state.module.display_name()),
                 Buffer::Logs(_) => Some("Logs".to_string()),
                 Buffer::ConfigEditor(_) => Some("Config Editor".to_string()),
             }

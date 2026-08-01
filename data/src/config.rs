@@ -17,6 +17,7 @@ pub use self::display::Display;
 pub use self::keys::Keyboard;
 pub use self::logos::Logos;
 pub use self::logs::Logs;
+pub use self::modules::Modules;
 pub use self::notification::Notifications;
 pub use self::pane::Pane;
 pub use self::platform_specific::PlatformSpecific;
@@ -40,6 +41,7 @@ pub mod display;
 pub mod keys;
 pub mod logos;
 pub mod logs;
+pub mod modules;
 pub mod notification;
 pub mod pane;
 pub mod platform_specific;
@@ -69,6 +71,7 @@ pub struct Config {
     pub actions: Actions,
     pub display: Display,
     pub logs: Logs,
+    pub modules: Modules,
     pub platform_specific: PlatformSpecific,
     pub runtime: Runtime,
     pub check_for_update_on_launch: bool,
@@ -93,6 +96,7 @@ impl Default for Config {
             actions: Actions::default(),
             display: Display::default(),
             logs: Logs::default(),
+            modules: Modules::default(),
             platform_specific: PlatformSpecific::default(),
             runtime: Runtime::default(),
             check_for_update_on_launch: true,
@@ -448,6 +452,7 @@ impl Config {
             pub actions: Actions,
             pub display: Display,
             pub logs: Logs,
+            pub modules: Modules,
             pub platform_specific: PlatformSpecific,
             pub runtime: Runtime,
             pub check_for_update_on_launch: bool,
@@ -472,6 +477,7 @@ impl Config {
                     actions: Actions::default(),
                     display: Display::default(),
                     logs: Logs::default(),
+                    modules: Modules::default(),
                     platform_specific: PlatformSpecific::default(),
                     runtime: Runtime::default(),
                     check_for_update_on_launch: true,
@@ -507,6 +513,7 @@ impl Config {
             actions,
             display,
             logs,
+            modules,
             platform_specific,
             runtime,
             check_for_update_on_launch,
@@ -538,6 +545,7 @@ impl Config {
             actions,
             display,
             logs,
+            modules,
             platform_specific,
             runtime,
             check_for_update_on_launch,

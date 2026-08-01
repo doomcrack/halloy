@@ -11,18 +11,29 @@ pub use self::timestamp::Timestamp;
 use crate::appearance::theme::hex_to_color;
 use crate::config;
 use crate::conversation::ConvoId;
+use crate::module::ModuleId;
 use crate::serde::deserialize_strftime_date;
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(tag = "type", content = "id", rename_all = "kebab-case")]
 pub enum Buffer {
     Conversation(ConvoId),
+    /// A module's log stream. Parallel to `Conversation`, never nested under
+    /// one: a module is not something you talk to, and the sidebar groups the
+    /// two separately.
+    Module(ModuleId),
     Internal(Internal),
 }
 
 impl From<ConvoId> for Buffer {
     fn from(convo_id: ConvoId) -> Self {
         Self::Conversation(convo_id)
+    }
+}
+
+impl From<ModuleId> for Buffer {
+    fn from(module_id: ModuleId) -> Self {
+        Self::Module(module_id)
     }
 }
 
@@ -51,9 +62,14 @@ pub enum Internal {
 }
 
 impl Buffer {
+    /// Stable settings key. `module:` is a distinct namespace from `convo:`
+    /// on purpose — `Dashboard::load` sweeps every `convo:` key because
+    /// conversation identity is ephemeral, and module ids must not be caught
+    /// by that sweep.
     pub fn key(&self) -> String {
         match self {
             Buffer::Conversation(convo_id) => format!("convo:{convo_id}"),
+            Buffer::Module(module_id) => format!("module:{module_id}"),
             Buffer::Internal(internal) => internal.key(),
         }
     }
@@ -61,6 +77,14 @@ impl Buffer {
     pub fn convo_id(&self) -> Option<&ConvoId> {
         if let Self::Conversation(convo_id) = self {
             Some(convo_id)
+        } else {
+            None
+        }
+    }
+
+    pub fn module_id(&self) -> Option<&ModuleId> {
+        if let Self::Module(module_id) = self {
+            Some(module_id)
         } else {
             None
         }
@@ -360,6 +384,7 @@ where
 mod tests {
     use super::{Buffer, Color, Internal};
     use crate::conversation::ConvoId;
+    use crate::module::ModuleId;
 
     #[derive(Debug, serde::Deserialize)]
     struct Root {
@@ -414,6 +439,34 @@ mod tests {
         let json = serde_json::to_string(&internal).unwrap();
         assert_eq!(json, r#"{"type":"internal","id":"Logs"}"#);
         assert_eq!(serde_json::from_str::<Buffer>(&json).unwrap(), internal);
+    }
+
+    /// A module pane is persisted by its wire name, which is stable across
+    /// restarts — the whole reason the catalog is hardcoded — so the
+    /// persisted form must stay a bare, readable id.
+    #[test]
+    fn module_buffer_round_trips_by_wire_name() {
+        let module = Buffer::Module(ModuleId::from("blockchain_module"));
+        let json = serde_json::to_string(&module).unwrap();
+
+        assert_eq!(json, r#"{"type":"module","id":"blockchain_module"}"#);
+        assert_eq!(serde_json::from_str::<Buffer>(&json).unwrap(), module);
+        assert_eq!(
+            module.module_id(),
+            Some(&ModuleId::from("blockchain_module"))
+        );
+        assert!(module.convo_id().is_none());
+        assert!(module.internal().is_none());
+    }
+
+    /// `module:` must not collide with the `convo:` namespace `Dashboard::load`
+    /// sweeps, or every module's settings would be dropped on every launch.
+    #[test]
+    fn module_key_is_its_own_namespace() {
+        let key = Buffer::Module(ModuleId::from("blockchain_module")).key();
+
+        assert_eq!(key, "module:blockchain_module");
+        assert!(!key.starts_with("convo:"));
     }
 
     #[test]

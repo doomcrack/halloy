@@ -1,10 +1,10 @@
 use data::{Config, history, message};
-use iced::widget::{container, row};
+use iced::widget::container;
 use iced::{Length, Size, Task};
 
-use super::{context_menu, scroll_view};
-use crate::widget::{Element, selectable_text};
-use crate::{Theme, font, theme};
+use super::{context_menu, log_row, scroll_view};
+use crate::Theme;
+use crate::widget::Element;
 
 #[derive(Debug, Clone)]
 pub enum Message {
@@ -36,54 +36,14 @@ pub fn view<'a>(
             {
                 message::Source::Internal(message::source::Internal::Logs(
                     level,
-                )) => {
-                    let timestamp = config
-                        .buffer
-                        .format_timestamp(&message.server_time)
-                        .map(|timestamp| {
-                            selectable_text(timestamp)
-                                .style(theme::selectable_text::timestamp)
-                                .font_maybe(
-                                    theme::font_style::timestamp(theme)
-                                        .map(font::get),
-                                )
-                        });
-
-                    let log_level_style = move |message_theme: &Theme| {
-                        theme::selectable_text::log_level(message_theme, *level)
-                    };
-                    let log_level = selectable_text(
-                        // Infer left or right alignment preference from
-                        // sender alignment setting
-                        if config.buffer.sender.alignment.is_right() {
-                            format!("{level: >5}")
-                        } else {
-                            format!("{level: <5}")
-                        },
-                    )
-                    .style(log_level_style)
-                    .font_maybe(
-                        theme::font_style::log_level(theme, *level)
-                            .map(font::get),
-                    );
-
-                    let message = selectable_text(message.text())
-                        .font_maybe(
-                            theme::font_style::primary(theme).map(font::get),
-                        )
-                        .style(theme::selectable_text::logs);
-
-                    Some(
-                        row![
-                            timestamp,
-                            selectable_text(" "),
-                            log_level,
-                            selectable_text(" "),
-                            message,
-                        ]
-                        .into(),
-                    )
-                }
+                )) => Some(log_row::view(
+                    &message.server_time,
+                    *level,
+                    None,
+                    message.text(),
+                    config,
+                    theme,
+                )),
                 _ => None,
             },
         )

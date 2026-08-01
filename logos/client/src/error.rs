@@ -28,6 +28,10 @@ pub enum IpcError {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ModuleErrorCode {
     ModuleNotLoaded,
+    /// Only `getModuleInfo` produces this one, and it means the name is not
+    /// installed at all — distinct from `ModuleNotLoaded`, which means it is
+    /// installed and idle.
+    ModuleNotFound,
     MethodFailed,
     InvalidArgs,
     Internal,
@@ -38,6 +42,7 @@ impl ModuleErrorCode {
     pub fn parse(code: &str) -> Self {
         match code {
             "MODULE_NOT_LOADED" => Self::ModuleNotLoaded,
+            "MODULE_NOT_FOUND" => Self::ModuleNotFound,
             "METHOD_FAILED" => Self::MethodFailed,
             "INVALID_ARGS" => Self::InvalidArgs,
             "INTERNAL_ERROR" => Self::Internal,

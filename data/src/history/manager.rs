@@ -3,6 +3,7 @@ use std::collections::{HashMap, HashSet};
 use crate::conversation::ConvoId;
 use crate::history::{self, History, ReadMarker};
 use crate::message::Limit;
+use crate::module::ModuleId;
 use crate::{Message, input};
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
@@ -16,6 +17,12 @@ impl Resource {
             kind: history::Kind::Logs,
         }
     }
+
+    pub fn module(module_id: ModuleId) -> Self {
+        Self {
+            kind: history::Kind::Module(module_id),
+        }
+    }
 }
 
 #[derive(Debug, Default)]
@@ -26,9 +33,11 @@ pub struct Manager {
 
 impl Manager {
     /// Syncs the set of tracked histories with the currently open buffers.
-    /// Newly tracked kinds get a `Partial` entry so unread state accrues;
-    /// untracked `Full` histories collapse back to `Partial` (the module is
-    /// the message store — nothing to flush).
+    /// Newly tracked kinds get an entry so unread state accrues — `Partial`
+    /// for conversations, `Full` for kinds that await no snapshot (see
+    /// [`History::new`]). Untracked conversations collapse back to `Partial`
+    /// (the module is the message store — nothing to flush); the rest
+    /// keep their `Full` state, since nothing would ever refill them.
     pub fn track(&mut self, new_resources: HashSet<Resource>) {
         let added = new_resources
             .difference(&self.resources)
@@ -44,7 +53,7 @@ impl Manager {
             self.data
                 .map
                 .entry(resource.kind.clone())
-                .or_insert_with(|| History::partial(resource.kind));
+                .or_insert_with(|| History::new(resource.kind));
         }
 
         for resource in removed {
@@ -71,7 +80,7 @@ impl Manager {
             .data
             .map
             .entry(kind.clone())
-            .or_insert_with(|| History::partial(kind));
+            .or_insert_with(|| History::new(kind));
 
         if let History::Partial {
             show_in_sidebar, ..
@@ -114,6 +123,18 @@ impl Manager {
             .add_message(history::Kind::Logs, Message::log(record));
     }
 
+    /// Files one tailed log line under the module it was attributed to.
+    ///
+    /// Takes the id from the line rather than from the caller: attribution is
+    /// resolved once, in the parser, and a caller that could disagree with it
+    /// would be a second place for a line to end up on the wrong pane.
+    pub fn record_module_log(&mut self, line: crate::module::tail::Line) {
+        self.data.add_message(
+            history::Kind::Module(line.module.clone()),
+            Message::module_log(line),
+        );
+    }
+
     pub fn record_input_history(&mut self, convo_id: &ConvoId, text: String) {
         self.data.input.record(convo_id, text);
     }
@@ -134,6 +155,20 @@ impl Manager {
         self.data.history_view(kind, limit)
     }
 
+    /// Whether a pane on `kind` would render nothing.
+    ///
+    /// Answers the same question as an empty [`Self::get_messages`] without
+    /// building the view: that walks and clones a reference per message, and
+    /// an "is there anything here" check runs on every frame. `Partial`
+    /// counts as empty because its pending messages are deliberately
+    /// invisible until a snapshot merges them.
+    pub fn is_empty(&self, kind: &history::Kind) -> bool {
+        match self.data.map.get(kind) {
+            Some(History::Full { messages, .. }) => messages.is_empty(),
+            Some(History::Partial { .. }) | None => true,
+        }
+    }
+
     pub fn mark_as_read(&mut self, kind: &history::Kind) -> Option<ReadMarker> {
         self.data.map.get_mut(kind).and_then(History::mark_as_read)
     }
@@ -151,7 +186,7 @@ impl Manager {
         self.data
             .map
             .entry(kind.clone())
-            .or_insert_with(|| History::partial(kind.clone()))
+            .or_insert_with(|| History::new(kind.clone()))
             .mark_unread();
     }
 
@@ -286,10 +321,10 @@ impl Data {
                 ..
             }) => {
                 for message in snapshot {
-                    history::insert_message(&mut messages, message);
+                    history::insert_message(&kind, &mut messages, message);
                 }
 
-                history::truncate_messages(&mut messages);
+                history::truncate_messages(&kind, &mut messages);
 
                 self.map.insert(
                     kind.clone(),
@@ -317,10 +352,10 @@ impl Data {
                 messages.reserve(len);
 
                 for message in snapshot {
-                    history::insert_message(&mut messages, message);
+                    history::insert_message(&kind, &mut messages, message);
                 }
 
-                history::truncate_messages(&mut messages);
+                history::truncate_messages(&kind, &mut messages);
 
                 self.map.insert(
                     kind.clone(),
@@ -348,7 +383,7 @@ impl Data {
     fn add_message(&mut self, kind: history::Kind, message: Message) {
         self.map
             .entry(kind.clone())
-            .or_insert_with(|| History::partial(kind))
+            .or_insert_with(|| History::new(kind))
             .add_message(message);
     }
 
@@ -553,6 +588,66 @@ mod tests {
 
     fn kind_missing() -> history::Kind {
         history::Kind::Conversation(ConvoId::from("fresh"))
+    }
+
+    /// The `Partial` trap, at the seam that actually renders: `get_messages`
+    /// only answers for a `Full` history. Nothing will ever call `load_full`
+    /// for a log, so a log that starts `Partial` renders empty for the whole
+    /// session no matter how many lines it is handed.
+    #[test]
+    fn log_histories_render_without_ever_being_loaded() {
+        let mut manager = Manager::default();
+        let module = history::Kind::Module(ModuleId::from("blockchain_module"));
+
+        manager.track(HashSet::from([
+            Resource::module(ModuleId::from("blockchain_module")),
+            Resource::logs(),
+        ]));
+
+        manager
+            .record_message(module.clone(), received("c1", "block 1", 1_000));
+        manager.record_log(crate::log::Record {
+            timestamp: chrono::Utc::now(),
+            level: crate::log::Level::Info,
+            message: "started".to_string(),
+        });
+
+        assert_eq!(manager.get_messages(&module, None).unwrap().total, 1);
+        assert_eq!(
+            manager
+                .get_messages(&history::Kind::Logs, None)
+                .unwrap()
+                .total,
+            1
+        );
+
+        // Closing the pane must not take the lines with it: there is no
+        // snapshot to refetch them from when it reopens
+        manager.track(HashSet::new());
+        assert_eq!(manager.get_messages(&module, None).unwrap().total, 1);
+    }
+
+    /// The fix above must not reach conversations, whose `Partial` state is a
+    /// real promise that a `get_messages` snapshot is on its way.
+    #[test]
+    fn conversations_still_start_partial_and_promote_on_load() {
+        let mut manager = Manager::default();
+        let kind = kind("c1");
+
+        manager.track(HashSet::from([Resource { kind: kind.clone() }]));
+        manager.record_message(kind.clone(), received("c1", "hi", 10_000));
+        assert!(
+            manager.get_messages(&kind, None).is_none(),
+            "a tracked conversation is Partial until its snapshot lands"
+        );
+
+        manager.load_full(kind.clone(), vec![received("c1", "hi", 10_100)]);
+        let view = manager.get_messages(&kind, None).unwrap();
+        assert_eq!(view.total, 1, "the pending message survives promotion");
+
+        // Untracking a conversation still collapses it — reopening refetches
+        manager.track(HashSet::new());
+        assert!(manager.get_messages(&kind, None).is_none());
     }
 
     #[test]

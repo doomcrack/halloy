@@ -32,6 +32,11 @@ const AVATAR_SIZE: f32 = 26.0;
 /// 160-char preview.
 const PREVIEW_DISPLAY_CHARS: usize = 32;
 
+/// Width of a module row's event-pulse column. Four digits at the sidebar's
+/// own font size, reserved whether or not the module is emitting anything —
+/// see [`pulse`].
+const PULSE_WIDTH: f32 = 34.0;
+
 #[derive(Debug, Clone)]
 pub enum Message {
     New(data::Buffer),
@@ -284,6 +289,16 @@ impl Sidebar {
                 })
                 .collect::<Vec<_>>();
 
+            let module_rows = session
+                .modules
+                .iter()
+                .map(|module| {
+                    module_button(
+                        config, panes, focus, module, history, width, theme,
+                    )
+                })
+                .collect::<Vec<_>>();
+
             let mut buffers: Vec<Element<'a, Message>> = vec![];
 
             if config.sidebar.position.is_horizontal() {
@@ -312,6 +327,10 @@ impl Sidebar {
                 None
             };
 
+            // Modules always come last. The loop below drops empty groups,
+            // so a run whose module set has not been reported yet renders
+            // byte-identically to one built before the monitor existed —
+            // no header, no spacer, nothing.
             let groups = if config
                 .sidebar
                 .internal_buffers
@@ -320,11 +339,13 @@ impl Sidebar {
                 [
                     internal_rows,
                     conversation_rows.into_iter().chain(empty_state).collect(),
+                    module_rows,
                 ]
             } else {
                 [
                     conversation_rows.into_iter().chain(empty_state).collect(),
                     internal_rows,
+                    module_rows,
                 ]
             };
 
@@ -333,7 +354,8 @@ impl Sidebar {
                 .filter(|group| !group.is_empty())
                 .enumerate()
             {
-                // Separator between conversations and internal buffers.
+                // Separator between conversations, internal buffers and
+                // modules.
                 if index > 0 {
                     if config.sidebar.position.is_horizontal() {
                         buffers.push(
@@ -985,6 +1007,187 @@ fn internal_buffer_button<'a>(
         )
         .into(),
     )
+}
+
+/// The module's event pulse: how many events it emitted in the window the
+/// last status report closed.
+///
+/// The count is the point, not the fact of activity. A blockchain module
+/// catching up emitted 1158 `newBlock` events in a few minutes
+/// (`logos-modules.md` §2b) while a current one emits roughly one per
+/// block, so the *rate* is what says whether a `Bootstrapping` module is
+/// working or wedged — and it is the one thing an idle-looking sidebar row
+/// cannot otherwise tell you.
+///
+/// The slot is a fixed width and always present, even at zero. The sidebar
+/// measures itself against its widest row, so a pulse that came and went
+/// would make the whole panel breathe in and out for the entire length of a
+/// sync.
+fn pulse<'a>(
+    events: u64,
+    font_size: Option<f32>,
+    theme: &'a Theme,
+) -> Element<'a, Message> {
+    let label = match events {
+        0 => String::new(),
+        // Past four digits the number stops being read and starts being
+        // measured; the column stays the width the slot was sized for.
+        1000.. => "999+".to_owned(),
+        events => events.to_string(),
+    };
+
+    container(
+        text(label)
+            .line_height(LineHeight::Relative(1.0))
+            .size_maybe(font_size)
+            .style(theme::text::tertiary)
+            .font_maybe(theme::font_style::secondary(theme).map(font::get))
+            .wrapping(Wrapping::None),
+    )
+    .width(PULSE_WIDTH)
+    .align_x(iced::Alignment::End)
+    .into()
+}
+
+/// One module row: the same anatomy as [`internal_buffer_button`] — a 12x12
+/// icon, then the name — differing only in what the icon says, plus the
+/// event pulse the daemon's last report closed a window on.
+///
+/// The icon is the status indicator, which is why there is no group header
+/// and no status word: the sidebar has never had a header anywhere, and
+/// adding one for modules alone would read as a different application.
+/// `Crashed` breaks the pattern deliberately, in both shape and colour, on
+/// the strength of `logos-modules.md` §5 — a module really does abort, and a row that
+/// merely dims is indistinguishable from one that was never started.
+fn module_button<'a>(
+    config: &'a Config,
+    panes: &'a Panes,
+    focus: Focus,
+    module: &'a data::Module,
+    history: &'a history::Manager,
+    width: Length,
+    theme: &'a Theme,
+) -> Element<'a, Message> {
+    let kind = history::Kind::Module(module.id.clone());
+
+    let open_as_window_pane =
+        panes.iter().find_map(|(window_id, pane, state)| {
+            (state.buffer.module_id() == Some(&module.id))
+                .then_some((window_id, pane))
+        });
+
+    let focused_as_window_pane =
+        panes.iter().find_map(|(window_id, pane, state)| {
+            (Focus {
+                window: window_id,
+                pane,
+            } == focus
+                && state.buffer.module_id() == Some(&module.id))
+            .then_some((window_id, pane))
+        });
+
+    let has_unread = history.has_unread(&kind);
+    let crashed = module.status == data::module::Status::Crashed;
+
+    let icon: Element<'a, Message> = if crashed {
+        icon::error().style(theme::text::error).into()
+    } else {
+        icon::circle()
+            .style(match module.status {
+                data::module::Status::Loaded => theme::text::success,
+                data::module::Status::NotLoaded => theme::text::tertiary,
+                // A status we cannot read is not evidence of health.
+                data::module::Status::Crashed
+                | data::module::Status::Unknown(_) => theme::text::secondary,
+            })
+            .into()
+    };
+
+    let title_style = if crashed {
+        theme::text::error
+    } else if has_unread {
+        theme::text::tertiary
+    } else {
+        theme::text::primary
+    };
+
+    let font_size = config
+        .sidebar
+        .primary_font_size
+        .or(config.sidebar.secondary_font_size)
+        .or(config.font.size)
+        .map(f32::from);
+
+    let content = row![
+        container(icon).width(12.0).height(12.0),
+        text(module.display_name())
+            .line_height(LineHeight::Relative(1.0))
+            .size_maybe(font_size)
+            .style(title_style)
+            .font_maybe(theme::font_style::primary(theme).map(font::get))
+            .shaping(Shaping::Advanced)
+            .wrapping(Wrapping::None)
+            .ellipsis(Ellipsis::End),
+        // Same two-pass rule the new-chat caret follows: a `Fill` spacer
+        // would inflate the sidebar's measuring pass, so only the sized
+        // pass pushes the pulse to the trailing edge.
+        if matches!(width, Length::Fill) {
+            Element::from(space::horizontal())
+        } else {
+            Space::new().width(0).into()
+        },
+        pulse(module.recent_events, font_size, theme),
+    ]
+    .spacing(6)
+    .align_y(iced::Alignment::Center);
+
+    let base =
+        button(content.width(width).padding(Padding::default().bottom(1)))
+            .style(move |theme, status| {
+                theme::button::sidebar_buffer(
+                    theme,
+                    status,
+                    focused_as_window_pane.is_some(),
+                    open_as_window_pane.is_some(),
+                )
+            })
+            .padding(config.sidebar.padding.buffer)
+            .on_press(buffer_press_message(
+                config,
+                data::Buffer::Module(module.id.clone()),
+                open_as_window_pane,
+                focused_as_window_pane,
+            ));
+
+    let can_mark_as_read = history.can_mark_as_read(&kind);
+
+    // No conversation kind: copy-id, copy-address, nickname and delete are
+    // all conversation verbs, and `Entry::list` already excludes them for
+    // anything that is not one.
+    let entries =
+        Entry::list(panes.len(), open_as_window_pane, focus, true, None);
+
+    context_menu(
+        context_menu::MouseButton::default(),
+        context_menu::Anchor::Cursor,
+        context_menu::ToggleBehavior::KeepOpen,
+        Some(mouse::Interaction::Pointer),
+        base,
+        entries,
+        move |entry, length| {
+            entry_button(
+                entry,
+                module.display_name(),
+                data::Buffer::Module(module.id.clone()),
+                can_mark_as_read,
+                None,
+                length,
+                config,
+                theme,
+            )
+        },
+    )
+    .into()
 }
 
 fn entry_button<'a>(

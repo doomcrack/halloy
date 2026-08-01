@@ -81,6 +81,21 @@ pub struct Record {
 )]
 #[strum(serialize_all = "UPPERCASE")]
 pub enum Level {
+    /// A module dying.
+    ///
+    /// The app's own logger can never produce one — the `log` crate has five
+    /// levels and [`From<log::Level>`] is total over them. It is here because
+    /// this is the level the log panes render from, and a module abort
+    /// (`logos-modules.md` §5) arriving as
+    /// [`module::log::Level::Critical`](crate::module::log::Level) must not
+    /// be flattened into the same word and colour as the routine errors it
+    /// sits among.
+    ///
+    /// Rendered as `FATAL`: it is the daemon's own word for the event, and it
+    /// is five characters, so the fixed-width severity column that every log
+    /// row aligns on does not have to widen for the rarest level in it.
+    #[strum(serialize = "FATAL")]
+    Critical,
     Error,
     Warn,
     Info,
@@ -103,6 +118,18 @@ impl From<log::Level> for Level {
 impl std::cmp::PartialOrd<LevelFilter> for Level {
     fn partial_cmp(&self, other: &LevelFilter) -> Option<Ordering> {
         Some(match self {
+            // `LevelFilter` names no ceiling above `Error`, so a crash sorts
+            // below every floor that admits anything at all and above `Off`
+            // alone — the same rule `config::Modules::admits` applies to the
+            // module-side level, stated as an ordering.
+            Level::Critical => match other {
+                LevelFilter::Off => Ordering::Greater,
+                LevelFilter::Error
+                | LevelFilter::Warn
+                | LevelFilter::Info
+                | LevelFilter::Debug
+                | LevelFilter::Trace => Ordering::Less,
+            },
             Level::Error => match other {
                 LevelFilter::Off => Ordering::Greater,
                 LevelFilter::Error => Ordering::Equal,
@@ -148,6 +175,9 @@ impl std::cmp::PartialOrd<LevelFilter> for Level {
 impl std::cmp::PartialEq<LevelFilter> for Level {
     fn eq(&self, other: &LevelFilter) -> bool {
         match self {
+            // No filter selects crashes and nothing else, so `Critical`
+            // equals none of them; it is strictly above `Error`, never at it.
+            Level::Critical => false,
             Level::Error => matches!(other, LevelFilter::Error),
             Level::Warn => matches!(other, LevelFilter::Warn),
             Level::Info => matches!(other, LevelFilter::Info),

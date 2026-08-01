@@ -1,6 +1,6 @@
 //! Spawn / health / stop / stale-reap of the app-owned logoscore daemon.
 
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::time::Duration;
 
@@ -20,6 +20,16 @@ const TOKEN_TIMEOUT: Duration = Duration::from_secs(5);
 /// Every invocation carries it, which is what makes a daemon's argv proof
 /// of which config dir it holds.
 const CONFIG_DIR_FLAG: &str = "--config-dir";
+/// The daemon's combined log: its own output plus every module's stdout and
+/// stderr, in one file inside the config dir.
+const LOG_FILE_NAME: &str = "logoscore.log";
+
+/// Where [`start`] points the daemon's stdout and stderr. Exposed so readers
+/// (the module monitor tails it) resolve the same file the supervisor
+/// creates, instead of growing a second copy of the naming rule.
+pub fn log_path(config_dir: &Path) -> PathBuf {
+    config_dir.join(LOG_FILE_NAME)
+}
 
 pub async fn start(
     artifacts: &Artifacts,
@@ -29,7 +39,7 @@ pub async fn start(
 
     // Daemon output goes to a file: piping without draining could block
     // the child once the pipe buffer fills over a long session.
-    let log_path = config_dir.join("logoscore.log");
+    let log_path = log_path(config_dir);
     let log = std::fs::File::create(&log_path)?;
 
     let mut child = Command::new(&artifacts.logoscore_bin)

@@ -267,6 +267,15 @@ impl Buffer {
             },
         ));
 
+        // Modules are reachable from here for the same reason conversations
+        // are: every buffer the sidebar can open, the command bar can open.
+        list.extend(session.modules.iter().map(|module| {
+            Buffer::Replace(
+                data::Buffer::Module(module.id.clone()),
+                format!("Open {} log", module.display_name()),
+            )
+        }));
+
         list
     }
 }

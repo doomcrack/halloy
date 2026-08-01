@@ -11,12 +11,15 @@ mod icon;
 mod logger;
 mod mock;
 mod modal;
+mod module_log;
 mod notification;
 mod open_url;
 mod platform_specific;
 mod screen;
 mod stream;
 mod system;
+#[cfg(test)]
+mod testkit;
 mod unix_signal;
 mod url;
 mod widget;
@@ -419,6 +422,10 @@ pub enum Message {
     WindowSettingsSaved(Result<(), window::Error>),
     WindowMaximizeChecked(bool),
     Logging(Vec<logger::Record>),
+    /// A batch of tailed daemon-log lines, already parsed and attributed.
+    /// Batched rather than per-line for the same reason [`Self::Logging`] is:
+    /// a syncing node writes faster than a frame.
+    ModuleLogging(Vec<data::module::tail::Line>),
     UnixSignal(i32),
     ConfigReloaded(Result<Config, config::Error>),
     RuntimeConfigured(Result<(), iced::backend::Error>),
@@ -1057,6 +1064,32 @@ impl Frigicom {
 
                 Task::none()
             }
+            Message::ModuleLogging(lines) => {
+                for line in lines {
+                    // Ahead of the level filter on purpose. A crash can be
+                    // announced by a line whose own dialect calls it `info`
+                    // (`logos-modules.md` §5), and losing the fact because of a
+                    // display setting would leave the row looking idle.
+                    if line.record.reports_crash() {
+                        self.session.note_module_crash(&line.module);
+                    }
+
+                    if !self.config.modules.admits(line.level()) {
+                        continue;
+                    }
+
+                    // Nothing is buffered for a screen that is not the
+                    // dashboard: unlike the app's own log this is a tail of a
+                    // file that is still on disk, and the only screens that
+                    // are not the dashboard are the config-error screen and
+                    // the one shown while quitting.
+                    if let Screen::Dashboard(dashboard) = &mut self.screen {
+                        dashboard.record_module_log(line);
+                    }
+                }
+
+                Task::none()
+            }
             Message::UnixSignal(signal) => match signal {
                 #[cfg(target_family = "unix")]
                 signal_hook::consts::SIGUSR1 => {
@@ -1088,14 +1121,25 @@ impl Frigicom {
         }
     }
 
-    /// Ensures a history entry per known conversation (so unread state
-    /// accrues even without an open pane) and retracks pane histories
-    /// against the live backend, requesting message loads for open
-    /// conversation panes whose history is not `Full` yet. Restored panes
-    /// are otherwise stuck empty: `Dashboard::restore` runs before the
-    /// controller exists, so its initial load requests are dropped.
+    /// Reconciles the panes against the live conversation set, then ensures
+    /// a history entry per known conversation (so unread state accrues even
+    /// without an open pane) and retracks pane histories against the live
+    /// backend, requesting message loads for open conversation panes whose
+    /// history is not `Full` yet. Restored panes are otherwise stuck empty:
+    /// `Dashboard::restore` runs before the controller exists, so its
+    /// initial load requests are dropped.
+    ///
+    /// Every path that restores panes from disk funnels through here — the
+    /// first `ConversationsSnapshot` after launch and the screen rebuild a
+    /// config reload performs — so this is where the invariant is kept:
+    /// after either one, no pane names a conversation the backend does not
+    /// have, and nothing is asked about a dead id. Reconciling first is
+    /// what makes the second half true; the tracking below would otherwise
+    /// open a history and request messages for the dead id it just found.
     fn sync_histories(&mut self) {
         if let Screen::Dashboard(dashboard) = &mut self.screen {
+            dashboard.reconcile_conversations(&self.session);
+
             for conversation in self.session.conversations.iter() {
                 dashboard.open_history(history::Kind::Conversation(
                     conversation.id.clone(),
@@ -1145,6 +1189,10 @@ impl Frigicom {
                     dashboard.reset_member_requests();
                 }
 
+                // The snapshot has already replaced the conversation map
+                // (`Session::apply`, above), so the reconciliation
+                // `sync_histories` opens with sees the authoritative set —
+                // and runs before any load is requested below.
                 self.sync_histories();
 
                 // Snapshots carry no member lists and the only other
@@ -1175,6 +1223,10 @@ impl Frigicom {
                 }
             }
             Update::MembersLoaded { .. } => {}
+            // Already folded into `self.session` above, which is all the
+            // sidebar rows and the pane's status strip read. Nothing else
+            // has to happen when the module set moves.
+            Update::Modules(_) => {}
             Update::Event(event) => return self.handle_chat_event(event),
             Update::ActionFailed(error) => match error {
                 ActionError::SendFailed {
@@ -1573,6 +1625,12 @@ impl Frigicom {
         let backend =
             stream::subscription(&self.config, self.guard).map(Message::Stream);
 
+        // Deliberately not part of the backend subscription: tailing a file
+        // needs no daemon handshake, so the log keeps filling while the
+        // session is down — which is exactly when it is worth reading.
+        let module_logs =
+            module_log::subscription(&self.config).map(Message::ModuleLogging);
+
         let mut subscriptions = vec![
             url::listen().map(Message::RouteReceived),
             events().map(|(window, event)| Message::Event(window, event)),
@@ -1581,6 +1639,7 @@ impl Frigicom {
             system::events().map(Message::System),
             tick,
             backend,
+            module_logs,
         ];
 
         if cfg!(target_family = "unix") {

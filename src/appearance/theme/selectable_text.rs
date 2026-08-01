@@ -93,6 +93,7 @@ pub fn status(theme: &Theme, status: message::StatusKind) -> Style {
 
 pub fn log_level(theme: &Theme, log_level: log::Level) -> Style {
     let color = match log_level {
+        log::Level::Critical => critical(theme),
         log::Level::Error => theme.styles().text.error.color,
         log::Level::Warn => theme
             .styles()
@@ -124,6 +125,40 @@ pub fn log_level(theme: &Theme, log_level: log::Level) -> Style {
         color: Some(color),
         selection_color: theme.styles().buffer.selection,
     }
+}
+
+/// The body of a log line.
+///
+/// Every level but one leaves it the buffer's default ink, because a log pane
+/// where each line is a different colour is a log pane nobody reads. A crash
+/// is the exception: the severity column is five characters wide and the
+/// message beside it is the whole reason to be looking, so the colour is
+/// carried across the row rather than left in the gutter.
+pub fn log_message(theme: &Theme, log_level: log::Level) -> Style {
+    match log_level {
+        log::Level::Critical => Style {
+            color: Some(critical(theme)),
+            selection_color: theme.styles().buffer.selection,
+        },
+        log::Level::Error
+        | log::Level::Warn
+        | log::Level::Info
+        | log::Level::Debug
+        | log::Level::Trace => logs(theme),
+    }
+}
+
+/// Falls back to `error`'s colour rather than to a colour of its own: a theme
+/// that predates the level should read a crash as *at least* an error, and the
+/// bold weight [`font_style::log_level`](super::font_style::log_level) pairs
+/// with it keeps the two apart even then.
+fn critical(theme: &Theme) -> Color {
+    theme
+        .styles()
+        .text
+        .critical
+        .color
+        .unwrap_or(theme.styles().text.error.color)
 }
 
 pub fn color_dot(theme: &Theme, color: Color) -> Style {

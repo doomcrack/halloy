@@ -109,6 +109,17 @@ pub fn locate(overrides: &ArtifactOverrides) -> Result<Artifacts, LocateError> {
     locate::locate(overrides)
 }
 
+/// The combined log a daemon started with [`Supervisor::start`] writes:
+/// `<config_dir>/logoscore.log`, carrying the daemon's own Qt lines and every
+/// module's stdout and stderr interleaved. Reader-side code must go through
+/// this rather than rebuild the path, since the supervisor owns the write
+/// handle and truncates the file on every spawn.
+///
+/// The file may not exist: nothing creates it before the first spawn.
+pub fn log_path(config_dir: &Path) -> PathBuf {
+    supervisor::log_path(config_dir)
+}
+
 /// Clears a stale daemon left by a crashed prior run: if
 /// `<config_dir>/daemon/state.json` names a pid that is still alive AND
 /// that pid is a logoscore invocation pointed at this config dir, ask it to

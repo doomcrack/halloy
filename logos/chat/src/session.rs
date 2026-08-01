@@ -6,15 +6,20 @@
 //! daemon up → abi check → logos thread + `module_event` subscription →
 //! `get_status` link check → `loadModule("chat_module")` →
 //! `watchModuleEvents` per event (×7 explicit, or one wildcard behind
-//! config) → `chat.init({delivery_preset})` → `list_conversations` snapshot →
-//! `chat.status()` seeded through the SAME handler as the live event so an
-//! already-online module triggers the resync path instead of being
-//! swallowed.
+//! config) → `chat.init({delivery_preset})` → `list_conversations`
+//! snapshot → `chat.status()` seeded through the SAME handler as the live
+//! event so an already-online module triggers the resync path instead of
+//! being swallowed.
+//!
+//! The module monitor is *not* on that ladder. It runs entirely from the
+//! main loop's poll, so nothing a module does can delay chat's login: the
+//! logos thread serializes every invoke, so an introspection call issued
+//! before `chat.init` is a call `chat.init` waits behind.
 //!
 //! Main loop rules:
-//! - Control channel (bounded, cap 32) is polled only when no action is in
-//!   flight — natural serialization for the single-dispatch module. Events
-//!   are always polled (they keep flowing during a slow 20s send).
+//! - Control channel (bounded, cap 32) is polled only when no *chat* action
+//!   is in flight — natural serialization for the single-dispatch module.
+//!   Events are always polled (they keep flowing during a slow 20s send).
 //! - `conversation_updated` marks a resync and `members_changed` queues a
 //!   member reload for its conversation — the events carry only the id, so
 //!   the session refetches and the results arrive as
@@ -22,6 +27,14 @@
 //! - Mutating actions are gated on Online → `ActionFailed(NotOnline)`.
 //! - A 5s health tick probes the daemon at the PROCESS level (never an lp
 //!   call) so detection works while the logos thread is blocked.
+//! - A 5s module-status poll runs `listModules` (and the introspection +
+//!   watch registration of any module that has newly become loaded) in a
+//!   slot of its own. It is dispatched only while no chat action is in
+//!   flight, so it never queues ahead of the user's work, and it occupies
+//!   nothing the control channel is gated on, so a wedged daemon cannot
+//!   stop the user's next action from dispatching. Every failure is
+//!   swallowed — a monitor refresh must never restart the session. Module
+//!   events other than chat's are counted per poll window, not forwarded.
 //! - Fresh transition to Online after the initial snapshot → full resync
 //!   (`Ready` + `ConversationsSnapshot` re-emitted).
 //! - Dead link (`IpcError::DeadLink` or outer timeout) → check daemon →
@@ -44,6 +57,7 @@
 //! - Fatal errors emit `Phase(Failed)` then `Update::Fatal`, and the
 //!   stream pends forever afterwards, exactly like after `Stopped`.
 
+use std::collections::HashSet;
 use std::future::Future;
 use std::pin::Pin;
 use std::sync::Arc;
@@ -52,8 +66,8 @@ use std::time::Duration;
 use futures::channel::mpsc;
 use futures::stream::{self, Stream, StreamExt};
 use logos_client::{
-    FakeTransport, Gateway, GatewayError, IpcError, LogosHandle, RawEvent,
-    Transport, decode_module_event,
+    FakeTransport, Gateway, GatewayError, IpcError, LogosHandle, ModuleStatus,
+    RawEvent, Transport, decode_module_event,
 };
 use logos_daemon::Supervisor;
 use tokio::sync::mpsc as tokio_mpsc;
@@ -71,6 +85,29 @@ pub const CONTROL_CAP: usize = 32;
 
 /// Process-level daemon liveness probe period (Live driver only).
 const HEALTH_TICK: Duration = Duration::from_secs(5);
+/// Module-status poll period.
+///
+/// A module can abort at any time and the daemon then reports it as
+/// `not_loaded` on the very next poll — there is no crash event to
+/// subscribe to, so the poll *is* the detection mechanism and its period is
+/// the worst-case delay before a dead module stops looking healthy. Five
+/// seconds keeps that inside the window a person reads as "immediately",
+/// and matches [`HEALTH_TICK`] so the two liveness signals never disagree
+/// for long.
+///
+/// It is affordable at that rate because `listModules` never leaves the
+/// daemon: it answers from the module runtime's own table and calls into no
+/// module, so a poll cannot be delayed by (or delay) a busy module. The one
+/// call that does leave — `getModuleInfo`, for the event contract — is made
+/// once per module per daemon run, not once per poll.
+///
+/// It is also the delay before the sidebar first says anything: the ladder
+/// asks the daemon nothing about modules, so the first report is the first
+/// tick.
+const MODULE_POLL_TICK: Duration = Duration::from_secs(5);
+/// The daemon's word for a running module, the one status value that
+/// decides whether it is worth asking a module about its contract.
+const LOADED: &str = "loaded";
 /// Outer cap on `chat_module.shutdown()` during a clean quit.
 const CHAT_SHUTDOWN_CAP: Duration = Duration::from_secs(5);
 /// Outer cap on `core_service.shutdown` during a clean quit.
@@ -121,6 +158,47 @@ pub enum Phase {
     Failed,
 }
 
+/// One tracked module, as the monitor sees it: what the daemon last said
+/// about it, plus how busy its event stream was over the last poll window.
+///
+/// Every field is one the UI renders, and the whole struct is the
+/// republish decision (see [`Session::publish_modules`]) — so a field
+/// nothing reads is not merely dead weight here, it is a guarantee that the
+/// sidebar repaints forever. `uptime_seconds` was exactly that: the daemon
+/// grows it every second, no view ever showed it, and carrying it made the
+/// "publish only what moved" check true on every single poll.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ModuleState {
+    pub name: String,
+    /// The daemon's verbatim vocabulary (`loaded` / `not_loaded`), left
+    /// unmapped on purpose — the domain layer owns the interpretation, and
+    /// a value the daemon grows later must reach it unflattened.
+    pub status: String,
+    pub version: Option<String>,
+    /// Module events seen in the window since the last report, and reset by
+    /// it. A *rate sample*, not a stream: a syncing blockchain node emitted
+    /// 1158 `newBlock` events in a few minutes of catch-up, so forwarding
+    /// each one would thrash the UI, and a running total would only ever
+    /// grow. Sampled per poll it is the "there is progress" pulse
+    /// `logos-modules.md` §2b asks for, and it settles back to zero — once —
+    /// when the module goes quiet.
+    pub recent_events: u64,
+}
+
+impl ModuleState {
+    /// A module we staged but have not heard about yet. `not_loaded` is the
+    /// honest pre-poll guess: it is what the daemon reports for anything
+    /// installed and idle, which every module except chat's closure is.
+    fn seed(name: &str) -> Self {
+        Self {
+            name: name.to_owned(),
+            status: "not_loaded".to_owned(),
+            version: None,
+            recent_events: 0,
+        }
+    }
+}
+
 #[derive(Debug)]
 pub enum Update {
     /// Always the first item.
@@ -144,6 +222,12 @@ pub enum Update {
     },
     /// Live push event, already decoded.
     Event(ChatEvent),
+    /// The whole tracked module set, re-sent whenever any of it moved.
+    /// Never sent when nothing changed, so a 5s poll on a quiet daemon puts
+    /// nothing on the stream at all — and never sent by the ladder, which
+    /// asks the daemon nothing about modules. The first one arrives with
+    /// the first poll, a few seconds after login.
+    Modules(Vec<ModuleState>),
     ActionFailed(ActionError),
     /// Terminal for this run.
     Fatal(BackendError),
@@ -183,6 +267,10 @@ pub enum Control {
     },
     /// Manual full refetch; coalesced if one is already pending.
     Resync,
+    /// Manual module-status refresh, off the poll's schedule. Coalesced the
+    /// same way a resync is: several requests before the next dispatch cost
+    /// one `listModules`.
+    RefreshModules,
     /// Clean shutdown; the stream ends with `Update::Stopped`.
     Quit,
 }
@@ -208,13 +296,22 @@ async fn session(
     updates: mpsc::UnboundedSender<Update>,
 ) {
     let (control_tx, mut control_rx) = mpsc::channel(CONTROL_CAP);
+    let modules: Vec<ModuleState> = config
+        .modules
+        .iter()
+        .map(|name| ModuleState::seed(name))
+        .collect();
     let mut session = Session {
+        published: modules.clone(),
+        modules,
         config,
         updates,
         delivery: DeliveryState::Initialising,
         initial_snapshot_done: false,
         resync_dirty: false,
+        modules_dirty: false,
         pending_member_loads: Vec::new(),
+        watched: HashSet::new(),
     };
     session.emit(Update::Controller(control_tx));
 
@@ -257,9 +354,14 @@ async fn session(
     }
 }
 
-/// A boxed in-flight action. It emits its own updates; `Err` carries a
+/// A boxed in-flight chat action. It emits its own updates; `Err` carries a
 /// dead-link reason that aborts the run into the restart ladder.
 type ActionFuture = Pin<Box<dyn Future<Output = Result<(), String>> + Send>>;
+
+/// A boxed monitor pass. Separate from [`ActionFuture`] because it is not
+/// chat work: it emits nothing itself, it cannot end the run, and it is
+/// deliberately not what the control channel waits on.
+type MonitorFuture = Pin<Box<dyn Future<Output = MonitorPass> + Send>>;
 
 enum LoopExit {
     Quit,
@@ -271,11 +373,27 @@ enum Applied {
     Quit,
 }
 
+/// What one monitor pass learned, for the loop to fold in — only the loop
+/// holds `&mut Session`.
+#[derive(Default)]
+struct MonitorPass {
+    /// The rows the daemon reported, empty when the poll failed. An empty
+    /// report folds to nothing, which is the right answer for both: the
+    /// last known status stays on screen.
+    report: Vec<ModuleStatus>,
+    /// Modules this pass attempted to watch, whether or not the attempt
+    /// succeeded — see [`Session::watched`] for why a failure is not
+    /// retried.
+    watched: Vec<String>,
+}
+
 enum Arm {
     Raw(Option<RawEvent>),
     Action(Result<(), String>),
+    Monitor(MonitorPass),
     Control(Option<Control>),
     Health,
+    ModulePoll,
 }
 
 /// Session-wide mutable state plus the update sender.
@@ -285,7 +403,22 @@ struct Session {
     delivery: DeliveryState,
     initial_snapshot_done: bool,
     resync_dirty: bool,
+    modules_dirty: bool,
     pending_member_loads: Vec<ConvoId>,
+    /// The tracked module set, in catalogue order with anything the daemon
+    /// reported but we did not stage appended.
+    modules: Vec<ModuleState>,
+    /// The last set actually sent as [`Update::Modules`]. Publishing is
+    /// decided against this rather than against the state before a fold,
+    /// so an event pulse that moved between two identical status reports
+    /// still reaches the UI, and a poll that changed nothing stays silent.
+    published: Vec<ModuleState>,
+    /// Modules whose event watches this daemon run has already registered —
+    /// or tried to. There is no unwatch, so a second registration would
+    /// duplicate every forwarder; and a module whose introspection times out
+    /// must not cost that timeout again on every poll. One attempt per
+    /// module per run, made the first time the daemon reports it loaded.
+    watched: HashSet<String>,
 }
 
 impl Session {
@@ -334,6 +467,94 @@ impl Session {
             }
         }
     }
+
+    /// Index of `module`'s row, creating one if this is a name we have not
+    /// seen. Rows are created rather than dropped because attribution is by
+    /// tag string, not by a known-module list: a module that renames itself
+    /// mid-flight should become visible, not silent.
+    fn module_row(&mut self, module: &str) -> usize {
+        match self.modules.iter().position(|state| state.name == module) {
+            Some(index) => index,
+            None => {
+                self.modules.push(ModuleState::seed(module));
+                self.modules.len() - 1
+            }
+        }
+    }
+
+    /// Records one event from a module that is not chat. Every event name
+    /// counts, modelled or not — this *is* the fallback for an event we do
+    /// not know, and it is why an unrecognised event can never be fatal.
+    /// The name itself is only logged: what the pulse says is "this module
+    /// is doing something", and a name would need a whole vocabulary to
+    /// mean more than that.
+    ///
+    /// Deliberately emits nothing. The count rides out with the next status
+    /// publish, which coalesces a flood into one repaint.
+    fn note_module_event(&mut self, module: &str, event: &str) {
+        log::trace!("{module} emitted {event}");
+        let index = self.module_row(module);
+        let state = &mut self.modules[index];
+        state.recent_events = state.recent_events.saturating_add(1);
+    }
+
+    /// Folds one `listModules` report into the tracked set.
+    ///
+    /// A tracked module the report does not mention keeps its current row.
+    /// The daemon lists every *installed* module whatever its load state,
+    /// so silence means "not installed on this machine", which this
+    /// read-only increment has no action to offer for and renders the same
+    /// as idle.
+    fn apply_modules(&mut self, report: Vec<ModuleStatus>) {
+        for row in report {
+            let index = self.module_row(&row.name);
+            let state = &mut self.modules[index];
+            state.status = row.status;
+            state.version = row.version;
+        }
+
+        self.publish_modules();
+    }
+
+    /// Drops back to the staged set. A restart means a fresh daemon, so
+    /// every module is idle again until the new one says otherwise, the
+    /// event counters belong to a process that is gone, and the watches
+    /// were registered against forwarders that died with it.
+    fn reset_modules(&mut self) {
+        self.modules = self
+            .config
+            .modules
+            .iter()
+            .map(|name| ModuleState::seed(name))
+            .collect();
+        self.watched.clear();
+
+        self.publish_modules();
+    }
+
+    /// Sends the tracked set if it differs from what the UI last saw, then
+    /// closes the event window the report just described.
+    ///
+    /// Nothing to say is said with silence: on a quiet daemon the 5s poll
+    /// puts no updates on the stream at all. That holds only because every
+    /// field compared here is one the UI renders — one field that moves on
+    /// its own (a running total, an uptime the daemon grows every second)
+    /// makes the comparison differ forever, and the coalescing this exists
+    /// for is gone with it.
+    /// The window roll runs on every publish, published or not, so counts
+    /// describe one poll interval each rather than accumulating; the last
+    /// busy window is followed by exactly one report of zero, and then
+    /// silence.
+    fn publish_modules(&mut self) {
+        if self.modules != self.published {
+            self.published = self.modules.clone();
+            self.emit(Update::Modules(self.published.clone()));
+        }
+
+        for state in &mut self.modules {
+            state.recent_events = 0;
+        }
+    }
 }
 
 /// One connected backend stack, torn down and rebuilt on every restart.
@@ -354,7 +575,9 @@ async fn start_stack(
     session.delivery = DeliveryState::Initialising;
     session.initial_snapshot_done = false;
     session.resync_dirty = false;
+    session.modules_dirty = false;
     session.pending_member_loads.clear();
+    session.reset_modules();
 
     match driver {
         Driver::Live => start_live(session).await,
@@ -506,13 +729,61 @@ async fn watch_events(
     Ok(())
 }
 
+/// Registers one module's watches from the contract it reports, never from
+/// a list written down here.
+///
+/// The blockchain module we ship exposes one event (`newBlock`) while its
+/// master branch exposes three; a hardcoded list would therefore either
+/// miss events or register watches that never fire, depending only on which
+/// build happens to be staged. `module_info` is the sole authority, and it
+/// answers with an empty contract for a module that is not loaded — which
+/// is why only loaded modules are asked.
+async fn watch_module(gateway: &Gateway, module: &str) {
+    let events = match gateway.module_info(module).await {
+        Ok(info) => info.events,
+        Err(error) => {
+            log::warn!(
+                "getModuleInfo({module}) failed; not watching it: {error}"
+            );
+            return;
+        }
+    };
+
+    if events.is_empty() {
+        log::debug!("{module} reports no events; nothing to watch");
+        return;
+    }
+
+    for event in &events {
+        match gateway.watch_module_events(module, event).await {
+            Ok(true) => {}
+            Ok(false) => {
+                log::warn!("daemon declined the {module}.{event} watch");
+            }
+            Err(error) => {
+                log::warn!("watching {module}.{event} failed: {error}");
+            }
+        }
+    }
+}
+
 async fn main_loop(
     session: &mut Session,
     stack: &mut Stack,
     control_rx: &mut mpsc::Receiver<Control>,
 ) -> LoopExit {
     let mut in_flight: Option<ActionFuture> = None;
+    let mut monitor: Option<MonitorFuture> = None;
     let mut health = tokio::time::interval(HEALTH_TICK);
+    // First tick a full period out, not immediately: the login burst
+    // (init, snapshot, status seed, and the resync an already-online module
+    // triggers) owns the logos thread for those seconds, and the monitor
+    // queueing behind it would be the startup delay this poll exists to
+    // avoid. The staged rows carry the sidebar until the first report.
+    let mut module_poll = tokio::time::interval_at(
+        tokio::time::Instant::now() + MODULE_POLL_TICK,
+        MODULE_POLL_TICK,
+    );
 
     loop {
         if in_flight.is_none()
@@ -546,6 +817,16 @@ async fn main_loop(
             }
         }
 
+        // Observation goes last and never first: dispatched only while chat
+        // has nothing in flight, so a poll can never be the call a user's
+        // action queues behind on the logos thread. Once dispatched it runs
+        // in its own slot, so the control channel keeps flowing under it.
+        if monitor.is_none() && session.modules_dirty && in_flight.is_none() {
+            session.modules_dirty = false;
+            monitor =
+                Some(monitor_pass(&stack.gateway, session.watched.clone()));
+        }
+
         let arm = tokio::select! {
             raw = stack.events.recv() => Arm::Raw(raw),
             outcome = async {
@@ -554,10 +835,17 @@ async fn main_loop(
                     .expect("in-flight action gated by the branch condition")
                     .await
             }, if in_flight.is_some() => Arm::Action(outcome),
+            pass = async {
+                monitor
+                    .as_mut()
+                    .expect("monitor pass gated by the branch condition")
+                    .await
+            }, if monitor.is_some() => Arm::Monitor(pass),
             control = control_rx.next(), if in_flight.is_none() => {
                 Arm::Control(control)
             }
             _ = health.tick(), if stack.supervisor.is_some() => Arm::Health,
+            _ = module_poll.tick() => Arm::ModulePoll,
         };
 
         match arm {
@@ -570,6 +858,11 @@ async fn main_loop(
                 if let Err(reason) = outcome {
                     return LoopExit::Dead(reason);
                 }
+            }
+            Arm::Monitor(pass) => {
+                monitor = None;
+                session.watched.extend(pass.watched);
+                session.apply_modules(pass.report);
             }
             Arm::Control(Some(control)) => {
                 match apply_control(session, stack, &mut in_flight, control) {
@@ -587,13 +880,16 @@ async fn main_loop(
                     );
                 }
             }
+            Arm::ModulePoll => session.modules_dirty = true,
         }
     }
 }
 
-/// Decodes one wire event: filter to chat_module, forward the raw
-/// `Update::Event`, then feed `delivery_state_changed` into the delivery
-/// handler. Undecodable payloads are logged, never fatal.
+/// Decodes one wire event and demuxes it by module: anything that is not
+/// chat is counted against that module's monitor row and goes no further;
+/// chat's own events take exactly the path they always did — forward the
+/// raw `Update::Event`, then feed `delivery_state_changed` into the
+/// delivery handler. Undecodable payloads are logged, never fatal.
 fn handle_raw_event(session: &mut Session, raw: &RawEvent) {
     if raw.name != "module_event" {
         log::debug!("ignoring unexpected event {}", raw.name);
@@ -607,6 +903,7 @@ fn handle_raw_event(session: &mut Session, raw: &RawEvent) {
         }
     };
     if module_event.module != MODULE {
+        session.note_module_event(&module_event.module, &module_event.event);
         return;
     }
     match ChatEvent::decode(&module_event.event, &module_event.args) {
@@ -651,6 +948,10 @@ fn apply_control(
             session.resync_dirty = true;
             return Applied::Handled;
         }
+        Control::RefreshModules => {
+            session.modules_dirty = true;
+            return Applied::Handled;
+        }
         _ => {}
     }
 
@@ -679,6 +980,7 @@ fn gated_method(control: &Control) -> Option<&'static str> {
         Control::LoadMessages { .. }
         | Control::LoadMembers { .. }
         | Control::Resync
+        | Control::RefreshModules
         | Control::Quit => None,
     }
 }
@@ -794,7 +1096,7 @@ fn action(
                 }
             }
             // Handled in `apply_control`, never dispatched here.
-            Control::Resync | Control::Quit => None,
+            Control::Resync | Control::RefreshModules | Control::Quit => None,
         };
 
         match failure {
@@ -805,6 +1107,63 @@ fn action(
                     updates.unbounded_send(Update::ActionFailed(action_error));
                 if dead { Err(error.to_string()) } else { Ok(()) }
             }
+        }
+    })
+}
+
+/// One monitor pass: `listModules`, then the introspection and watch
+/// registration of every module the daemon now reports loaded that this run
+/// has not asked about yet.
+///
+/// The watches live here rather than on the startup ladder for two reasons.
+/// The logos thread serializes every invoke, so an introspection call made
+/// before `chat.init` is a call `chat.init` waits behind — a module stalling
+/// to its 5s timeout would delay chat's login by that much. And a module
+/// loaded *after* startup used to get no watches at all; asked once per
+/// module rather than once per run, the monitor converges on its own.
+///
+/// Every failure is swallowed, including a dead link. Observation must
+/// never be the thing that decides the chat session is dead — a daemon too
+/// old to know `listModules` answers with the same literal `null` a dead
+/// link does, and that would put a working session into the restart ladder
+/// on the strength of a monitor refresh. Real link death still surfaces
+/// through chat's own calls and the process-level health tick.
+fn monitor_pass(gateway: &Gateway, watched: HashSet<String>) -> MonitorFuture {
+    let gateway = gateway.clone();
+    Box::pin(async move {
+        let report = match gateway.list_modules().await {
+            Ok(report) => report,
+            Err(error) => {
+                log::debug!(
+                    "listModules failed; keeping the last known module \
+                     status: {error}"
+                );
+                return MonitorPass::default();
+            }
+        };
+
+        // Chat is excluded: its watches are registered from
+        // `ChatEvent::NAMES` (or one wildcard) by the ladder, and there is
+        // no unwatch — re-registering here would duplicate every chat
+        // forwarder. An idle module is skipped because its contract is
+        // empty until it loads.
+        let fresh: Vec<String> = report
+            .iter()
+            .filter(|row| {
+                row.name != MODULE
+                    && row.status == LOADED
+                    && !watched.contains(&row.name)
+            })
+            .map(|row| row.name.clone())
+            .collect();
+
+        for module in &fresh {
+            watch_module(&gateway, module).await;
+        }
+
+        MonitorPass {
+            report,
+            watched: fresh,
         }
     })
 }
@@ -1047,6 +1406,13 @@ mod tests {
         controller
             .respond("loadModule", r#"{"status":"ok","module":"chat_module"}"#);
         controller.respond("watchModuleEvents", "true");
+        // Answered but never asked by the ladder: the monitor polls from
+        // the main loop. Chat only, so a poll registers no extra watches
+        // and makes no `getModuleInfo` call.
+        controller.respond(
+            "listModules",
+            r#"[{"name":"chat_module","status":"loaded","version":"0.2.1"}]"#,
+        );
 
         let overrides = overrides.to_vec();
         controller.respond_with("callModuleMethod", move |args| {
@@ -1213,6 +1579,11 @@ mod tests {
                 &Phase::InitialisingChat,
             ]
         );
+        assert!(
+            updates.iter().all(|update| modules_of(update).is_none()),
+            "the ladder publishes no module status: the monitor has not \
+             run yet, and saying so would be inventing one",
+        );
         match next(&mut stream).await {
             Update::Phase(Phase::InitialisingChat) => {}
             other => panic!("expected the seeded phase, got {other:?}"),
@@ -1234,6 +1605,9 @@ mod tests {
             )
         }));
         expected.extend([
+            // Nothing of the monitor's sits between chat's watches and
+            // chat's init: every call the ladder makes is chat's own, in
+            // its own order, with its own arguments.
             (
                 "callModuleMethod".to_owned(),
                 format!(
@@ -1251,6 +1625,497 @@ mod tests {
             ),
         ]);
         assert_eq!(controller.calls(), expected);
+    }
+
+    /// The staged set is the application's, not the daemon's, so it is
+    /// supplied rather than discovered.
+    fn config_with_modules(modules: &[&str]) -> BackendConfig {
+        let mut config = config();
+        config.modules =
+            modules.iter().map(|name| (*name).to_owned()).collect();
+        config
+    }
+
+    fn watches(controller: &FakeController) -> Vec<String> {
+        controller
+            .calls()
+            .into_iter()
+            .filter(|(method, _)| method == "watchModuleEvents")
+            .map(|(_, args)| args)
+            .collect()
+    }
+
+    fn modules_of(update: &Update) -> Option<&[ModuleState]> {
+        match update {
+            Update::Modules(modules) => Some(modules),
+            _ => None,
+        }
+    }
+
+    fn state<'a>(modules: &'a [ModuleState], name: &str) -> &'a ModuleState {
+        modules
+            .iter()
+            .find(|state| state.name == name)
+            .unwrap_or_else(|| panic!("no row for {name}"))
+    }
+
+    /// Announces every `listModules` call on the returned channel and
+    /// answers it from `rows`, which the test may move between polls.
+    ///
+    /// Waiting for the *call* is what lets a test assert a negative. The
+    /// thing under test is whether an update is emitted at all, so a test
+    /// that can only wait for updates can only ever prove the half that
+    /// emits one — which is exactly how a republish on every poll survived
+    /// a test named for catching it.
+    fn polling(
+        controller: &FakeController,
+        rows: &Arc<Mutex<String>>,
+    ) -> tokio_mpsc::UnboundedReceiver<()> {
+        let (called, calls) = tokio_mpsc::unbounded_channel();
+        let rows = rows.clone();
+        controller.respond_with("listModules", move |_| {
+            // Read first, announce second: the test flips `rows` the moment
+            // it hears about a call, and this answer is already decided.
+            let answer = rows.lock().unwrap().clone();
+            let _ = called.send(());
+            Ok(answer)
+        });
+        calls
+    }
+
+    /// One `blockchain_module` row, with the uptime a live daemon grows
+    /// every second.
+    fn row(status: &str, uptime: u32) -> String {
+        format!(
+            r#"[{{"name":"blockchain_module","status":"{status}",
+                  "version":"0.2.0","uptime_seconds":{uptime}}}]"#
+        )
+    }
+
+    /// Refreshes, and returns once the daemon has been *asked* — carrying
+    /// every update the session emitted in the meantime.
+    ///
+    /// The updates are returned rather than dropped because they are the
+    /// evidence: the fold of the previous poll lands in this window, so a
+    /// poll that was supposed to stay silent is caught by what this hands
+    /// back. The session only advances while its stream is polled, hence
+    /// the pump; `biased` closes the window on the call itself rather than
+    /// draining on past it, so an update this returns belongs to a poll
+    /// that already happened. Anything it leaves behind is still on the
+    /// stream for the caller's own `next` to trip over.
+    async fn poll(
+        stream: &mut (impl Stream<Item = Update> + Unpin),
+        control: &mut mpsc::Sender<Control>,
+        calls: &mut tokio_mpsc::UnboundedReceiver<()>,
+    ) -> Vec<Update> {
+        control.try_send(Control::RefreshModules).unwrap();
+
+        let mut meanwhile = Vec::new();
+        let pump = async {
+            loop {
+                tokio::select! {
+                    biased;
+                    called = calls.recv() => {
+                        called.expect("the poll reached the daemon");
+                        return;
+                    }
+                    update = stream.next() => {
+                        meanwhile.push(update.expect("update stream ended"));
+                    }
+                }
+            }
+        };
+        tokio::time::timeout(NEXT_TIMEOUT, pump)
+            .await
+            .expect("timed out waiting for the poll");
+
+        meanwhile
+    }
+
+    fn republished(updates: &[Update]) -> bool {
+        updates.iter().any(|update| modules_of(update).is_some())
+    }
+
+    /// Event watches for other modules must come from the contract the
+    /// module reports, never from a list written down here: the same
+    /// blockchain module ships with one event on the tag we run and three
+    /// on master, so a hardcoded list would either miss events or register
+    /// watches that never fire depending on which build is staged.
+    ///
+    /// The same pass pins four things: an idle module is not asked for a
+    /// contract it cannot have, a module that loads *later* is picked up by
+    /// the poll that sees it (the watches are no longer a one-shot on the
+    /// startup ladder), chat is never re-watched, and no module is asked
+    /// twice — there is no unwatch, so a second registration would
+    /// duplicate every forwarder.
+    #[tokio::test]
+    async fn module_watches_come_from_the_reported_contract() {
+        let (transport, controller) = FakeTransport::new();
+        script_ladder(&controller, "initialising", &[]);
+        let rows = Arc::new(Mutex::new(
+            r#"[{"name":"chat_module","status":"loaded","version":"0.2.1"},
+                {"name":"blockchain_module","status":"not_loaded","version":"0.2.0"}]"#
+                .to_owned(),
+        ));
+        let mut calls = polling(&controller, &rows);
+        controller.respond(
+            "getModuleInfo",
+            r#"{"name":"blockchain_module","status":"loaded","version":"0.2.0",
+                "dependencies":[],"dependents":[],
+                "events":[{"name":"newBlock","type":"event"}]}"#,
+        );
+
+        let mut stream = Box::pin(run(config(), single(transport)));
+        let mut control = start_initialising(&mut stream).await;
+
+        // Two passes, because a pass is only provably finished once the
+        // next one has been dispatched — the monitor holds a single slot.
+        poll(&mut stream, &mut control, &mut calls).await;
+        poll(&mut stream, &mut control, &mut calls).await;
+        assert!(
+            !controller
+                .calls()
+                .iter()
+                .any(|(method, _)| method == "getModuleInfo"),
+            "an idle module has no live contract to report",
+        );
+
+        *rows.lock().unwrap() =
+            r#"[{"name":"chat_module","status":"loaded","version":"0.2.1"},
+                {"name":"blockchain_module","status":"loaded","version":"0.2.0"}]"#
+                .to_owned();
+        poll(&mut stream, &mut control, &mut calls).await;
+        // The report is folded in the same breath as the watches, so the
+        // update is the signal that the pass is done.
+        match next(&mut stream).await {
+            Update::Modules(modules) => {
+                assert_eq!(state(&modules, "blockchain_module").status, LOADED);
+            }
+            other => panic!("expected the loaded module, got {other:?}"),
+        }
+
+        // A third poll of an unchanged report must ask nothing again.
+        poll(&mut stream, &mut control, &mut calls).await;
+        poll(&mut stream, &mut control, &mut calls).await;
+
+        let introspected: Vec<String> = controller
+            .calls()
+            .into_iter()
+            .filter(|(method, _)| method == "getModuleInfo")
+            .map(|(_, args)| args)
+            .collect();
+        assert_eq!(introspected, vec![r#"["blockchain_module"]"#.to_owned()]);
+
+        let mut expected: Vec<String> = ChatEvent::NAMES
+            .iter()
+            .map(|name| format!(r#"["chat_module","{name}"]"#))
+            .collect();
+        expected.push(r#"["blockchain_module","newBlock"]"#.to_owned());
+        assert_eq!(watches(&controller), expected);
+    }
+
+    /// A module that cannot be introspected must cost only its own watches,
+    /// and must cost them once. `getModuleInfo` is the one call that leaves
+    /// the daemon, so it is the one most likely to hang — and a poll that
+    /// retried it would spend that timeout again every five seconds for the
+    /// rest of the run.
+    #[tokio::test]
+    async fn a_failing_module_introspection_is_not_retried_every_poll() {
+        let (transport, controller) = FakeTransport::new();
+        script_ladder(&controller, "online", &[]);
+        let rows = Arc::new(Mutex::new(
+            r#"[{"name":"delivery_module","status":"loaded","version":"0.1.3"}]"#
+                .to_owned(),
+        ));
+        let mut calls = polling(&controller, &rows);
+        controller.respond_once(
+            "getModuleInfo",
+            Err(IpcError::Timeout {
+                method: "getModuleInfo".to_owned(),
+            }),
+        );
+
+        let mut stream = Box::pin(run(config(), single(transport)));
+        let mut control = start_online(&mut stream).await;
+
+        poll(&mut stream, &mut control, &mut calls).await;
+        // The status half of the pass survives the introspection half.
+        match next(&mut stream).await {
+            Update::Modules(modules) => {
+                assert_eq!(state(&modules, "delivery_module").status, LOADED);
+            }
+            other => panic!("expected the report anyway, got {other:?}"),
+        }
+
+        poll(&mut stream, &mut control, &mut calls).await;
+        poll(&mut stream, &mut control, &mut calls).await;
+
+        let introspections = controller
+            .calls()
+            .iter()
+            .filter(|(method, _)| method == "getModuleInfo")
+            .count();
+        assert_eq!(introspections, 1, "the failure was retried");
+        let expected: Vec<String> = ChatEvent::NAMES
+            .iter()
+            .map(|name| format!(r#"["chat_module","{name}"]"#))
+            .collect();
+        assert_eq!(watches(&controller), expected);
+    }
+
+    /// The monitor is off chat's critical path, and off the path of every
+    /// action the user takes afterwards.
+    ///
+    /// `listModules` never answers here until the test lets it. The ladder
+    /// has to reach its snapshot regardless: the logos thread serializes
+    /// every invoke, so a monitor call issued before `chat.init` is a call
+    /// `chat.init` waits behind, and a module stalling to its timeout would
+    /// be a login stalling to its timeout. Once the poll IS in flight, the
+    /// control channel has to keep flowing — a gated send is answered by
+    /// the session alone, so an answer proves the control was dequeued
+    /// while the poll had still not returned.
+    #[tokio::test]
+    async fn a_wedged_module_poll_blocks_neither_login_nor_the_next_action() {
+        let (transport, controller) = FakeTransport::new();
+        script_ladder(&controller, "initialising", &[]);
+        let (release, blocked) = std::sync::mpsc::channel::<()>();
+        let blocked = Mutex::new(blocked);
+        let (called, mut calls) = tokio_mpsc::unbounded_channel();
+        controller.respond_with("listModules", move |_| {
+            let _ = called.send(());
+            let _ = blocked.lock().unwrap().recv();
+            Ok(r#"[{"name":"chat_module","status":"loaded"}]"#.to_owned())
+        });
+
+        let mut stream = Box::pin(run(config(), single(transport)));
+        // Reaching the seeded phase at all is the assertion: with the
+        // monitor back on the ladder this sits in `listModules` until the
+        // test's own timeout.
+        let mut control = start_initialising(&mut stream).await;
+
+        poll(&mut stream, &mut control, &mut calls).await;
+
+        control
+            .try_send(Control::SendMessage {
+                convo_id: ConvoId("c1".to_owned()),
+                content: "hello".to_owned(),
+            })
+            .unwrap();
+        match next(&mut stream).await {
+            Update::ActionFailed(ActionError::NotOnline { attempted }) => {
+                assert_eq!(attempted, "send_message");
+            }
+            other => panic!(
+                "the control channel waited on the module poll: {other:?}"
+            ),
+        }
+
+        release.send(()).unwrap();
+        match next(&mut stream).await {
+            Update::Modules(modules) => {
+                assert_eq!(state(&modules, "chat_module").status, LOADED);
+            }
+            other => panic!("expected the released poll, got {other:?}"),
+        }
+    }
+
+    /// The staged set gives every module a row before the daemon has said
+    /// anything, and the first report fills those rows in rather than
+    /// replacing the list — a module the daemon never mentions keeps its
+    /// place instead of disappearing from the sidebar.
+    #[tokio::test]
+    async fn staged_modules_hold_their_row_when_the_daemon_reports() {
+        let (transport, controller) = FakeTransport::new();
+        script_ladder(&controller, "initialising", &[]);
+        controller.respond(
+            "listModules",
+            r#"[{"name":"chat_module","status":"loaded","version":"0.2.1","uptime_seconds":7}]"#,
+        );
+
+        let mut stream = Box::pin(run(
+            config_with_modules(&["chat_module", "blockchain_module"]),
+            single(transport),
+        ));
+        let mut control = start_initialising(&mut stream).await;
+
+        control.try_send(Control::RefreshModules).unwrap();
+        let modules = match next(&mut stream).await {
+            Update::Modules(modules) => modules,
+            other => panic!("expected the first report, got {other:?}"),
+        };
+
+        assert_eq!(
+            modules.iter().map(|s| s.name.as_str()).collect::<Vec<_>>(),
+            vec!["chat_module", "blockchain_module"]
+        );
+        assert_eq!(state(&modules, "chat_module").status, LOADED);
+        assert_eq!(
+            state(&modules, "chat_module").version.as_deref(),
+            Some("0.2.1")
+        );
+        assert_eq!(state(&modules, "blockchain_module").status, "not_loaded");
+    }
+
+    /// A refresh that learns nothing new must say nothing: the poll runs
+    /// every 5s forever, and an update per tick would repaint the sidebar
+    /// for state the UI already has.
+    ///
+    /// The middle poll is the one that matters, and it is the one a real
+    /// daemon serves constantly: same module, same status, same version,
+    /// and an uptime one second further along. Silence there is asserted by
+    /// what arrives *next* — a spurious `loaded` republish would be the
+    /// update this test reads as the crash it went looking for. Asserting
+    /// it with a follow-up round trip instead would prove nothing at all:
+    /// the poll dispatches at lowest priority, so a chat reply outruns a
+    /// queued republish whether or not one exists.
+    #[tokio::test]
+    async fn module_status_is_republished_only_when_it_moves() {
+        let (transport, controller) = FakeTransport::new();
+        script_ladder(&controller, "online", &[]);
+        let rows = Arc::new(Mutex::new(row(LOADED, 7)));
+        let mut calls = polling(&controller, &rows);
+        controller.respond(
+            "getModuleInfo",
+            r#"{"name":"blockchain_module","status":"loaded","events":[]}"#,
+        );
+
+        let mut stream = Box::pin(run(
+            config_with_modules(&["blockchain_module"]),
+            single(transport),
+        ));
+        let mut control = start_online(&mut stream).await;
+
+        poll(&mut stream, &mut control, &mut calls).await;
+        match next(&mut stream).await {
+            Update::Modules(modules) => {
+                assert_eq!(state(&modules, "blockchain_module").status, LOADED);
+            }
+            other => panic!("expected the first report, got {other:?}"),
+        }
+
+        // Nothing moved but the daemon's clock.
+        *rows.lock().unwrap() = row(LOADED, 12);
+        poll(&mut stream, &mut control, &mut calls).await;
+
+        // The module aborts; the daemon reports it as `not_loaded` on the
+        // very next poll, and that is the only way we ever learn of it.
+        // Whatever the uptime-only poll had to say lands in this window.
+        *rows.lock().unwrap() = row("not_loaded", 0);
+        let quiet = poll(&mut stream, &mut control, &mut calls).await;
+        assert!(
+            !republished(&quiet),
+            "an uptime-only report was republished: {quiet:?}",
+        );
+
+        match next(&mut stream).await {
+            Update::Modules(modules) => {
+                assert_eq!(
+                    state(&modules, "blockchain_module").status,
+                    "not_loaded",
+                    "the uptime-only poll republished",
+                );
+            }
+            other => panic!("expected the changed status, got {other:?}"),
+        }
+    }
+
+    /// A module event that is not chat's must reach the module state
+    /// instead of being dropped — and must not be forwarded one-for-one: a
+    /// syncing blockchain node emitted 1158 `newBlock` events in a few
+    /// minutes of catch-up. The poll samples the count, which is what makes
+    /// it a rate rather than a running total, and one quiet window later it
+    /// is back to zero and stays silent.
+    #[tokio::test]
+    async fn non_chat_events_are_sampled_per_poll_and_never_forwarded() {
+        let (transport, controller) = FakeTransport::new();
+        script_ladder(&controller, "online", &[]);
+        let rows = Arc::new(Mutex::new(row(LOADED, 7)));
+        let mut calls = polling(&controller, &rows);
+        controller.respond(
+            "getModuleInfo",
+            r#"{"name":"blockchain_module","status":"loaded",
+                "events":[{"name":"newBlock","type":"event"}]}"#,
+        );
+
+        let mut stream = Box::pin(run(
+            config_with_modules(&["blockchain_module"]),
+            single(transport),
+        ));
+        let mut control = start_online(&mut stream).await;
+
+        controller
+            .emit("module_event", r#"["blockchain_module","newBlock",1]"#);
+        controller
+            .emit("module_event", r#"["blockchain_module","newBlock",2]"#);
+        // An event we model nowhere is recorded just the same; an unknown
+        // event from an unknown module must never be fatal.
+        controller.emit("module_event", r#"["other_module","surprise"]"#);
+
+        poll(&mut stream, &mut control, &mut calls).await;
+        match next(&mut stream).await {
+            Update::Modules(modules) => {
+                assert_eq!(
+                    state(&modules, "blockchain_module").recent_events,
+                    2
+                );
+                assert_eq!(state(&modules, "other_module").recent_events, 1);
+            }
+            other => panic!("expected the sampled window, got {other:?}"),
+        }
+
+        // A quiet window reports zero — once.
+        poll(&mut stream, &mut control, &mut calls).await;
+        match next(&mut stream).await {
+            Update::Modules(modules) => {
+                assert_eq!(
+                    state(&modules, "blockchain_module").recent_events,
+                    0
+                );
+            }
+            other => panic!("expected the quiet window, got {other:?}"),
+        }
+
+        poll(&mut stream, &mut control, &mut calls).await;
+        *rows.lock().unwrap() = row("not_loaded", 0);
+        let quiet = poll(&mut stream, &mut control, &mut calls).await;
+        assert!(
+            !republished(&quiet),
+            "a second quiet window republished a pulse of zero: {quiet:?}",
+        );
+        match next(&mut stream).await {
+            Update::Modules(modules) => {
+                assert_eq!(
+                    state(&modules, "blockchain_module").status,
+                    "not_loaded"
+                );
+            }
+            other => panic!("expected the changed status, got {other:?}"),
+        }
+    }
+
+    /// The poll is observation. A daemon that does not know `listModules`
+    /// answers with the same literal `null` a dead link does, so treating a
+    /// failed refresh as a dead link would put a perfectly healthy session
+    /// into the restart ladder on the strength of a monitor call.
+    #[tokio::test]
+    async fn a_failing_module_poll_never_restarts_the_session() {
+        let (transport, controller) = FakeTransport::new();
+        script_ladder(&controller, "online", &[]);
+        let mut stream = Box::pin(run(config(), single(transport)));
+        let mut control = start_online(&mut stream).await;
+
+        controller.respond_once("listModules", Err(IpcError::DeadLink));
+        control.try_send(Control::RefreshModules).unwrap();
+        control
+            .try_send(Control::LoadMessages {
+                convo_id: ConvoId("c1".to_owned()),
+            })
+            .unwrap();
+
+        match next(&mut stream).await {
+            Update::MessagesLoaded { .. } => {}
+            other => panic!("expected the session to carry on, got {other:?}"),
+        }
     }
 
     #[tokio::test]

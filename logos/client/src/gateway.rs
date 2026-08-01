@@ -30,6 +30,46 @@ pub const WATCH_TIMEOUT: Duration = Duration::from_secs(5);
 pub const SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(3);
 /// Matches the protocol default so the outer guard, not the wire, decides.
 pub const DEFAULT_CALL_TIMEOUT: Duration = Duration::from_secs(20);
+/// Longer than [`STATUS_TIMEOUT`] because `getModuleInfo` is the one
+/// introspection call that leaves the daemon: for a loaded module it
+/// forwards `getPluginMethods` and `getPluginEvents` to the module itself,
+/// so it inherits that module's dispatch latency.
+pub const MODULE_INFO_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// One `listModules` row — the daemon's own view of one installed module.
+///
+/// `status` stays a verbatim string rather than an enum: this is a wire
+/// boundary, and the vocabulary is the daemon's to grow. Today it only ever
+/// emits `loaded` / `not_loaded` (`crashed` is counted by `getStatus` but
+/// never produced by the row builder), and mapping those onto a domain state
+/// belongs to the layer that owns the domain.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ModuleStatus {
+    pub name: String,
+    pub status: String,
+    /// From the module's manifest. The daemon substitutes an empty string
+    /// when the manifest carries no version; that is an absence, not a
+    /// version, so it is normalised to `None`.
+    pub version: Option<String>,
+}
+
+/// `getModuleInfo`, reduced to what a monitor reads.
+///
+/// `methods` and `events` are the *live* contract, introspected from the
+/// running module rather than read from a manifest — which is why they are
+/// empty for a module that is not loaded, and why an event-watch list must
+/// be built from them instead of being written down. The same blockchain
+/// module ships with one event on the tag we run and three on master.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ModuleInfo {
+    pub name: String,
+    pub status: String,
+    pub version: Option<String>,
+    pub dependencies: Vec<String>,
+    pub dependents: Vec<String>,
+    pub methods: Vec<String>,
+    pub events: Vec<String>,
+}
 
 #[derive(Clone)]
 pub struct Gateway {
@@ -87,6 +127,119 @@ impl Gateway {
             GatewayError::Decode(format!(
                 "watchModuleEvents returned a non-boolean: {value}"
             ))
+        })
+    }
+
+    /// `core_service.listModules(filter)` → one row per installed module.
+    ///
+    /// Always asks for `"all"`, never `"loaded"`: a monitor that only saw
+    /// loaded modules could not tell "staged but idle" from "gone", and the
+    /// idle case is the normal one for everything except chat.
+    ///
+    /// Unlike `callModuleMethod` this returns a bare JSON array, not a
+    /// status envelope — the daemon builds the rows itself and never
+    /// consults the modules, so there is nothing for a module to fail. A row
+    /// that does not decode is dropped with a warning rather than failing
+    /// the whole poll; one malformed entry must not blank the sidebar.
+    pub async fn list_modules(
+        &self,
+    ) -> Result<Vec<ModuleStatus>, GatewayError> {
+        let value = self
+            .invoke_checked(
+                "listModules",
+                vec![Value::String("all".to_owned())],
+                STATUS_TIMEOUT,
+            )
+            .await?;
+
+        let Value::Array(rows) = value else {
+            return Err(GatewayError::Decode(format!(
+                "listModules returned a non-array: {value}"
+            )));
+        };
+
+        Ok(rows
+            .into_iter()
+            .filter_map(|row| {
+                let Some(name) = row.get("name").and_then(Value::as_str) else {
+                    log::warn!("listModules row without a name: {row}");
+                    return None;
+                };
+                Some(ModuleStatus {
+                    name: name.to_owned(),
+                    status: row
+                        .get("status")
+                        .and_then(Value::as_str)
+                        .unwrap_or_default()
+                        .to_owned(),
+                    version: non_empty(row.get("version")),
+                })
+            })
+            .collect())
+    }
+
+    /// `core_service.getModuleInfo(name)` → the module's dependency edges
+    /// and its live method/event contract.
+    ///
+    /// Two shapes share one call. Success is a bare map whose `status` is
+    /// the module's *load* state (`loaded` / `not_loaded`); failure is the
+    /// error half of the usual envelope (`status: "error"` with
+    /// `MODULE_NOT_FOUND`). So this cannot go through
+    /// [`unwrap_envelope`] — that would read a perfectly good answer as a
+    /// malformed one.
+    ///
+    /// Treat every failure here as "this signal is unavailable", never as a
+    /// reason to tear a session down. A daemon predating the method returns
+    /// the literal `null`, which the dead-link heuristic reads as
+    /// [`IpcError::DeadLink`] once the link has produced any earlier
+    /// result — indistinguishable, at this layer, from a daemon that died.
+    pub async fn module_info(
+        &self,
+        name: &str,
+    ) -> Result<ModuleInfo, GatewayError> {
+        let value = self
+            .invoke_checked(
+                "getModuleInfo",
+                vec![Value::String(name.to_owned())],
+                MODULE_INFO_TIMEOUT,
+            )
+            .await?;
+
+        let status = value
+            .get("status")
+            .and_then(Value::as_str)
+            .ok_or_else(|| {
+                GatewayError::Decode(format!(
+                    "getModuleInfo returned no status: {value}"
+                ))
+            })?
+            .to_owned();
+
+        if status == "error" {
+            return Err(GatewayError::Module {
+                code: ModuleErrorCode::parse(
+                    value.get("code").and_then(Value::as_str).unwrap_or(""),
+                ),
+                message: value
+                    .get("message")
+                    .and_then(Value::as_str)
+                    .unwrap_or("")
+                    .to_owned(),
+            });
+        }
+
+        Ok(ModuleInfo {
+            name: value
+                .get("name")
+                .and_then(Value::as_str)
+                .unwrap_or(name)
+                .to_owned(),
+            status,
+            version: non_empty(value.get("version")),
+            dependencies: names(value.get("dependencies")),
+            dependents: names(value.get("dependents")),
+            methods: names(value.get("methods")),
+            events: names(value.get("events")),
         })
     }
 
@@ -157,6 +310,36 @@ impl Gateway {
         self.seen_ok.store(true, Ordering::SeqCst);
         Ok(value)
     }
+}
+
+/// A string field the daemon fills with `""` when it has nothing to say
+/// (module versions, notably) read as the absence it is.
+fn non_empty(value: Option<&Value>) -> Option<String> {
+    value
+        .and_then(Value::as_str)
+        .filter(|text| !text.is_empty())
+        .map(str::to_owned)
+}
+
+/// Flattens the two shapes `getModuleInfo` mixes in one response: plain
+/// strings (`dependencies`, `dependents`) and interface entries
+/// (`methods`, `events`), which the module's proxy emits as objects
+/// `{name, type, signature, returnType, parameters}`. Anything else in the
+/// array is skipped rather than guessed at.
+fn names(value: Option<&Value>) -> Vec<String> {
+    let Some(Value::Array(items)) = value else {
+        return Vec::new();
+    };
+
+    items
+        .iter()
+        .filter_map(|item| match item {
+            Value::String(name) => Some(name.clone()),
+            other => {
+                other.get("name").and_then(Value::as_str).map(str::to_owned)
+            }
+        })
+        .collect()
 }
 
 /// Unwraps the `{"status":"ok"|"error",...}` envelope, returning the inner
@@ -319,6 +502,138 @@ mod tests {
                 r#"["chat_module","message_received"]"#.to_owned()
             )]
         );
+    }
+
+    /// The row builder is the daemon's, not a module's: it fills `version`
+    /// with `""` when the manifest has none, and that absence must survive as
+    /// `None` rather than becoming an empty-string "version".
+    ///
+    /// The `uptime_seconds` the daemon also sends is deliberately not decoded —
+    /// it advances every second, and folding it into a state the monitor
+    /// compares made every poll look like a change. The fixture keeps it to
+    /// pin that an unread wire field is ignored rather than breaking the parse.
+    #[tokio::test]
+    async fn list_modules_decodes_rows_and_asks_for_all() {
+        let (gateway, controller) = gateway().await;
+        controller.respond(
+            "listModules",
+            r#"[{"name":"chat_module","status":"loaded","version":"0.2.1","uptime_seconds":42},
+                {"name":"blockchain_module","status":"not_loaded","version":""}]"#,
+        );
+
+        let modules = gateway.list_modules().await.unwrap();
+
+        assert_eq!(
+            modules,
+            vec![
+                ModuleStatus {
+                    name: "chat_module".to_owned(),
+                    status: "loaded".to_owned(),
+                    version: Some("0.2.1".to_owned()),
+                },
+                ModuleStatus {
+                    name: "blockchain_module".to_owned(),
+                    status: "not_loaded".to_owned(),
+                    version: None,
+                },
+            ]
+        );
+        assert_eq!(
+            controller.calls(),
+            vec![("listModules".to_owned(), r#"["all"]"#.to_owned())]
+        );
+    }
+
+    /// One unusable row must not cost the caller every other row — a poll
+    /// that returns nothing blanks the whole module sidebar.
+    #[tokio::test]
+    async fn list_modules_drops_only_the_undecodable_row() {
+        let (gateway, controller) = gateway().await;
+        controller.respond(
+            "listModules",
+            r#"[{"status":"loaded"},{"name":"delivery_module","status":"loaded"}]"#,
+        );
+
+        let modules = gateway.list_modules().await.unwrap();
+
+        assert_eq!(
+            modules.iter().map(|m| m.name.as_str()).collect::<Vec<_>>(),
+            vec!["delivery_module"]
+        );
+    }
+
+    /// `getModuleInfo` answers with a bare map whose `status` is the load
+    /// state, so it must NOT be read as an ok/error envelope. Events arrive
+    /// as interface objects; dependencies as plain strings.
+    #[tokio::test]
+    async fn module_info_decodes_both_list_shapes() {
+        let (gateway, controller) = gateway().await;
+        controller.respond(
+            "getModuleInfo",
+            r#"{"name":"chat_module","status":"loaded","version":"0.2.1",
+                "dependencies":["delivery_module"],"dependents":[],
+                "methods":[{"name":"status","type":"method"}],
+                "events":[{"name":"message_received","type":"event"},
+                          {"name":"delivery_state_changed","type":"event"}]}"#,
+        );
+
+        let info = gateway.module_info("chat_module").await.unwrap();
+
+        assert_eq!(
+            info,
+            ModuleInfo {
+                name: "chat_module".to_owned(),
+                status: "loaded".to_owned(),
+                version: Some("0.2.1".to_owned()),
+                dependencies: vec!["delivery_module".to_owned()],
+                dependents: Vec::new(),
+                methods: vec!["status".to_owned()],
+                events: vec![
+                    "message_received".to_owned(),
+                    "delivery_state_changed".to_owned(),
+                ],
+            }
+        );
+        assert_eq!(
+            controller.calls(),
+            vec![("getModuleInfo".to_owned(), r#"["chat_module"]"#.to_owned())]
+        );
+    }
+
+    /// An idle module answers with no `methods`/`events` at all — the
+    /// daemon only introspects a running one. Empty lists, not an error.
+    #[tokio::test]
+    async fn module_info_of_an_idle_module_has_no_contract() {
+        let (gateway, controller) = gateway().await;
+        controller.respond(
+            "getModuleInfo",
+            r#"{"name":"blockchain_module","status":"not_loaded","version":"0.2.0",
+                "dependencies":[],"dependents":[]}"#,
+        );
+
+        let info = gateway.module_info("blockchain_module").await.unwrap();
+
+        assert_eq!(info.status, "not_loaded");
+        assert!(info.methods.is_empty() && info.events.is_empty());
+    }
+
+    #[tokio::test]
+    async fn module_info_maps_the_not_found_error() {
+        let (gateway, controller) = gateway().await;
+        controller.respond(
+            "getModuleInfo",
+            r#"{"status":"error","code":"MODULE_NOT_FOUND","message":"Module 'nope' not found."}"#,
+        );
+
+        let error = gateway.module_info("nope").await.unwrap_err();
+
+        assert!(matches!(
+            error,
+            GatewayError::Module {
+                code: ModuleErrorCode::ModuleNotFound,
+                ..
+            }
+        ));
     }
 
     #[tokio::test]

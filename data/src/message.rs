@@ -3,7 +3,7 @@ use std::collections::HashSet;
 use std::hash::{DefaultHasher, Hash as _, Hasher};
 use std::sync::LazyLock;
 
-use chrono::{DateTime, Utc};
+use chrono::{DateTime, Local, TimeZone, Utc};
 use const_format::concatcp;
 use fancy_regex::{Match, Regex, RegexBuilder};
 use itertools::Itertools;
@@ -164,6 +164,45 @@ impl Message {
         }
     }
 
+    /// One line of a module's log, as a message on that module's history.
+    ///
+    /// The parsed [`Record`](crate::module::log::Record) is carried whole:
+    /// level, target and message are all styled separately by the pane, and
+    /// re-deriving them from the rendered text would mean parsing the same
+    /// line twice — once here and once on every frame.
+    ///
+    /// The envelope's timestamp is the daemon's local wall clock, so it is
+    /// resolved through the local zone rather than read as UTC; an ambiguous
+    /// or absent stamp (a continuation line inheriting nothing) falls back to
+    /// now, which keeps the row in arrival order where it belongs.
+    pub fn module_log(line: crate::module::tail::Line) -> Self {
+        let received_at = Posix::now();
+        let server_time = line
+            .record
+            .timestamp
+            .and_then(|timestamp| {
+                Local.from_local_datetime(&timestamp).single()
+            })
+            .map_or_else(Utc::now, |timestamp| timestamp.with_timezone(&Utc));
+        let target = Target::Logs {
+            source: Source::Internal(source::Internal::Module(
+                line.record.level,
+            )),
+        };
+        let content = Content::ModuleLog(line.record);
+        let hash = Hash::new(&server_time, &content, &received_at);
+
+        Self {
+            received_at,
+            server_time,
+            direction: Direction::Received,
+            target,
+            content,
+            hash,
+            hidden_urls: HashSet::default(),
+        }
+    }
+
     fn new(
         target: Target,
         direction: Direction,
@@ -192,8 +231,26 @@ impl Message {
                 Source::Peer(_) => true,
                 Source::Internal(source::Internal::Logs(level)) => {
                     match level {
-                        Level::Warn | Level::Error => true,
+                        // `Critical` cannot reach the app's own log — the
+                        // `log` crate stops at `Error` — but if it ever did
+                        // it would be the loudest thing in it.
+                        Level::Critical | Level::Warn | Level::Error => true,
                         Level::Info | Level::Debug | Level::Trace => false,
+                    }
+                }
+                // Errors only, unlike the app's own log. A relay node warns
+                // constantly — delivery emitted warnings in the hundreds
+                // over one session — so badging on `Warn` would leave every
+                // module row permanently lit and train the badge away.
+                Source::Internal(source::Internal::Module(level)) => {
+                    use crate::module::log::Level;
+
+                    match level {
+                        Level::Error | Level::Critical => true,
+                        Level::Warn
+                        | Level::Info
+                        | Level::Debug
+                        | Level::Trace => false,
                     }
                 }
                 Source::Yourself | Source::Status(_) => false,
@@ -203,7 +260,9 @@ impl Message {
     pub fn plain(&self) -> Option<&str> {
         match &self.content {
             Content::Plain(s) => Some(s),
-            Content::Fragments(_) | Content::Log(_) => None,
+            Content::Fragments(_) | Content::Log(_) | Content::ModuleLog(_) => {
+                None
+            }
         }
     }
 
@@ -425,6 +484,10 @@ pub enum Content {
     Plain(String),
     Fragments(Vec<Fragment>),
     Log(crate::log::Record),
+    /// One parsed line of a module's log. Kept as the record rather than as
+    /// text so the pane can colour by level and dim the target without
+    /// re-parsing.
+    ModuleLog(crate::module::log::Record),
 }
 
 impl Content {
@@ -435,6 +498,7 @@ impl Content {
                 fragments.iter().map(Fragment::as_str).join("").into()
             }
             Content::Log(record) => (&record.message).into(),
+            Content::ModuleLog(record) => (&record.message).into(),
         }
     }
 

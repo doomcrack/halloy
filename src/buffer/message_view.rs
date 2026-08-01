@@ -195,8 +195,11 @@ impl<'a> LayoutMessage<'a> for ConversationLayout<'a> {
 
                 (Some(marker), content)
             }
-            // Log records render through the logs buffer's own layout.
-            Source::Internal(message::source::Internal::Logs(_)) => {
+            // Log records render through the log buffers' own layout.
+            Source::Internal(
+                message::source::Internal::Logs(_)
+                | message::source::Internal::Module(_),
+            ) => {
                 return None;
             }
         };

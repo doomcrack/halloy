@@ -68,6 +68,17 @@ impl BufferSettings {
     /// Drops persisted per-conversation settings. Identity is ephemeral
     /// upstream, so `convo:` keys from a previous run can never match a
     /// live conversation again and would otherwise grow unboundedly.
+    ///
+    /// Only `convo:` keys. Module ids are stable across restarts by
+    /// construction — the catalog is hardcoded — so a `module:` key still
+    /// names the same module next launch and must survive, as must the
+    /// internal buffers'.
+    ///
+    /// Runs at load, where the live set is not yet known — nothing
+    /// conversation-keyed here survives to be spared. Layout and focus
+    /// cannot be swept the same way (a pane is the user's, not a cache
+    /// entry), so they are reconciled against the first snapshot instead;
+    /// see `screen::Dashboard::reconcile_conversations`.
     fn prune_orphaned_conversations(&mut self) {
         self.settings.retain(|key, _| !key.starts_with("convo:"));
     }
@@ -158,4 +169,71 @@ pub enum Error {
     Compression(#[from] compression::Error),
     #[error(transparent)]
     Io(#[from] io::Error),
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::conversation::ConvoId;
+    use crate::module::ModuleId;
+    use crate::pane::Pane;
+
+    /// The load-time sweep exists because conversation ids are ephemeral.
+    /// Module ids are not — the catalog is hardcoded precisely so a module
+    /// pane means the same thing next launch — so they must survive it, as
+    /// must the internal buffers'.
+    #[test]
+    fn pruning_orphaned_conversations_spares_module_settings() {
+        let mut settings = BufferSettings::default();
+
+        for buffer in [
+            Buffer::Conversation(ConvoId::from("abc123")),
+            Buffer::Module(ModuleId::from("blockchain_module")),
+            Buffer::Internal(buffer::Internal::Logs),
+        ] {
+            settings.entry(&buffer, None);
+        }
+
+        settings.prune_orphaned_conversations();
+
+        assert!(
+            settings
+                .get(&Buffer::Conversation(ConvoId::from("abc123")))
+                .is_none()
+        );
+        assert!(
+            settings
+                .get(&Buffer::Module(ModuleId::from("blockchain_module")))
+                .is_some()
+        );
+        assert!(
+            settings
+                .get(&Buffer::Internal(buffer::Internal::Logs))
+                .is_some()
+        );
+    }
+
+    /// A module pane and a module focus must come back exactly as they went
+    /// in — nothing on the persistence path is allowed to prune them.
+    #[test]
+    fn module_panes_survive_the_persisted_round_trip() {
+        let module = Buffer::Module(ModuleId::from("blockchain_module"));
+        let dashboard = Dashboard {
+            pane: Pane::Buffer {
+                buffer: module.clone(),
+            },
+            focus_buffer: Some(module.clone()),
+            ..Dashboard::default()
+        };
+
+        let bytes = compression::compress(&dashboard).unwrap();
+        let mut restored: Dashboard = compression::decompress(&bytes).unwrap();
+        restored.buffer_settings.prune_orphaned_conversations();
+
+        assert!(matches!(
+            restored.pane,
+            Pane::Buffer { buffer } if buffer == module
+        ));
+        assert_eq!(restored.focus_buffer, Some(module));
+    }
 }

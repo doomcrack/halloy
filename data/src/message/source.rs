@@ -28,7 +28,16 @@ pub enum StatusKind {
     Info,
 }
 
+/// A message the app produced about itself rather than received.
+///
+/// `Module` stays [`Copy`] like its sibling — the source is passed by value
+/// through `message_view`, `scroll_view` and `context_menu` — so it carries
+/// only the severity. Which module a line belongs to is carried by
+/// [`history::Kind::Module`](crate::history::Kind), which every read path
+/// already keys on; duplicating the id here would buy nothing and cost the
+/// `Copy`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub enum Internal {
     Logs(log::Level),
+    Module(crate::module::log::Level),
 }

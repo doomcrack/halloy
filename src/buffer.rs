@@ -8,6 +8,7 @@ use iced::{Size, Task};
 pub use self::config_editor::ConfigEditor;
 pub use self::conversation::Conversation;
 pub use self::logs::Logs;
+pub use self::module_log::ModuleLog;
 use crate::Theme;
 use crate::screen::dashboard::sidebar;
 use crate::widget::Element;
@@ -17,14 +18,20 @@ pub mod context_menu;
 pub mod conversation;
 pub mod empty;
 mod input_view;
+mod log_row;
 pub mod logs;
 mod message_view;
+pub mod module_log;
 mod scroll_view;
 
 #[derive(Clone, Debug)]
 pub enum Buffer {
     Empty,
     Conversation(Conversation),
+    /// One module's log. Sits in every match arm the `Logs` buffer does,
+    /// which is what makes it read-only: `input_view` is reachable from
+    /// `Conversation` and nowhere else.
+    Module(ModuleLog),
     Logs(Logs),
     ConfigEditor(ConfigEditor),
 }
@@ -32,6 +39,7 @@ pub enum Buffer {
 #[derive(Debug, Clone)]
 pub enum Message {
     Conversation(conversation::Message),
+    Module(module_log::Message),
     Logs(logs::Message),
     ConfigEditor(config_editor::Message),
 }
@@ -58,6 +66,7 @@ pub enum Event {
 }
 
 impl Buffer {
+    /// Hydrates a persisted or freshly opened `data::Buffer` into pane state.
     pub fn from_data(
         buffer: data::Buffer,
         history: &history::Manager,
@@ -68,6 +77,9 @@ impl Buffer {
             data::Buffer::Conversation(convo_id) => Self::Conversation(
                 Conversation::new(convo_id, history, pane_size, config),
             ),
+            data::Buffer::Module(module_id) => {
+                Self::Module(ModuleLog::new(module_id, pane_size, config))
+            }
             data::Buffer::Internal(internal) => match internal {
                 buffer::Internal::Logs => {
                     Self::Logs(Logs::new(pane_size, config))
@@ -86,13 +98,32 @@ impl Buffer {
     pub fn convo_id(&self) -> Option<&ConvoId> {
         match self {
             Buffer::Conversation(state) => Some(&state.convo_id),
-            Buffer::Empty | Buffer::Logs(_) | Buffer::ConfigEditor(_) => None,
+            // A module pane is not a conversation, and saying so here is
+            // what keeps `Dashboard::reconcile_conversations` from emptying
+            // it on the first snapshot: that sweep collects panes by this
+            // very method.
+            Buffer::Empty
+            | Buffer::Module(_)
+            | Buffer::Logs(_)
+            | Buffer::ConfigEditor(_) => None,
+        }
+    }
+
+    /// The module a pane is showing, if it is showing one.
+    ///
+    /// The sidebar's counterpart to [`Self::convo_id`]: it is how a module
+    /// row finds the pane already displaying it.
+    pub fn module_id(&self) -> Option<&data::module::ModuleId> {
+        if let Buffer::Module(state) = self {
+            Some(&state.module)
+        } else {
+            None
         }
     }
 
     pub fn internal(&self) -> Option<buffer::Internal> {
         match self {
-            Buffer::Empty | Buffer::Conversation(_) => None,
+            Buffer::Empty | Buffer::Conversation(_) | Buffer::Module(_) => None,
             Buffer::Logs(_) => Some(buffer::Internal::Logs),
             Buffer::ConfigEditor(_) => Some(buffer::Internal::ConfigEditor),
         }
@@ -103,6 +134,9 @@ impl Buffer {
             Buffer::Empty => None,
             Buffer::Conversation(state) => {
                 Some(data::Buffer::Conversation(state.convo_id.clone()))
+            }
+            Buffer::Module(state) => {
+                Some(data::Buffer::Module(state.module.clone()))
             }
             Buffer::Logs(_) => {
                 Some(data::Buffer::Internal(buffer::Internal::Logs))
@@ -165,6 +199,21 @@ impl Buffer {
 
                 (command.map(Message::Logs), event)
             }
+            (Buffer::Module(state), Message::Module(message)) => {
+                let (command, event) = state.update(message, history, config);
+
+                let kind = history::Kind::Module(state.module.clone());
+
+                let event = event.map(|event| match event {
+                    module_log::Event::ContextMenu(event) => {
+                        Event::ContextMenu(event)
+                    }
+                    module_log::Event::MarkAsRead => Event::MarkAsRead(kind),
+                    module_log::Event::OpenUrl(url) => Event::OpenUrl(url),
+                });
+
+                (command.map(Message::Module), event)
+            }
             (Buffer::ConfigEditor(state), Message::ConfigEditor(message)) => {
                 let (command, event) = state.update(message, config);
 
@@ -202,6 +251,14 @@ impl Buffer {
                 is_focused,
             )
             .map(Message::Conversation),
+            Buffer::Module(state) => module_log::view(
+                state,
+                session.module(&state.module),
+                history,
+                config,
+                theme,
+            )
+            .map(Message::Module),
             Buffer::Logs(state) => {
                 logs::view(state, history, config, theme).map(Message::Logs)
             }
@@ -214,7 +271,9 @@ impl Buffer {
 
     pub fn focus(&self) -> Task<Message> {
         match self {
-            Buffer::Empty | Buffer::Logs(_) => {
+            // Nothing here can take focus, which is the point: a pane with
+            // no focusable widget cannot grow a composer by accident.
+            Buffer::Empty | Buffer::Module(_) | Buffer::Logs(_) => {
                 widget::operate(focusable::unfocus())
             }
             Buffer::ConfigEditor(config_editor) => {
@@ -228,7 +287,10 @@ impl Buffer {
 
     pub fn reset(&mut self) {
         match self {
-            Buffer::Empty | Buffer::Logs(_) | Buffer::ConfigEditor(_) => {}
+            Buffer::Empty
+            | Buffer::Module(_)
+            | Buffer::Logs(_)
+            | Buffer::ConfigEditor(_) => {}
             Buffer::Conversation(conversation) => conversation.reset(),
         }
     }
@@ -274,6 +336,11 @@ impl Buffer {
                     Message::Logs(logs::Message::ScrollView(message))
                 })
             }
+            Buffer::Module(state) => {
+                state.scroll_view.scroll_up_page().map(|message| {
+                    Message::Module(module_log::Message::ScrollView(message))
+                })
+            }
         }
     }
 
@@ -294,6 +361,11 @@ impl Buffer {
             Buffer::Logs(log) => {
                 log.scroll_view.scroll_down_page().map(|message| {
                     Message::Logs(logs::Message::ScrollView(message))
+                })
+            }
+            Buffer::Module(state) => {
+                state.scroll_view.scroll_down_page().map(|message| {
+                    Message::Module(module_log::Message::ScrollView(message))
                 })
             }
         }
@@ -319,6 +391,11 @@ impl Buffer {
                     Message::Logs(logs::Message::ScrollView(message))
                 })
             }
+            Buffer::Module(state) => {
+                state.scroll_view.scroll_to_start(config).map(|message| {
+                    Message::Module(module_log::Message::ScrollView(message))
+                })
+            }
         }
     }
 
@@ -340,6 +417,11 @@ impl Buffer {
             Buffer::Logs(log) => {
                 log.scroll_view.scroll_to_end(config).map(|message| {
                     Message::Logs(logs::Message::ScrollView(message))
+                })
+            }
+            Buffer::Module(state) => {
+                state.scroll_view.scroll_to_end(config).map(|message| {
+                    Message::Module(module_log::Message::ScrollView(message))
                 })
             }
         }
@@ -370,6 +452,18 @@ impl Buffer {
                 .map(|message| {
                     Message::Logs(logs::Message::ScrollView(message))
                 }),
+            Buffer::Module(state) => {
+                let kind = scroll_view::Kind::Module(&state.module);
+
+                state
+                    .scroll_view
+                    .scroll_to_backlog(kind, history, config)
+                    .map(|message| {
+                        Message::Module(module_log::Message::ScrollView(
+                            message,
+                        ))
+                    })
+            }
         }
     }
 
@@ -380,6 +474,7 @@ impl Buffer {
                 state.scroll_view.has_pending_scroll_to()
             }
             Buffer::Logs(state) => state.scroll_view.has_pending_scroll_to(),
+            Buffer::Module(state) => state.scroll_view.has_pending_scroll_to(),
         }
     }
 
@@ -412,6 +507,18 @@ impl Buffer {
                 .map(|message| {
                     Message::Logs(logs::Message::ScrollView(message))
                 }),
+            Buffer::Module(state) => {
+                let kind = scroll_view::Kind::Module(&state.module);
+
+                state
+                    .scroll_view
+                    .prepare_for_pending_scroll_to(kind, history, config)
+                    .map(|message| {
+                        Message::Module(module_log::Message::ScrollView(
+                            message,
+                        ))
+                    })
+            }
         }
     }
 
@@ -422,12 +529,20 @@ impl Buffer {
                 Some(conversation.scroll_view.is_scrolled_to_bottom())
             }
             Buffer::Logs(log) => Some(log.scroll_view.is_scrolled_to_bottom()),
+            Buffer::Module(state) => {
+                Some(state.scroll_view.is_scrolled_to_bottom())
+            }
         }
     }
 
     pub fn close_picker(&mut self) -> bool {
         match self {
-            Buffer::Empty | Buffer::Logs(_) | Buffer::ConfigEditor(_) => false,
+            // There is no picker without a composer, and no composer
+            // without a conversation.
+            Buffer::Empty
+            | Buffer::Module(_)
+            | Buffer::Logs(_)
+            | Buffer::ConfigEditor(_) => false,
             Buffer::Conversation(state) => state.input_view.close_picker(),
         }
     }
@@ -440,6 +555,9 @@ impl Buffer {
             }
             Buffer::Logs(log) => {
                 log.scroll_view.update_pane_size(pane_size, config);
+            }
+            Buffer::Module(state) => {
+                state.scroll_view.update_pane_size(pane_size, config);
             }
         }
     }

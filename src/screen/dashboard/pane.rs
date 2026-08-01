@@ -96,6 +96,45 @@ impl Pane {
                 ]
                 .into()
             }
+            Buffer::Module(state) => {
+                let module = session.module(&state.module);
+
+                // The same primary/secondary pair the conversation title
+                // uses for its member count: what it is, then what it is
+                // doing. The status is the fact the pane exists to carry, so
+                // it is never omitted once the daemon has reported.
+                let status = module.map(|module| {
+                    let version = module
+                        .version
+                        .as_deref()
+                        .map(|version| format!(" · {version}"))
+                        .unwrap_or_default();
+
+                    format!(" · {}{version}", module.status.label())
+                });
+
+                row![
+                    text(state.module.display_name())
+                        .style(theme::text::primary)
+                        .wrapping(Wrapping::None)
+                        .ellipsis(text::Ellipsis::End),
+                    status.map(|status| {
+                        text(status)
+                            .style(
+                                if module.map(|module| &module.status)
+                                    == Some(&data::module::Status::Crashed)
+                                {
+                                    theme::text::error
+                                } else {
+                                    theme::text::secondary
+                                },
+                            )
+                            .wrapping(Wrapping::None)
+                            .ellipsis(text::Ellipsis::End)
+                    }),
+                ]
+                .into()
+            }
             Buffer::Logs(_) => text("Logs")
                 .wrapping(Wrapping::None)
                 .ellipsis(text::Ellipsis::End)
@@ -146,6 +185,9 @@ impl Pane {
             Buffer::Conversation(state) => Some(history::Resource {
                 kind: history::Kind::Conversation(state.convo_id.clone()),
             }),
+            Buffer::Module(state) => {
+                Some(history::Resource::module(state.module.clone()))
+            }
             Buffer::Logs(_) => Some(history::Resource::logs()),
             Buffer::ConfigEditor(_) => None,
         }
@@ -637,6 +679,7 @@ impl From<Pane> for data::Pane {
             Buffer::Conversation(state) => {
                 data::Buffer::Conversation(state.convo_id)
             }
+            Buffer::Module(state) => data::Buffer::Module(state.module),
             Buffer::Logs(_) => {
                 data::Buffer::Internal(data::buffer::Internal::Logs)
             }

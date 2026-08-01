@@ -29,6 +29,17 @@ pub struct BackendConfig {
     /// the backend out from under a running app.
     pub reap_stale_daemon: bool,
     pub restart_max_attempts: u32,
+    /// Wire names of the modules the monitor tracks, in display order.
+    ///
+    /// Supplied by the application from its own hardcoded catalogue rather
+    /// than discovered: frigicom stages the module set itself, so
+    /// `listModules` is a *status* feed, not a discovery mechanism. Naming
+    /// them here means a staged module still has a row before the daemon
+    /// has said anything, and keeps the order stable across polls.
+    ///
+    /// Empty is legitimate — the session then tracks exactly what the
+    /// daemon reports, which is what the scripted driver wants.
+    pub modules: Vec<String>,
 }
 
 impl BackendConfig {
@@ -42,10 +53,18 @@ impl BackendConfig {
             use_wildcard_watch: false,
             reap_stale_daemon: true,
             restart_max_attempts: 3,
+            modules: Vec::new(),
         }
     }
 
     pub fn daemon_config_dir(&self) -> PathBuf {
         self.state_dir.join("logoscore")
+    }
+
+    /// The combined daemon log the module monitor tails. Derived from the
+    /// same config dir the session spawns the daemon into, so a reader and
+    /// the supervisor can never disagree about which file is being written.
+    pub fn daemon_log_path(&self) -> PathBuf {
+        logos_daemon::log_path(&self.daemon_config_dir())
     }
 }

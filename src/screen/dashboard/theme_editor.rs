@@ -661,6 +661,7 @@ pub enum Text {
     Secondary,
     Tertiary,
     Success,
+    Critical,
     Error,
     Warning,
     Info,
@@ -675,6 +676,7 @@ impl Text {
             Text::Secondary => Some(styles.text.secondary.color),
             Text::Tertiary => Some(styles.text.tertiary.color),
             Text::Success => Some(styles.text.success.color),
+            Text::Critical => styles.text.critical.color,
             Text::Error => Some(styles.text.error.color),
             Text::Warning => styles.text.warning.color,
             Text::Info => styles.text.info.color,
@@ -689,6 +691,7 @@ impl Text {
             Text::Secondary => styles.text.secondary.font_style,
             Text::Tertiary => styles.text.tertiary.font_style,
             Text::Success => styles.text.success.font_style,
+            Text::Critical => styles.text.critical.font_style,
             Text::Error => styles.text.error.font_style,
             Text::Warning => styles.text.warning.font_style,
             Text::Info => styles.text.info.font_style,
@@ -727,6 +730,10 @@ impl Text {
                     styles.success.color = color;
                 }
                 styles.success.font_style = font_style;
+            }
+            Text::Critical => {
+                styles.critical.color = color;
+                styles.critical.font_style = font_style;
             }
             Text::Error => {
                 if let Some(color) = color {

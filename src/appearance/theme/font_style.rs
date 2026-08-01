@@ -42,6 +42,18 @@ pub fn url(theme: &Theme) -> Option<FontStyle> {
 
 pub fn log_level(theme: &Theme, log_level: log::Level) -> Option<FontStyle> {
     match log_level {
+        // The only level with a default weight of its own. A theme that
+        // never set `text.critical` would otherwise render a crash in
+        // whatever `text.error` says, and the finding this exists to answer
+        // is precisely a crash that looked like an error.
+        log::Level::Critical => Some(
+            theme
+                .styles()
+                .text
+                .critical
+                .font_style
+                .unwrap_or(FontStyle::Bold),
+        ),
         log::Level::Error => theme.styles().text.error.font_style,
         log::Level::Warn => theme.styles().text.warning.font_style,
         log::Level::Info => theme.styles().text.info.font_style,

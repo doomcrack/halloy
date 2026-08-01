@@ -1,4 +1,5 @@
 use std::hash::Hash;
+use std::path::PathBuf;
 
 pub use data::stream::{self, *};
 use data::{Config, environment};
@@ -52,15 +53,33 @@ pub fn subscription(
     )
 }
 
+/// The combined daemon log, for readers that want it without owning a
+/// session. Routed through [`BackendConfig`] rather than assembled here so
+/// the tailer and the daemon the session spawns can never point at different
+/// files — the whole path is one derivation from `state_dir`.
+pub fn daemon_log_path(config: &Config) -> PathBuf {
+    BackendConfig::new(state_dir(config)).daemon_log_path()
+}
+
+fn state_dir(config: &Config) -> PathBuf {
+    config
+        .logos
+        .instance_dir
+        .clone()
+        .unwrap_or_else(environment::logos_instance_dir)
+}
+
 fn backend_config(config: &Config, guard: ipc::Acquired) -> BackendConfig {
     let logos = &config.logos;
 
-    let mut backend_config = BackendConfig::new(
-        logos
-            .instance_dir
-            .clone()
-            .unwrap_or_else(environment::logos_instance_dir),
-    );
+    let mut backend_config = BackendConfig::new(state_dir(config));
+    // The module set is ours, hardcoded and staged by us — the session is
+    // told what to track rather than discovering it, so `listModules` stays
+    // a status feed and never becomes a plugin surface.
+    backend_config.modules = data::module::catalog()
+        .into_iter()
+        .map(|module| module.id.to_string())
+        .collect();
     backend_config.delivery_preset = logos.delivery_preset.clone();
     backend_config.installation_name = logos.installation_name.clone();
     backend_config.use_wildcard_watch = logos.use_wildcard_watch;

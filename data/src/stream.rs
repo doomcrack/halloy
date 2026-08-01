@@ -3,11 +3,11 @@
 //! as an iced subscription through this module and steers it via [`Map`].
 
 use futures::channel::mpsc;
-pub use logos_chat::session::run;
+pub use logos_chat::session::{CONTROL_CAP, run};
 pub use logos_chat::{
     ActionError, BackendConfig, BackendError, ChatEvent, Control, Conversation,
-    ConvoId, DeliveryState, Driver, GroupMember, Kind, Message, Phase, Status,
-    Update,
+    ConvoId, DeliveryState, Driver, GroupMember, Kind, Message, ModuleState,
+    Phase, Status, Update,
 };
 
 /// Handle to the running backend session — the replacement for the

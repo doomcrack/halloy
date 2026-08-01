@@ -30,6 +30,6 @@ pub use event::{ModuleEvent, decode_module_event};
 pub use fake::FakeTransport;
 #[cfg(feature = "ffi")]
 pub use ffi_transport::FfiTransport;
-pub use gateway::Gateway;
+pub use gateway::{Gateway, ModuleInfo, ModuleStatus};
 pub use thread::LogosHandle;
 pub use transport::{RawEvent, Transport};

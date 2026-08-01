@@ -13,7 +13,7 @@ pub use client::ChatClient;
 pub use config::BackendConfig;
 pub use error::{ActionError, BackendError, ChatError, LoadKind};
 pub use event::ChatEvent;
-pub use session::{Control, Driver, Phase, Update};
+pub use session::{Control, Driver, ModuleState, Phase, Update};
 pub use types::{
     Conversation, ConvoId, DeliveryState, GroupMember, Kind, Message, Status,
 };

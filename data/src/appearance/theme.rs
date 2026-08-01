@@ -276,6 +276,11 @@ pub struct Text {
     pub secondary: TextStyle,
     pub tertiary: TextStyle,
     pub success: TextStyle,
+    /// A module abort. Optional so a theme written before the level existed
+    /// still loads; unset, it falls back to `error`'s colour and to bold, so
+    /// the crash line stays distinguishable even in a theme that has never
+    /// heard of it.
+    pub critical: OptionalTextStyle,
     pub error: TextStyle,
     pub warning: OptionalTextStyle,
     pub info: OptionalTextStyle,

@@ -31,6 +31,14 @@ pub fn message_content<'a, M: 'a + std::clone::Clone>(
     config: &Config,
 ) -> Element<'a, M> {
     match content {
+        // A module log line renders through `buffer::log_row`, which styles
+        // level, target and message separately from the parsed record. There
+        // is no fragment parsing to do: the text is a terminal line, not a
+        // chat message.
+        message::Content::ModuleLog(record) => selectable_text(&record.message)
+            .font_maybe(font_style(theme).map(font::get))
+            .style(style)
+            .into(),
         message::Content::Plain(text) => {
             let selectable_text = if let Some(only_emojis_size) =
                 config.font.only_emojis_size
