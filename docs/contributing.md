@@ -19,9 +19,12 @@ Before submitting:
 
 ```sh
 cargo check --workspace
-cargo clippy -p frigicom --no-deps
-cargo test -p data
+cargo clippy -p frigicom --no-deps --all-targets
+cargo test -p data -p logos-chat -p frigicom
 ```
+
+`cargo test -p frigicom` runs the headless UI harness. See [Testing](./testing.md)
+for the layers, how to add a case, and how time is controlled.
 
 ## Documentation
 

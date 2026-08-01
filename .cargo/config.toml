@@ -1,0 +1,8 @@
+# Forces the headless test renderer onto the software rasterizer. The
+# fallback renderer would otherwise pick wgpu when a GPU happens to be
+# there, so text layout — and therefore what `testkit::render` reports —
+# would differ between a laptop and a CI runner. Only `iced_test` reads
+# this variable, and `iced_test` is a dev-dependency, so the shipped
+# binary is unaffected.
+[env]
+ICED_TEST_BACKEND = "tiny-skia"

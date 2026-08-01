@@ -144,6 +144,12 @@ iced = { workspace = true, features = [
     "web-colors",
     "debug",
 ] }
+# UI test harness (`src/testkit`). `iced_runtime::task::into_stream` is the
+# only way to drain an opaque `Task`; `iced_test` turns the real `view()`
+# into queryable text. Both are already in the lock file at this rev.
+iced_runtime = { git = "https://github.com/squidowl/iced", rev = "a6cd98b0debe317ba9ad0d8b364684939e086fa3" }
+iced_test = { git = "https://github.com/squidowl/iced", rev = "a6cd98b0debe317ba9ad0d8b364684939e086fa3" }
+tokio = { workspace = true, features = ["rt", "macros", "test-util"] }
 
 [target.'cfg(windows)'.dependencies]
 iced = { workspace = true, features = [
