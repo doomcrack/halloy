@@ -39,6 +39,11 @@ else
     echo "dev-env: WARNING: no artifacts dir at $_frigicom_artifacts; \
 export FRIGICOM_ARTIFACTS (or the three LOGOS_* variables) yourself"
 fi
+# A tree built by `nix build .#modules` is preferred over anything staged
+# by hand, because it is the only one that records where its modules came
+# from — which is what a disk image built from it has to declare, one of
+# the four being our fork. See docs/packaging-macos.md.
+_frigicom_built="$_frigicom_root/result-modules/modules"
 unset _frigicom_root
 
 # Newest logos-protocol-lib-* root wins. `find` rather than a glob: zsh
@@ -97,6 +102,7 @@ export LOGOSCORE_BIN
 # §6). Pin it explicitly if you want to reproduce that.
 if [ -z "${LOGOS_MODULES_DIR:-}" ]; then
     for _frigicom_modules in \
+        "$_frigicom_built" \
         "$_frigicom_artifacts/modules-live-v6" \
         "$_frigicom_artifacts/modules-live-v4" \
         "$_frigicom_artifacts/modules-live-v3" \
@@ -113,7 +119,7 @@ export LOGOS_MODULES_DIR
 [ -d "$LOGOS_MODULES_DIR" ] || echo "dev-env: WARNING: no staged module tree \
 under $_frigicom_artifacts; export LOGOS_MODULES_DIR to a directory holding \
 chat_module, delivery_module and capability_module"
-unset _frigicom_artifacts
+unset _frigicom_artifacts _frigicom_built
 
 # Append the dylib dir to the dynamic linker path, once (logos-sys bakes an
 # rpath, so this is belt-and-braces for tools that bypass it).
