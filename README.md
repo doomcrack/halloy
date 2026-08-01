@@ -23,6 +23,22 @@ IRC stack underneath with the Logos backend.
   are arm64 and there is no x86_64 half to pair them with. Everywhere else
   builds from source.
 
+## Try it
+
+Apple Silicon Mac, macOS 12 or later:
+
+```sh
+curl -fsSL https://github.com/doomcrack/halloy/releases/download/v0.0.1-pre-alpha/frigicom.dmg -o /tmp/frigicom.dmg && hdiutil attach /tmp/frigicom.dmg -nobrowse -quiet && cp -R /Volumes/Frigicom/Frigicom.app /Applications/ && hdiutil detach /Volumes/Frigicom -quiet && xattr -dr com.apple.quarantine /Applications/Frigicom.app && open /Applications/Frigicom.app
+```
+
+The `xattr` step is part of the line rather than a footnote because it is
+not optional: the build is signed ad-hoc, so without it macOS reports the
+app as damaged and refuses to open it. It strips the download flag and
+changes nothing else.
+
+The release is a pre-release, so the tag is spelled out above —
+`releases/latest/` does not resolve to it.
+
 ## Quickstart
 
 The Logos artifacts (`liblogos_protocol`, the `logoscore` binary, the staged
