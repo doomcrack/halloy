@@ -11,10 +11,22 @@
   };
 
   inputs = {
+    # NOTE: this tracks a branch, and it is currently a documented skew —
+    # the rev the lock holds builds `logos-protocol-lib-0.1.0` while the
+    # dylib `dev-env.sh` actually uses is 0.2.0 from a GC root. So
+    # `nix develop` and `dev-env.sh` are NOT equivalent today, despite
+    # being documented as such. Closing it means relinking the app against
+    # a different ABI, so it wants its own pass rather than riding a daemon
+    # bump. See docs/dependency-maintenance.md.
     logos-protocol.url = "github:logos-co/logos-protocol";
     nixpkgs.follows = "logos-protocol/nixpkgs";
 
-    logoscore.url = "github:logos-co/logos-logoscore-cli";
+    # Tag 0.2.2, not the default branch. 0.2.2-RC1 carries the fix for a
+    # platform bug where a cross-module `sign` returned a *different*
+    # caller's argument once a second caller had called — which the chat
+    # identity depends on not happening. Pinning a tag rather than a branch
+    # also means the daemon stops moving under us between builds.
+    logoscore.url = "github:logos-co/logos-logoscore-cli/0.2.2";
     # Keep the daemon and the dylib logos-sys links against on the same
     # protocol rev (same follows-wiring logoscore uses for its own SDK stack).
     logoscore.inputs.logos-protocol.follows = "logos-protocol";
@@ -145,7 +157,18 @@
             passAsFile = [ "provenance" ];
             provenance = builtins.toJSON stagedSources;
           } ''
-          mkdir -p "$out/modules"
+          mkdir -p "$out/modules" "$out/bin"
+
+          # The daemon ships with the modules it was built against.
+          #
+          # Not a convenience. Before this, `dev-env.sh` took the daemon
+          # from a hand-made GC root while the modules came from the flake,
+          # so bumping the logoscore pin moved `capability_module` and left
+          # the daemon behind — the two silently disagreeing, which is the
+          # hardest kind of skew to notice because everything still starts.
+          # One output, one version.
+          cp -RL ${logoscoreCli}/bin/. "$out/bin/"
+          chmod -R u+w "$out/bin"
 
           # chat and capability ship already staged...
           cp -R ${chat-module.packages.${system}.install}/modules/chat_module \
