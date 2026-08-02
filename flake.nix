@@ -122,12 +122,28 @@
       #   nix build .#modules --out-link result-modules
       #   . scripts/dev-env.sh      # prefers result-modules/modules over
       #                             # anything staged by hand
-      packages = forAllSystems ({ system, pkgs, logoscoreCli, ... }: {
+      packages = forAllSystems ({ system, pkgs, logoscoreCli, ... }:
+        let
+          # The blockchain module cannot be built for Intel macOS: its
+          # `logos-blockchain-circuits` dependency publishes no
+          # `x86_64-darwin` output at all, so the whole tree fails to
+          # *evaluate* there rather than failing to build.
+          #
+          # Staged conditionally so the other four still produce a usable
+          # tree on that platform. Chat does not depend on blockchain, so
+          # what is lost is the blockchain panel, not the client.
+          blockchainSupported = system != "x86_64-darwin";
+          stagedSources =
+            if blockchainSupported
+            then sources
+            else builtins.removeAttrs sources [ "blockchain_module" ];
+        in
+        {
         modules = pkgs.runCommand "frigicom-modules"
           {
             nativeBuildInputs = [ pkgs.jq ];
             passAsFile = [ "provenance" ];
-            provenance = builtins.toJSON sources;
+            provenance = builtins.toJSON stagedSources;
           } ''
           mkdir -p "$out/modules"
 
@@ -157,7 +173,9 @@
           }
 
           stage_lgx ${delivery-module.packages.${system}.lgx}/*.lgx
-          stage_lgx ${blockchain-module.packages.${system}.lgx}/*.lgx
+          ${if blockchainSupported
+            then "stage_lgx ${blockchain-module.packages.${system}.lgx}/*.lgx"
+            else "# blockchain_module: no x86_64-darwin build exists"}
 
           chmod -R u+w "$out"
 
@@ -174,7 +192,9 @@
           for pair in \
             "chat_module:${chat-module}" \
             "delivery_module:${delivery-module}" \
-            "blockchain_module:${blockchain-module}" \
+            ${if blockchainSupported
+              then "\"blockchain_module:${blockchain-module}\" \\"
+              else ""}
             "capability_module:${logoscore}" \
             "keystore_signer:${keystore-signer-module}"; do
             name=''${pair%%:*}
