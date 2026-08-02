@@ -316,9 +316,18 @@ else:
 lines += [
     "Licence texts for each module are in licenses/.",
     "",
-    "Frigicom itself is GPL-3.0-or-later; the full text is in LICENSE,",
-    f"and its source is at {os.environ.get('REPO') or 'the project repository'}.",
+    "This app is three layers, under two licences.",
+    "",
+    "  Modules (above)          MIT/Apache-2.0, upstream repositories",
+    "  Logos client stack       MIT/Apache-2.0, doomcrack/logos-rs",
+    "  Frigicom itself          GPL-3.0-or-later, a fork of halloy",
+    "",
+    "The full GPL text is in LICENSE, and frigicom's source is at",
+    f"{os.environ.get('REPO') or 'the project repository'}.",
     "It is a fork of halloy (https://github.com/squidowl/halloy).",
+    "The binary you are running is a combined work, so it is GPL as a",
+    "whole; the middle layer is separate so it can be reused where this",
+    "app cannot be.",
 ]
 
 with open(os.path.join(resources, "MODULES.txt"), "w") as handle:

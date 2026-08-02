@@ -12,7 +12,7 @@ Open issues and pull requests on the fork's
 ## Building
 
 See [Installation](./installation.md) for the toolchain and the Logos artifacts,
-and [`logos/README.md`](https://github.com/doomcrack/halloy/tree/main/logos) for
+and [the logos-rs README](https://github.com/doomcrack/logos-rs) for
 the backend architecture and the threading rules the `logos/*` crates must obey.
 
 Before submitting:
@@ -33,4 +33,8 @@ Any setting added in a pull request should be described in the
 
 ## License
 
-Contributions are made under GPL-3.0-or-later, inherited from halloy.
+Contributions to this repository are made under GPL-3.0-or-later,
+inherited from halloy. Contributions to the Logos client stack go to
+`doomcrack/logos-rs` instead and are MIT/Apache-2.0 — if a change belongs
+below the UI, that is where it goes, and `tests/layering.rs` is what
+notices when the boundary is crossed by accident.

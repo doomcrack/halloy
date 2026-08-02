@@ -219,13 +219,13 @@ change. The supervisor anchoring is still worth doing for the other modules, but
 it is no longer load-bearing for blockchain.
 
 **If the supervisor anchoring is implemented, note the ordering trap.**
-`logos/daemon/src/supervisor.rs` sets neither `.current_dir()` nor `.env()`, so
+`daemon/src/supervisor.rs` sets neither `.current_dir()` nor `.env()`, so
 the daemon inherits the app's CWD — which is `/` when the app is launched from
 Finder, meaning any module writing to a relative path today writes somewhere
 arbitrary. The obvious fix, `.current_dir(config_dir)`, is **not safe as a
 one-liner**: `Artifacts::logoscore_bin` and `Artifacts::modules_dir` are built
 with `PathBuf::from` over environment variables
-(`logos/daemon/src/locate.rs:53,65`) and so may be relative. Setting the child's
+(`daemon/src/locate.rs:53,65`) and so may be relative. Setting the child's
 working directory would resolve them against the new CWD and break the spawn.
 Canonicalize both paths first, then set `current_dir`.
 

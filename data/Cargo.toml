@@ -46,7 +46,8 @@ hex = "0.4.3"
 iced_core = "0.15.0-dev"
 iced_wgpu = "0.15.0-dev"
 indexmap = { version = "2.14", features = ["std", "serde"] }
-logos-chat = { version = "0.1.0", path = "../logos/chat", default-features = false }
+logos-chat = { git = "https://github.com/doomcrack/logos-rs", rev = "03b2597457beff71ef16535f6484a830eb5dcf76", default-features = false }
+logos-domain = { git = "https://github.com/doomcrack/logos-rs", rev = "03b2597457beff71ef16535f6484a830eb5dcf76" }
 seahash = "4.1.0"
 serde_json = "1.0"
 serde_ignored = "0.1"
@@ -65,6 +66,9 @@ unicode-security = "0.1.2"
 
 [dev-dependencies]
 serde_test = "1.0"
+# The corpus the domain crate's own parser tests use, so the integration
+# assertions here cannot drift from a second copy.
+logos-domain = { git = "https://github.com/doomcrack/logos-rs", rev = "03b2597457beff71ef16535f6484a830eb5dcf76", features = ["fixtures"] }
 tempfile = "3"
 tokio = { workspace = true, features = ["macros", "rt", "time"] }
 

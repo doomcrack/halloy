@@ -93,21 +93,38 @@ once, or macOS will report the app as damaged. The disk image says so too.
 
 ## Architecture
 
-The backend crates live under [`logos/`](logos/README.md) — that README covers
-the crate map, the daemon recipe, and the threading rules the FFI imposes
-(one dedicated thread per `lp_client`, synchronous invokes only, subscribe
-before watching, dead links that report success). `data/` folds the backend's
-`Update` stream into domain state; `src/` is the iced UI.
+Three layers, and the boundaries between them are licence boundaries too.
+
+| Layer | Where | Licence |
+| --- | --- | --- |
+| **Modules** — chat, delivery, capability, blockchain | separate upstream repos, loaded by a daemon in their own processes | MIT/Apache-2.0 |
+| **Client stack** — daemon supervision, the `lp_*` client, the chat contract, the domain state it folds into | [`doomcrack/logos-rs`](https://github.com/doomcrack/logos-rs), a pinned dependency | MIT/Apache-2.0 |
+| **Application** — `src/` (the iced UI), `data/`, `ipc/` | this repository | **GPL-3.0-or-later** |
+
+The middle layer is not derived from halloy and does not depend on this
+repository — no GUI framework, no `data`, no `ipc`. That is what let it be
+separated, and `tests/layering.rs` fails the build if an edge ever points
+back the other way. Its README covers the crate map, the daemon recipe, and
+the threading rules the FFI imposes.
+
+`data/` folds the backend's `Update` stream into UI state and re-exports the
+domain types under the paths they always had; `src/` is the iced UI.
 
 ## Licensing and attribution
 
-frigicom is released under **GPL-3.0-or-later**, inherited from halloy. See
-[LICENSE](LICENSE).
+frigicom — this repository — is released under **GPL-3.0-or-later**,
+inherited from halloy. See [LICENSE](LICENSE). A binary built from it is a
+combined work and is GPL too, whatever its dependencies are licensed under.
 
 Based on [halloy](https://github.com/squidowl/halloy) (GPL-3.0-or-later),
 copyright its authors, who are retained in `[workspace.package] authors`.
 Upstream's theme format is unchanged, so halloy themes and the
 `halloy:///theme` deep link still work.
+
+The Logos client stack was written for frigicom but is not derived from
+halloy, so it lives in its own repository under MIT/Apache-2.0 — the licence
+every Logos component it talks to uses. Separating it is what keeps that
+possible; it does not change what this repository or its binaries are under.
 
 The workspace pins [`squidowl/iced`](https://github.com/squidowl/iced) via
 `[patch.crates-io]` — halloy's iced fork, a handful of patches on iced master.

@@ -24,7 +24,7 @@ those is a nix build that names its dependencies by absolute
 and nowhere else — which is the whole reason a copied `.app` produces a
 daemon that dies before it logs anything useful.
 
-`logos/daemon/src/locate.rs` already looks for a bundled layout, so the
+`daemon/src/locate.rs` already looks for a bundled layout, so the
 staging is dictated rather than invented:
 
 ```

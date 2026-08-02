@@ -21,14 +21,15 @@ iosevka-font = []
 # with `FfiUnavailable`.
 live = ["data/live"]
 
+# The Logos client stack lives in its own repository (doomcrack/logos-rs),
+# dual MIT/Apache-2.0. It is not derived from halloy and does not depend on
+# anything here; keeping it out of this workspace is what stops this fork's
+# GPL from being the only licence in the tree. `tests/layering.rs` fails the
+# build if a dependency edge ever points back the other way.
 [workspace]
 members = [
     "data",
     "ipc",
-    "logos/sys",
-    "logos/daemon",
-    "logos/client",
-    "logos/chat",
 ]
 
 [workspace.package]
@@ -109,7 +110,7 @@ iced = { workspace = true, features = [
 
 data = { version = "0.1.0", path = "data" }
 ipc = { version = "0.1.0", path = "ipc" }
-logos-client = { version = "0.1.0", path = "logos/client", default-features = false }
+logos-client = { git = "https://github.com/doomcrack/logos-rs", rev = "03b2597457beff71ef16535f6484a830eb5dcf76", default-features = false }
 serde_json = { workspace = true }
 
 signal-hook = "0.3.18"

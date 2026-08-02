@@ -158,5 +158,5 @@ variables:
 They also put `$LOGOS_PROTOCOL_ROOT/lib` on `DYLD_LIBRARY_PATH` (macOS) or
 `LD_LIBRARY_PATH`.
 
-See [`logos/README.md`](https://github.com/doomcrack/halloy/tree/main/logos)
+See [the logos-rs README](https://github.com/doomcrack/logos-rs)
 in the repository for the backend architecture and the threading rules.

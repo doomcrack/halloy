@@ -34,3 +34,6 @@ options available. See [Configuration](./configuration.md) to get started.
 ## License
 
 Frigicom is released under GPL-3.0-or-later, inherited from halloy.
+The Logos client stack it runs on is a separate repository under
+MIT/Apache-2.0, and the Logos modules it loads are MIT/Apache-2.0
+upstream. A built binary is a combined work and is GPL either way.
