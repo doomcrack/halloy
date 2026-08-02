@@ -970,3 +970,64 @@ async fn a_first_run_that_never_starts_accuses_nothing_of_dying() {
     );
     assert_eq!(app.module_status("chat_module"), "not loaded");
 }
+
+/// The panel exists because a log pane cannot answer "is this node
+/// healthy". Three things have to be on screen at once, and each is a
+/// measured failure if it is not:
+///
+/// - **the mode**, because it is the headline;
+/// - **height and slot**, because `Bootstrapping` lasts tens of minutes and
+///   the word on its own reads as a hang — these are what show it working;
+/// - **why a value is missing**, because this build has no peer count at
+///   all, and a row reading zero would be a different and false claim.
+///
+/// The log stays underneath: it is still the only place a crash is visible.
+#[tokio::test(start_paused = true)]
+async fn the_blockchain_panel_shows_movement_and_says_what_is_missing() {
+    let mut app = App::fresh();
+    app.connect();
+    app.backend(build::modules(&[("blockchain_module", "loaded")]));
+    app.open_module("blockchain_module");
+    app.backend(build::blockchain(1, "Bootstrapping", 94_147, 2_833_298));
+
+    assert!(app.shows("Bootstrapping"), "the mode is the headline");
+    assert!(
+        app.shows("94,147") && app.shows("2,833,298"),
+        "height and slot are what stop a 20-minute bootstrap reading as a \
+         hang; screen was:\n{}",
+        app.screen()
+    );
+    assert!(
+        app.shows("no blocks yet"),
+        "an empty block table must say why: nothing is finalised during \
+         bootstrap, which is not the same as having no blocks"
+    );
+    assert!(
+        app.shows("this build reports no peer count"),
+        "absence is not zero — there is no peer-count method in this build"
+    );
+
+    // A later reading replaces the earlier one, which is the movement the
+    // panel exists to show.
+    app.backend(build::blockchain(2, "Online", 94_200, 2_833_400));
+
+    assert!(app.shows("Online") && app.shows("94,200"));
+    assert!(!app.shows("94,147"), "the stale height must be gone");
+}
+
+/// The guard against a slow parent walk landing after a fast poll and
+/// dragging the panel backwards. Out-of-order replies are expected, not
+/// exceptional: the two calls are issued from the same pass.
+#[tokio::test(start_paused = true)]
+async fn a_late_blockchain_reading_never_replaces_a_newer_one() {
+    let mut app = App::fresh();
+    app.connect();
+    app.backend(build::modules(&[("blockchain_module", "loaded")]));
+    app.open_module("blockchain_module");
+
+    app.backend(build::blockchain(2, "Online", 94_200, 2_833_400));
+    app.backend(build::blockchain(1, "Bootstrapping", 10, 500));
+
+    assert!(app.shows("94,200"), "the newer reading must survive");
+    assert!(!app.shows("Bootstrapping"), "the older one must be dropped");
+}

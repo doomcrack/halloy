@@ -110,7 +110,8 @@ iced = { workspace = true, features = [
 
 data = { version = "0.1.0", path = "data" }
 ipc = { version = "0.1.0", path = "ipc" }
-logos-client = { git = "https://github.com/doomcrack/logos-rs", rev = "03b2597457beff71ef16535f6484a830eb5dcf76", default-features = false }
+logos-client = { git = "https://github.com/doomcrack/logos-rs", rev = "e436a9d2963e927d3cd680c395ef16665b935536", default-features = false }
+logos-blockchain-client = { git = "https://github.com/doomcrack/logos-rs", rev = "e436a9d2963e927d3cd680c395ef16665b935536" }
 serde_json = { workspace = true }
 
 signal-hook = "0.3.18"

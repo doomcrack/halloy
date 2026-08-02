@@ -188,6 +188,79 @@ actual catch-up runs through tip polling (`tip poll: enqueued peer tip for
 catch-up`). Both fields exist in the generated config and they are not the same
 knob.
 
+## 2c. The read surface, measured against a running node
+
+`module-info` and a live sync, against tag `0.2.0`. Everything here was
+called, not inferred, and three of the findings contradict what a reasonable
+reading of the method names would tell you.
+
+### `result.value` is a JSON *string*, not a JSON value
+
+Every structured return arrives double-encoded and needs a second parse:
+
+```json
+{"result": {"success": true, "error": null,
+            "value": "{\"height\":0,\"mode\":\"Bootstrapping\", …}"}}
+```
+
+Scalar returns (`get_peer_id`) are the bare string. A client that deserialises
+`value` directly gets a string where it expected a record.
+
+### There is no peer count, and no network or mempool metrics
+
+The 24 methods contain **no `get_network_info`, no `get_mantle_metrics`, no
+`get_cryptarchia_headers`.** Any design that shows a peer count is designing
+against a different build — `logos-inspector` reads `network_info.n_peers`,
+which does not exist here. `get_peer_id(config_path)` returns **our own** id,
+not a list of peers.
+
+### `get_blocks` returns nothing for the entire bootstrap
+
+Measured across a full sync, at every range tried — around the tip's slot,
+around the wall-clock slot, and a 2000-slot window:
+
+| call | height at the time | result |
+|---|---|---|
+| `get_blocks(0, 5)` | 0 | `[]` |
+| `get_blocks(slot−200, slot)` | 11,668 | `[]` |
+| `get_blocks(tip−1, tip+1)` | 31,798 | `[]` |
+| `get_blocks(tip−50, tip)` | 31,798 | `[]` |
+
+`lib` stayed on the genesis hash (`efa86ac7…`) the whole time while `tip`
+advanced, so **nothing is finalised during bootstrap** and `get_blocks`
+appears to serve finalised blocks only. It is not broken and the range is not
+wrong; there is simply nothing in it yet.
+
+**A recent-blocks view must therefore walk the tip's parents**, not call
+`get_blocks`: `get_block(tip)` works throughout and every block carries
+`header.parent_block`. (`logos-inspector` carries a `used_tip_parent_walk`
+flag for what looks like exactly this reason.)
+
+### Block shape
+
+`get_block(header_id_hex)` — note it is keyed by **header id, not height**:
+
+```
+header:
+  version              "Bedrock"
+  parent_block         hex        ← what a parent walk follows
+  slot                 int
+  block_root           hex
+  proof_of_leadership: proof, entropy_contribution, leader_key, voucher_cm
+signature              hex
+transactions           [ { mantle_tx: { ops: [ { opcode, payload } ] } }, … ]
+```
+
+**Blocks carry no height** — only `slot`. A height column has to be counted
+by the client, or left out.
+
+### `info.slot` is the chain's slot, not the wall clock
+
+It starts at 0 and climbs with the sync (`0 → 1,491 → 344,108 → 1,343,044`),
+and was observed exactly equal to the tip block's slot. So the progress
+fraction in §2 is sound: `info.slot / expected_slot`, where the denominator
+is the wall-clock slot derived from `genesis_time`.
+
 ## 3. The bring-up sequence that works
 
 ```

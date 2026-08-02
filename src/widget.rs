@@ -33,6 +33,7 @@ pub mod key_press;
 pub mod message_content;
 pub mod modal;
 pub mod notify_visibility;
+pub mod panel;
 pub mod pick_list;
 pub mod selectable_rich_text;
 pub mod selectable_text;

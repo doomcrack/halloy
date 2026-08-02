@@ -18,6 +18,8 @@ use data::{Config, history, message};
 use iced::widget::{center, column, container, text};
 use iced::{Length, Size, Task};
 
+pub mod blockchain;
+
 use super::{context_menu, log_row, scroll_view};
 use crate::widget::Element;
 use crate::{Theme, font, theme};
@@ -36,15 +38,31 @@ pub enum Event {
 pub fn view<'a>(
     state: &'a ModuleLog,
     module: Option<&'a data::Module>,
+    chain: &'a logos_blockchain_client::State,
     history: &'a history::Manager,
     config: &'a Config,
     theme: &'a Theme,
 ) -> Element<'a, Message> {
     let kind = history::Kind::Module(state.module.clone());
 
+    // The panel goes above the log rather than instead of it: the log is
+    // still the only place a crash is visible, and a structured view that
+    // hid it would cost the pane the thing it was built for.
+    let panel = module
+        .filter(|module| blockchain::applies(module))
+        .map(|_| blockchain::view(chain, theme));
+
     if let Some(placeholder) = placeholder(state, module, history, &kind, theme)
     {
-        return placeholder;
+        // A node with nothing in its log still has a status worth showing.
+        return match panel {
+            Some(panel) => container(column![panel, placeholder].spacing(10))
+                .width(Length::Fill)
+                .height(Length::Fill)
+                .padding(8)
+                .into(),
+            None => placeholder,
+        };
     }
 
     let messages = container(
@@ -98,7 +116,7 @@ pub fn view<'a>(
     // line as a vertical column of letters. The logs pane never hit this
     // because it puts the scrollback straight into a filling container; this
     // pane grew a column to carry the crash banner and inherited the trap.
-    container(column![banner, messages].width(Length::Fill))
+    container(column![panel, banner, messages].width(Length::Fill))
         .width(Length::Fill)
         .height(Length::Fill)
         .padding(8)

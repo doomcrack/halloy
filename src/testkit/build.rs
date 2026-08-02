@@ -247,6 +247,29 @@ pub fn send_failed(id: &str, content: &str, reason: &str) -> Update {
     })
 }
 
+/// One blockchain reading, as the monitor pass publishes it.
+///
+/// `mode` and `slot` are the two the panel must show moving: the word
+/// alone reads as a hang for the twenty-odd minutes a cold start takes.
+pub fn blockchain(sequence: u64, mode: &str, height: u64, slot: u64) -> Update {
+    use logos_blockchain_client::{CryptarchiaInfo, Probe, Sample};
+
+    Update::Blockchain(Sample::now(
+        sequence,
+        Probe::Ready(CryptarchiaInfo {
+            mode: mode.to_owned(),
+            height,
+            slot,
+            tip: "b11eda4c0f9b2854".to_owned(),
+            lib: "efa86ac70717d040".to_owned(),
+        }),
+        // What the whole bootstrap looks like: `get_blocks` serves
+        // finalised blocks and nothing is finalised yet.
+        Probe::Pending("no blocks yet"),
+        Probe::Unsupported("this build reports no peer count"),
+    ))
+}
+
 /// One `listModules` report, as the backend publishes it. `status` is the
 /// daemon's verbatim word — `loaded` or `not_loaded`; it never says
 /// `crashed`, which is the whole reason the log has to.

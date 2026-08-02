@@ -1226,7 +1226,9 @@ impl Frigicom {
             // Already folded into `self.session` above, which is all the
             // sidebar rows and the pane's status strip read. Nothing else
             // has to happen when the module set moves.
-            Update::Modules(_) => {}
+            // Both already folded into `session` above; the panel reads it
+            // from there, so there is nothing for the app loop to do.
+            Update::Modules(_) | Update::Blockchain(_) => {}
             Update::Event(event) => return self.handle_chat_event(event),
             Update::ActionFailed(error) => match error {
                 ActionError::SendFailed {

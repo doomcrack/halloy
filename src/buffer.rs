@@ -254,6 +254,7 @@ impl Buffer {
             Buffer::Module(state) => module_log::view(
                 state,
                 session.module(&state.module),
+                &session.blockchain,
                 history,
                 config,
                 theme,
