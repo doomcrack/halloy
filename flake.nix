@@ -42,6 +42,12 @@
     # name and cannot find a peer; the deployed fleet's protocol identity
     # is exactly this tag. docs/logos-modules.md §6 has the evidence.
     blockchain-module.url = "github:logos-blockchain/logos-blockchain-module/0.2.0";
+
+    # Holds the chat identity key and never exports it. chat_module declares
+    # it as a dependency, so the daemon auto-loads it — but it still has to
+    # be staged here, because `load-module` resolves declared dependencies
+    # only from the directory it was pointed at.
+    keystore-signer-module.url = "github:doomcrack/keystore-signer-module";
   };
 
   outputs =
@@ -52,6 +58,7 @@
     , chat-module
     , delivery-module
     , blockchain-module
+    , keystore-signer-module
     }:
     let
       systems = [ "aarch64-darwin" "x86_64-darwin" "x86_64-linux" "aarch64-linux" ];
@@ -96,6 +103,11 @@
           rev = logoscore.rev;
           patched = false;
         };
+        keystore_signer = {
+          flake = "github:doomcrack/keystore-signer-module";
+          rev = keystore-signer-module.rev;
+          patched = false;
+        };
       };
     in
     {
@@ -123,6 +135,8 @@
           cp -R ${chat-module.packages.${system}.install}/modules/chat_module \
             "$out/modules/"
           cp -R ${logoscoreCli}/modules/capability_module "$out/modules/"
+          cp -R ${keystore-signer-module.packages.${system}.install}/modules/keystore_signer \
+            "$out/modules/"
 
           # ...while delivery and blockchain ship as `.lgx` archives: a
           # gzipped tar holding a manifest and one directory per platform
@@ -147,17 +161,42 @@
 
           chmod -R u+w "$out"
 
-          # The licence texts travel with the binaries they cover. Three of
+          # The licence texts travel with the binaries they cover. Most of
           # these are upstream MIT/Apache-2.0 projects and one is our fork
           # of one; an image that ships the code without the terms is not
           # something we can hand to anybody.
+          #
+          # `keystore-signer-module` declares `MIT OR Apache-2.0` in its
+          # manifest but ships no licence *text* at its root. A missing
+          # file is recorded rather than silently skipped: shipping a
+          # binary whose terms we cannot reproduce is a thing a reader
+          # should be able to see, and it is worth asking upstream for.
           for pair in \
             "chat_module:${chat-module}" \
             "delivery_module:${delivery-module}" \
             "blockchain_module:${blockchain-module}" \
-            "capability_module:${logoscore}"; do
-            mkdir -p "$out/licenses/''${pair%%:*}"
-            cp "''${pair#*:}"/LICENSE-* "$out/licenses/''${pair%%:*}/"
+            "capability_module:${logoscore}" \
+            "keystore_signer:${keystore-signer-module}"; do
+            name=''${pair%%:*}
+            src=''${pair#*:}
+            mkdir -p "$out/licenses/$name"
+
+            # `find`, not a glob: an unmatched glob inside this builder
+            # expands to the literal pattern and `cp` then fails on a
+            # path that does not exist.
+            texts=$(find "$src" -maxdepth 1 -name 'LICENSE*' 2>/dev/null)
+
+            if [ -n "$texts" ]; then
+              printf '%s\n' "$texts" | while read -r text; do
+                cp "$text" "$out/licenses/$name/"
+              done
+            else
+              printf '%s\n' \
+                'This component declares its licence in its package' \
+                'manifest but ships no licence text in its source tree,' \
+                'so none could be copied here. See its repository.' \
+                > "$out/licenses/$name/NO-LICENCE-TEXT"
+            fi
           done
 
           # Versions come off the manifests on disk rather than being

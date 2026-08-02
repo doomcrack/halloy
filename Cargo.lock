@@ -2934,7 +2934,7 @@ checksum = "0ceec5bc11778974d1bcb055b18002eba7f4b3518b6a0081b3af5f21666da9ad"
 [[package]]
 name = "logos-blockchain-client"
 version = "0.1.0"
-source = "git+https://github.com/doomcrack/logos-rs?rev=e436a9d2963e927d3cd680c395ef16665b935536#e436a9d2963e927d3cd680c395ef16665b935536"
+source = "git+https://github.com/doomcrack/logos-rs?rev=d4d5941fcbf00e74c0e0064abd4ff7c53566c516#d4d5941fcbf00e74c0e0064abd4ff7c53566c516"
 dependencies = [
  "chrono",
  "log",
@@ -2947,7 +2947,7 @@ dependencies = [
 [[package]]
 name = "logos-chat"
 version = "0.1.0"
-source = "git+https://github.com/doomcrack/logos-rs?rev=e436a9d2963e927d3cd680c395ef16665b935536#e436a9d2963e927d3cd680c395ef16665b935536"
+source = "git+https://github.com/doomcrack/logos-rs?rev=d4d5941fcbf00e74c0e0064abd4ff7c53566c516#d4d5941fcbf00e74c0e0064abd4ff7c53566c516"
 dependencies = [
  "futures",
  "log",
@@ -2963,7 +2963,7 @@ dependencies = [
 [[package]]
 name = "logos-client"
 version = "0.1.0"
-source = "git+https://github.com/doomcrack/logos-rs?rev=e436a9d2963e927d3cd680c395ef16665b935536#e436a9d2963e927d3cd680c395ef16665b935536"
+source = "git+https://github.com/doomcrack/logos-rs?rev=d4d5941fcbf00e74c0e0064abd4ff7c53566c516#d4d5941fcbf00e74c0e0064abd4ff7c53566c516"
 dependencies = [
  "log",
  "logos-sys",
@@ -2975,7 +2975,7 @@ dependencies = [
 [[package]]
 name = "logos-daemon"
 version = "0.1.0"
-source = "git+https://github.com/doomcrack/logos-rs?rev=e436a9d2963e927d3cd680c395ef16665b935536#e436a9d2963e927d3cd680c395ef16665b935536"
+source = "git+https://github.com/doomcrack/logos-rs?rev=d4d5941fcbf00e74c0e0064abd4ff7c53566c516#d4d5941fcbf00e74c0e0064abd4ff7c53566c516"
 dependencies = [
  "libc",
  "log",
@@ -2988,7 +2988,7 @@ dependencies = [
 [[package]]
 name = "logos-domain"
 version = "0.1.0"
-source = "git+https://github.com/doomcrack/logos-rs?rev=e436a9d2963e927d3cd680c395ef16665b935536#e436a9d2963e927d3cd680c395ef16665b935536"
+source = "git+https://github.com/doomcrack/logos-rs?rev=d4d5941fcbf00e74c0e0064abd4ff7c53566c516#d4d5941fcbf00e74c0e0064abd4ff7c53566c516"
 dependencies = [
  "chrono",
  "futures",
@@ -3002,7 +3002,7 @@ dependencies = [
 [[package]]
 name = "logos-sys"
 version = "0.1.0"
-source = "git+https://github.com/doomcrack/logos-rs?rev=e436a9d2963e927d3cd680c395ef16665b935536#e436a9d2963e927d3cd680c395ef16665b935536"
+source = "git+https://github.com/doomcrack/logos-rs?rev=d4d5941fcbf00e74c0e0064abd4ff7c53566c516#d4d5941fcbf00e74c0e0064abd4ff7c53566c516"
 
 [[package]]
 name = "loop9"

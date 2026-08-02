@@ -13,9 +13,11 @@ IRC stack underneath with the Logos backend.
 
 **Pre-alpha.** Usable end to end against a live daemon, but:
 
-- **Identity is ephemeral upstream.** `chat_module` mints a new address on every
-  `init` and its persistence is compiled off, so your address, conversations,
-  and messages do not survive a restart.
+- **Your address survives a restart; your conversations do not.** The address
+  is derived from a key `keystore_signer` holds and never exports, so it is the
+  same on every launch. Conversations and messages still vanish: upstream's
+  persistence is compiled off because DirectV1 has no reload path in libchat,
+  which is a separate problem in a different repository.
 - No attachments, reactions, replies, receipts, typing indicators, or history
   pagination — none of them exist in the module contract.
 - Group membership changes take up to a minute to commit.
@@ -77,7 +79,7 @@ references the two of them pull in, all rewritten off the nix store by
 `scripts/macos-bundle-libs.py` — see `docs/packaging-macos.md` for what that
 involves and what is known to break.
 
-**One of the four bundled modules is our fork** — `chat_module` carries a
+**One of the five bundled modules is our fork** — `chat_module` carries a
 libchat patch upstream does not have — so the image declares what it
 contains in `MODULES.txt`, per module, with the revision each was built
 from. Package from a hand-staged module tree instead of `.#modules` and it
@@ -97,7 +99,7 @@ Three layers, and the boundaries between them are licence boundaries too.
 
 | Layer | Where | Licence |
 | --- | --- | --- |
-| **Modules** — chat, delivery, capability, blockchain | separate upstream repos, loaded by a daemon in their own processes | MIT/Apache-2.0 |
+| **Modules** — chat, delivery, capability, blockchain, keystore | separate upstream repos, loaded by a daemon in their own processes | MIT/Apache-2.0 |
 | **Client stack** — daemon supervision, the `lp_*` client, the chat contract, the domain state it folds into | [`doomcrack/logos-rs`](https://github.com/doomcrack/logos-rs), a pinned dependency | MIT/Apache-2.0 |
 | **Application** — `src/` (the iced UI), `data/`, `ipc/` | this repository | **GPL-3.0-or-later** |
 
