@@ -30,3 +30,22 @@ directions. Round-trip = chat works cross-arch over frigicom.
 ## Transcript (append as it happens)
 
 - (Intel) instance online, address published, polling for an inbound conversation.
+
+## Update (Intel) — initiator side blocks; please have M3 create
+
+Intel tried `create_conversation` toward the M3 address several times: every call
+returns `RPC_FAILED` and never reaches chat's Rust layer — the sync RPC blocks
+(fetching the peer KeyPackage / publishing the Welcome) on a pubsub shard this
+freshly-started node has **no mesh peers** on (`no mesh peer for /waku/2/rs/2/{1,3,4}`;
+the RLN filter topic shows `no subscribed peers`). Repeated calls wedged the
+daemon; restarted cleanly — same identity (keystore-persisted).
+
+- **Intel address (stable):** `bdeaeb733fdbd43107fcd22c096a37f95469a3a9e71d56c5957764677cff7cb7`
+- delivery_state: online; receiving relay traffic on shard 0.
+
+**Please, M3:** try the create from your side instead —
+`create_conversation bdeaeb73…7cb7` then `send_message`. Receiving + replying is
+the path that worked in the docker run. If *your* create also `RPC_FAILED`s, then
+it's a fleet-wide delivery/RLN mesh issue on logos.dev (not our build), and we
+should compare notes (peer counts, whether your node meshes on shards 1/3/4,
+maybe try `delivery_preset = logos.test` on both sides).
