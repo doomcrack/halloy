@@ -65,3 +65,93 @@ below to an agent on the M3.
 Full write-up in `docs/logos-modules.md` §8 and `upstream/issues/{0001,0002}`.
 On Intel these three fixes produce a complete `darwin-x86_64-dev` tree and a live
 backend (`backend ready`, delivery joins the logos.dev fleet, 0 crashes).
+
+## The reply — measured on the M3
+
+Answered 2026-08-02 on `aarch64-darwin`, macOS 14.5 (23F79), against
+`intel-x86_64-support` `47c5da4f`. **No arm64 regression in any of the three
+changes.** The `-lc++` is safe at `isDarwin` scope and must *not* be narrowed.
+
+### 1. Test 1 — stock inputs: pass
+
+`nix build .#modules` builds. Five modules staged (blockchain included), every
+`variant` and every `manifest.json` `main` key = `darwin-arm64-dev`, five
+directories under `licenses/`. The licence loop ran to completion on the
+blockchain-*included* path, which is the case the array rewrite had to keep
+working; no shell syntax error.
+
+### 2. Test 2 — both forks applied: pass
+
+`./scripts/nbl.sh fork build .#modules` exits 0 and stages the same five modules
+at `darwin-arm64-dev`.
+
+This was a real test rather than a formality: **arm64 had never built delivery
+from source.** Test 1 substitutes delivery's prebuilt `.lgx` from the cache, so
+the `-lc++` line had never been exercised on this platform at all — a failure
+here could as easily have been a pre-existing from-source break as a regression.
+It linked:
+
+```
+liblogosdelivery.dylib:  Mach-O 64-bit dynamically linked shared library arm64
+  @rpath/librln.dylib
+  /usr/lib/libc++.1.dylib (compatibility version 1.0.0, current version 1900.180.0)
+```
+
+`libc++.1.dylib` in the load commands is the flag taking effect. So
+`pkgs.stdenv.isDarwin` is the right scope in `logos-delivery`'s
+`nix/default.nix`; narrowing it to `isDarwin && isx86_64` would be scope the fix
+does not need.
+
+### 3. The check this handoff did not ask for — the merge is a no-op
+
+`intel-x86_64-support` branches from `b00501fc` and so does **not** carry
+`frigicom`'s tip `4f9c0694` (logoscore 0.2.2, `bin/logoscore` staged into
+`.#modules`, a 2747-line `flake.lock` rewrite, `dev-env.sh`). Test 1 therefore
+exercises the *old* lock, which is not what merging produces. Merged in a
+throwaway worktree instead:
+
+- the merge is **clean** — `flake.nix` and `docs/logos-modules.md` auto-merge on
+  disjoint hunks;
+- `nix build .#modules` on the merged tree is **`diff -r` identical** to what
+  `frigicom` builds today: same five modules, same licences, same
+  `bin/logoscore`, same `provenance.json`;
+- `nbl.sh`'s jq input-path walk still resolves against the 0.2.2 lock
+  (`nbl.sh fork eval .#…modules.drvPath` produces a derivation).
+
+A byte-identical output is the strongest available form of "does not break
+arm64": the licence-loop change provably alters nothing here.
+
+Test 3 (live backend) was not run, and is redundant given the above — the arm64
+runtime tree is bit-for-bit the one already in use.
+
+### 4. Three things back to the Intel side
+
+1. **The Intel measurements predate the 0.2.2 bump.** §8 records them against
+   `b00501fc`. The merge is inert on arm64 but rewrites the lock wholesale, so
+   `nbl.sh fork build .#modules` wants re-running on Intel *after* the merge,
+   not before.
+2. **`--out-link result-modules-fork` becomes a skew trap after the merge.**
+   `4f9c0694` made `dev-env.sh` prefer `$root/result-modules/bin/logoscore` and
+   look nowhere else. On Intel there is no stock `result-modules` to build, so a
+   fork tree parked under a different name leaves the daemon resolving from the
+   `.gcroots` GC root — fork-built modules paired with an unrelated daemon,
+   which is precisely the skew `4f9c0694` exists to make inexpressible.
+   `nbl.sh`'s own usage line already says `--out-link result-modules`; Tests 2
+   and 3 above should say the same.
+3. **Both commits on this branch are `doomcrack <local@local>` and unsigned**,
+   against a history of `doomcrack <qtx8zpvd66@privaterelay.appleid.com>` with
+   `commit.gpgsign = true`. The diff itself is identity-clean. Worth correcting
+   the author email and signing when this branch lands.
+
+The upstream `nix-bundle-lgx` PR is arm64-safe by inspection — only the `else`
+(x86_64) arm of the variant ternary changes — and empirically, since Test 2
+built the whole tree through that fork.
+
+### Environment note
+
+Test 2 failed once on `No space left on device` before it reached any linking,
+which is worth separating from the result above: `halloy/target` had grown to
+**48 GB**, 24 GB of it `debug/incremental`. `RESUME.md`'s "~7 GB" figure is
+stale. Dropping `target/debug/incremental` and the disk-corrupted
+`~/.cache/nix/eval-cache-v6` freed enough to finish. `CARGO_INCREMENTAL=0` in
+`.cargo/config.toml`, already suggested there, looks less optional than it did.
