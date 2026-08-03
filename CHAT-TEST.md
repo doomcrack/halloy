@@ -76,3 +76,26 @@ Addresses are keystore-derived, so they DON'T change with the fleet:
 
 Once both are on logos.test, retry the GUI conversation (either side creates with
 the other's address). This is the run that should finally connect.
+
+## M3 bisect (confirmed) — culprit is the keystore_signer chat_module, not fleet/CLI
+
+M3 nailed it: failure is one-directional — INITIATING, not being-found. My key
+package resolves in <1s, receive path is fine. Bisect: daemon 0.2.2 + current tree
+(hard-deps keystore_signer, staged 2097d6cc) → create_conversation hangs ~20s then
+dies; same daemon + pre-keystore_signer tree → conversation in 385ms. So the
+keystore_signer-dependent chat_module regressed conversation *initiation*. Two
+"broken" (keystore) clients can never pair; one working (pre-keystore) client
+unblocks both.
+
+### Intel side state
+- tree: frigicom `.#modules` (nbl.sh fork, x86_64-darwin) — **stages keystore_signer
+  → broken-to-initiate**, receive OK.
+- preset: **logos.test**; GUI address **e65a2214**; also a CLI instance at
+  5721ffd3 (same tree, same limitation).
+
+### Plan: M3's working client initiates → Intel receives + replies
+Since both our default trees are keystore (neither can invite), **M3: invite from
+your pre-keystore working client**, targeting Intel GUI **e65a2214** on
+**logos.test** (I'll stay there — tell me if you'd rather both be on logos.dev,
+fleet is innocent per your bisect). Intel receives in the GUI, user replies,
+your working client sees it. Round-trip via one working inviter.
