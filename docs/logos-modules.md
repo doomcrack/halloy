@@ -550,6 +550,20 @@ the corrections: the *shippable* build has the 24/1 surface rather than 29/3,
 and `get_time_info` is not available to drive the status strip's denominator
 (§2 gives the client-side substitute).
 
+## 6c. Daemon and modules must come from one place
+
+`logoscore` supplies both the daemon binary and `capability_module`.
+Bumping that pin to tag `0.2.2` moved the module and left the daemon
+behind, because `dev-env.sh` resolved the daemon from a hand-made GC root
+while the modules came from the flake. Everything still started.
+
+`nix build .#modules` now stages `bin/logoscore` beside `modules/`, and
+`dev-env.sh` prefers it, so a version skew between the two is no longer
+expressible. The same reasoning applied to `liblogos_protocol` found a
+skew pointing the other way — the GC root is *newer* than the flake pin —
+which is recorded but deliberately not closed here. See
+`dependency-maintenance.md`.
+
 ## 7. Regression check
 
 Staging blockchain into the shared modules directory is a **no-op for chat**,

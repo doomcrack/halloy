@@ -43,7 +43,7 @@ fi
 # by hand, because it is the only one that records where its modules came
 # from — which is what a disk image built from it has to declare, one of
 # the four being our fork. See docs/packaging-macos.md.
-_frigicom_built="$_frigicom_root/result-modules/modules"
+_frigicom_built="$_frigicom_root/result-modules"
 unset _frigicom_root
 
 # Newest logos-protocol-lib-* root wins. `find` rather than a glob: zsh
@@ -65,6 +65,14 @@ else
 the live feature will not link — export LOGOS_PROTOCOL_ROOT"
 fi
 
+# The daemon that `nix build .#modules` staged wins over any GC root,
+# because it is the one the modules in that same tree were built against.
+# Taking the two from different places is how a pin bump moves the modules
+# and leaves the daemon behind — everything still starts, and the mismatch
+# only shows up as behaviour nobody can account for.
+if [ -z "${LOGOSCORE_BIN:-}" ] && [ -x "$_frigicom_built/bin/logoscore" ]; then
+    LOGOSCORE_BIN="$_frigicom_built/bin/logoscore"
+fi
 : "${LOGOSCORE_BIN:=$_frigicom_artifacts/logos-logoscore-cli/bin/logoscore}"
 export LOGOSCORE_BIN
 
@@ -74,35 +82,14 @@ export LOGOSCORE_BIN
 # and logoscore-cli ships capability_module alone — so the modules-live*
 # trees are merged by hand, and they are what the live tests run against.
 #
-# modules-live-v3 is the current set: chat_module 0.2.1 carrying our three
-# fixes (delivery config trimmed to {mode,preset}, `online` reported only
-# once the node really started, delivery rejections logged) next to the
-# genuine delivery_module 0.1.3. It reaches the logos.dev fleet — real Waku
-# node, ENR, discv5 peers.
-#
-# modules-live-v2 is the same three fixes on chat_module 0.2.0, kept as a
-# fallback. Mind the contract when you use it: 0.2.1 took a `ChatConfig`
-# record where 0.2.0 took the preset as a bare string, and `logos-chat`
-# now sends the record. A 0.2.0 module reads that record as an empty
-# string and falls back to its own `logos.dev` default — so on v2 the
-# preset is ignored rather than misapplied, and a `logos.test` run there
-# would silently go to logos.dev.
-#
-# modules-live is older still, kept only for comparison: chat.init gets as
-# far as `online` on it while the delivery node never starts. The narrower
-# dirs are the last resort: the daemon comes up on them but chat.init never
-# reaches delivery. Export LOGOS_MODULES_DIR to pin a different tree.
-#
-# v6 is preferred: it is the only tree carrying a blockchain_module that
-# can join the testnet (tag 0.2.0), so it is the one the module monitor
-# has anything interesting to show. v5 is deliberately absent from this
-# list — it carries a blockchain build from the upstream default branch,
-# which advertises an unsubstituted protocol name, fails to find a peer,
-# and aborts the module process on the way down (docs/logos-modules.md
-# §6). Pin it explicitly if you want to reproduce that.
+# `nix build .#modules` is the source of truth: it stages all five modules
+# and the daemon they were built against, and records where each came from.
+# Everything below it is a hand-merged fallback from before that existed,
+# kept only so an old checkout still runs. They have no provenance record
+# and no matching daemon; prefer the built tree.
 if [ -z "${LOGOS_MODULES_DIR:-}" ]; then
     for _frigicom_modules in \
-        "$_frigicom_built" \
+        "$_frigicom_built/modules" \
         "$_frigicom_artifacts/modules-live-v6" \
         "$_frigicom_artifacts/modules-live-v4" \
         "$_frigicom_artifacts/modules-live-v3" \
