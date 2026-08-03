@@ -570,3 +570,162 @@ observable signature of a synced node, and is available **~20 minutes before**
 `mode` flips to `Online` (§2b). So height-versus-slot is the better "we are
 current" signal for the UI; `mode` is the slower, more conservative one. Show
 both — they answer different questions.
+
+## 8. `x86_64-darwin`: `.#modules` fails on a variant-name skew, not a compile gap
+
+Measured on an Intel Mac (`x86_64`, macOS 15.7.7, nix 2.34.7) against `frigicom`
+`b00501fc`, with the Logos Attic cache enabled. This is the finding
+`docs/handoff-intel-mac.md` asked to report back (item 3), and the answer is not
+either of the two the handoff anticipated: the builder does **not** emit an
+arm64 payload on Intel, and it does **not** emit `darwin-x64-*`. It emits a real
+**x86_64** dylib under the variant key **`darwin-amd64-dev`**, and the install
+step then rejects it because `lgpm` resolves this host as **`darwin-x86_64-dev`**.
+The two halves of the same toolchain disagree on the arch token for Intel macOS.
+
+### What was run and what came back
+
+`nix build .#modules` evaluated cleanly (the four-module tree resolves; blockchain
+is dropped as designed, §handoff) and substituted almost the whole closure from
+`cache.nix.logos.co/public` — nothing of substance compiled from source. It then
+failed at the **first** module install to run, `capability_module`:
+
+```
+logos-capability_module-module-lib-lgx> Adding variant darwin-amd64-dev to
+    logos-capability_module-module-lib.lgx (main: capability_module_plugin.dylib)
+logos-capability_module-module-lib-install> Installing … via lgpm …
+logos-capability_module-module-lib-install>  FAILED
+logos-capability_module-module-lib-install> Error: Package does not contain
+    variant for platform: darwin-x86_64-dev
+```
+
+which cascaded up `logos-logoscore-cli-modules` → `-bin` → `cli` →
+`frigicom-modules`. The `.lgx` the packer produced is internally consistent and
+carries a genuine Intel binary — the mismatch is purely the key name:
+
+| check | result |
+| --- | --- |
+| `manifest.json` `main` | `{"darwin-amd64-dev": "capability_module_plugin.dylib"}` |
+| `manifest.json` `hashes` keys | `root`, `variants`, `variants/darwin-amd64-dev` |
+| `file …/capability_module_plugin.dylib` | `Mach-O 64-bit … shared library x86_64` |
+| `lgpm` install resolves host as | `darwin-x86_64-dev` |
+
+So it is a **packaging/naming defect, not a platform port gap**. The code
+compiles and links for Intel; it is staged under a name the loader on the same
+platform does not ask for.
+
+### Root cause — one line, and the fix already exists upstream
+
+The variant token is chosen by the shared LGX-bundler flake ("Bundle Nix
+derivations into LGX packages", the `nix-bundle-lgx` / `logos-package` input),
+`flake.nix:26`:
+
+```nix
+(if pkgs.stdenv.isAarch64 then "darwin-arm64" else "darwin-amd64")
+```
+
+`bundle.sh` passes that through to `lgpm … --variant "$VARIANT"` verbatim, so the
+`.lgx` is stamped `darwin-amd64-dev`. Meanwhile `lgpm`'s install/runtime host
+resolver reports Intel macOS as `x86_64` (Qt's `QSysInfo` arch string), i.e.
+`darwin-x86_64-dev`. On **arm64** both sides say `arm64`, which is why every
+`darwin-arm64-dev` build in §1–§7 worked and this was never seen. On **Intel**
+the darwin branch uses the Linux/Go `amd64` token where the loader uses the
+Apple/`uname` `x86_64` token, and they never meet. (Linux is self-consistent —
+`linux-amd64` on both sides — so only darwin-Intel is affected.)
+
+This is not yet fixed anywhere in frigicom's graph. `frigicom`'s `flake.lock`
+pins **`nix-bundle-lgx` 181 times across three `logos-co` revs**
+(`3c44d99b` ×105, `9d8f8602` ×55, `b49074a8` ×21) — and `flake.nix:26` reads
+`darwin-amd64` in **all three**, and at `logos-co/nix-bundle-lgx` HEAD
+(`b49074a8`) too. So there is no fixed rev to bump to; the one-line change has to
+be made (e.g. in a fork such as `doomcrack/nix-bundle-lgx`, whose `main` is the
+same buggy `b49074a8`) and then adopted by the module flakes' pins. Because the
+input is transitive under the "Logos Module Builder" (`logos-module`) flake and
+pinned 181×, there is no single-flag local override that reaches every instance —
+propagating a fixed pin through the module flakes is the clean path.
+
+### Consequence for frigicom on Intel
+
+The live backend cannot come up from a clean build on `x86_64-darwin` until this
+is resolved upstream, and a local rename hack is **not** a shortcut here:
+
+- The failure is not confined to one module. `capability_module` is only the
+  first to fail; `delivery_module`'s prebuilt darwin `.lgx` (pulled from the
+  cache) carries the same `darwin-amd64-dev` key, so it would be rejected too.
+- The `logoscore` **runtime bundle** never assembles, because the same
+  `lgpm install` is on its build path. The bare daemon binary that does exist in
+  the store is unrunnable on its own — `dyld: Library not loaded:
+  @rpath/liblogos_core.dylib` — the sibling `liblogos_*.dylib`/Qt frameworks are
+  staged only by the bundle step that fails. So there is no working daemon to
+  point a hand-staged module tree at.
+
+**Recommended fix:** apply the one-line change in `nix-bundle-lgx`
+(`darwin-amd64` → `darwin-x86_64` on the darwin branch — no such rev exists yet;
+`logos-co` HEAD and all three pinned revs are buggy), then bump the pin to it
+across every Logos module flake that stages a darwin `.lgx`
+(`logos-logoscore-cli`, `logos-chat-module`, `keystore-signer-module`,
+`logos-delivery-module`) so it propagates through `logos-module`. Equivalent
+alternative: teach `lgpm`'s host resolver to accept `amd64` as an alias of
+`x86_64` on darwin. Bumping the pin is cleaner — Linux already agrees on `amd64`,
+only darwin diverges. Because the input is pinned 181× transitively, there is no
+clean single-flag local override. Filed at
+`upstream/issues/0001-lgx-variant-darwin-amd64-vs-x86_64.md`.
+
+### A second, independent Intel blocker surfaced downstream (delivery)
+
+Applying the fix (via `--override-input` to the fork — see `scripts/nbl.sh`)
+proves the variant half works: `capability_module` then stamps `darwin-x86_64-dev`
+and `lgpm install` **succeeds** (the exact step that failed before). But the build
+does not complete, because changing `nix-bundle-lgx` re-derives the **delivery**
+module's `.lgx`, forcing it to build **from source** — and delivery does not link
+from source on `x86_64-darwin`:
+
+```
+liblogosdelivery-dev> Undefined symbols for architecture x86_64:
+  "std::logic_error::logic_error(char const*)", "std::terminate()", … (bssl objects)
+```
+
+i.e. the vendored BoringSSL C++ objects are linked without libc++. Delivery's
+prebuilt x86_64 dylib substitutes fine; only its *from-source* build is broken.
+Because the variant fix touches delivery's input subtree (and the fork's own
+inputs freshen — the `nix-bundle-lgx` nodes reference three different
+`logos-package` revs, so no single pin keeps the override inert), delivery gets
+re-derived and the build stops there. So the `nix-bundle-lgx` fix is **necessary
+but not sufficient** for a live Intel build — delivery needs its own fix. Filed as
+`upstream/issues/0002-delivery-module-libcxx-link-x86_64-darwin.md`.
+
+### What does work on Intel
+
+- **Eval, fetch, and compile are fine.** `.#modules` evaluates; the closure
+  substitutes from the Attic cache; the dylibs are valid x86_64. `capability`,
+  `logos_core`, and the Rust modules build from source cleanly — only delivery's
+  from-source link fails.
+- **The frigicom client builds and runs in mock mode.** `cargo build` (default
+  features, no `--features live`) compiles the whole UI on Intel, and with
+  `mock = true` under `[logos]` the app runs with a scripted in-process backend —
+  no nix, no daemon, no dylib. That isolates the defect above as purely a
+  Logos-module packaging problem, not a frigicom-on-Intel problem.
+
+### Resolution — three fixes, and a complete darwin-x86_64-dev tree
+
+`x86_64-darwin` needed **three** independent fixes, each a one-liner, found by
+peeling them one at a time (each blocked the build before the next was visible):
+
+1. **`nix-bundle-lgx` variant** (§ above / issue #0001): `darwin-amd64` →
+   `darwin-x86_64`. Merged to `doomcrack/nix-bundle-lgx`.
+2. **`logos-delivery` libc++ link** (issue #0002): the shared `nimCompile` in
+   `logos-delivery`'s `nix/default.nix` linked `-lstdc++` on Linux and *nothing*
+   on darwin, so the vendored BoringSSL C++ objects had no C++ runtime. Add
+   `${pkgs.lib.optionalString pkgs.stdenv.isDarwin " -lc++"}` to the `--passL`.
+   The rebuilt `liblogosdelivery.dylib` then links `/usr/lib/libc++.1.dylib`.
+3. **frigicom's own `.#modules` assembly**: the licence-copy loop used a
+   backslash-continued `for … in` list with an *optional* blockchain entry; on
+   `x86_64-darwin` (blockchain excluded) the empty interpolation left a dangling
+   continuation that terminated the list early (`syntax error near … capability`).
+   No earlier build reached this step. Fixed by switching to a bash array.
+
+With all three applied, `nix build .#modules` completes on Intel and stages all
+four modules at `darwin-x86_64-dev` with x86_64 dylibs (capability 1.0.0, chat
+0.2.1, delivery 0.1.3, keystore 0.1.0). The `scripts/nbl.sh fork` wrapper composes
+fixes 1 and 2 as `--override-input`s (fix 3 is committed); `nbl.sh fork build
+.#modules` reproduces the tree in one command. Verified 2026-08-02,
+`FULL_BUILD_EXIT=0`.
