@@ -212,14 +212,21 @@
           # file is recorded rather than silently skipped: shipping a
           # binary whose terms we cannot reproduce is a thing a reader
           # should be able to see, and it is worth asking upstream for.
-          for pair in \
-            "chat_module:${chat-module}" \
-            "delivery_module:${delivery-module}" \
+          # A bash array, not a backslash-continued `for ... in` list: the
+          # blockchain entry is optional (absent on x86_64-darwin), and an
+          # empty interpolation between two backslash-continued lines leaves a
+          # dangling continuation that terminates the list early. An empty
+          # line inside an array literal is simply ignored.
+          pairs=(
+            "chat_module:${chat-module}"
+            "delivery_module:${delivery-module}"
             ${if blockchainSupported
-              then "\"blockchain_module:${blockchain-module}\" \\"
+              then "\"blockchain_module:${blockchain-module}\""
               else ""}
-            "capability_module:${logoscore}" \
-            "keystore_signer:${keystore-signer-module}"; do
+            "capability_module:${logoscore}"
+            "keystore_signer:${keystore-signer-module}"
+          )
+          for pair in "''${pairs[@]}"; do
             name=''${pair%%:*}
             src=''${pair#*:}
             mkdir -p "$out/licenses/$name"
