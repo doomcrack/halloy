@@ -742,4 +742,14 @@ four modules at `darwin-x86_64-dev` with x86_64 dylibs (capability 1.0.0, chat
 0.2.1, delivery 0.1.3, keystore 0.1.0). The `scripts/nbl.sh fork` wrapper composes
 fixes 1 and 2 as `--override-input`s (fix 3 is committed); `nbl.sh fork build
 .#modules` reproduces the tree in one command. Verified 2026-08-02,
-`FULL_BUILD_EXIT=0`.
+`FULL_BUILD_EXIT=0`, and a live backend reached `backend ready` with delivery
+joined to the logos.dev fleet.
+
+**Re-verified after the logoscore 0.2.2 bump.** These fixes were first measured on
+`b00501fc`; `frigicom` then moved to `4f9c0694` (logoscore 0.2.2, the daemon
+staged into `.#modules/bin`, a wholesale `flake.lock` rewrite). After merging that
+tip, `nbl.sh fork build .#modules` still completes on Intel — all four modules
+`darwin-x86_64-dev` (x86_64) plus the staged x86_64 `bin/logoscore`. The three
+fixes are orthogonal to the 0.2.2 changes. (arm64 verified independently on the
+M3: no regression, delivery's `-lc++` links there too — see
+`docs/handoff-m3-verify.md`.)

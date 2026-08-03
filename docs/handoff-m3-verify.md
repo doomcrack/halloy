@@ -34,8 +34,11 @@ below to an agent on the M3.
 >
 > ### Test 2 — our two forks applied (arm64): the delivery `-lc++` is the risk
 > ```sh
-> ./scripts/nbl.sh fork build .#modules --out-link result-modules-fork
+> ./scripts/nbl.sh fork build .#modules --out-link result-modules
 > ```
+> (Use `result-modules`, not a fork-specific name: since 0.2.2, `dev-env.sh`
+> resolves the daemon from `result-modules/bin/logoscore` only, so a tree parked
+> under another name would pair fork-built modules with an unrelated daemon.)
 > This overrides `nix-bundle-lgx` → our fork (a no-op on arm64) and
 > `logos-delivery` → our `-lc++` fork (**does** change arm64). Expect: builds; all
 > modules `darwin-arm64-dev`. **The thing to confirm: `liblogosdelivery` still
