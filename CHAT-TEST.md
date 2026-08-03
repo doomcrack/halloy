@@ -49,3 +49,30 @@ the path that worked in the docker run. If *your* create also `RPC_FAILED`s, the
 it's a fleet-wide delivery/RLN mesh issue on logos.dev (not our build), and we
 should compare notes (peer counts, whether your node meshes on shards 1/3/4,
 maybe try `delivery_preset = logos.test` on both sides).
+
+## Root cause found: wrong fleet + config in the wrong place
+
+Both GUIs defaulted to **`logos.dev`**, whose relay mesh is starved on the chat
+shards (thousands of `no mesh peer for /waku/2/rs/2/{1,3,4}`), so key-package /
+Welcome exchange can't happen → `create_conversation` → `MethodFailed` (in the GUI
+too, not just the CLI). On **`logos.test`** the same node gets `relayCount=11–13`
+and healthy mesh.
+
+The GUI reads its config from **`~/Library/Application Support/frigicom/config.toml`**
+(NOT the repo `config.toml`, which is only a template). That file did not exist, so
+it fell back to the `logos.dev` default.
+
+### M3: switch to logos.test and retry
+```sh
+mkdir -p ~/Library/Application\ Support/frigicom
+printf '[logos]\ndelivery_preset = "logos.test"\n' > ~/Library/Application\ Support/frigicom/config.toml
+# then quit + relaunch frigicom (cargo run --features live, system toolchain)
+```
+Confirm the daemon log says `joining delivery preset logos.test`.
+
+Addresses are keystore-derived, so they DON'T change with the fleet:
+- **Intel GUI:** `e65a2214…` (now on logos.test, address `e65a2214`)
+- **M3 GUI:** `0abbf2d3e82acf2a3ea2c9ee661b81e7f6a4e5f63e42f453f243147dafa4f1e8`
+
+Once both are on logos.test, retry the GUI conversation (either side creates with
+the other's address). This is the run that should finally connect.
